@@ -170,6 +170,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
+
     # save resume path before creating a new log_dir
     if agent_cfg.resume:
         # get path to previous checkpoint
@@ -195,5 +196,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 if __name__ == "__main__":
     # run the main function
     main()
+    
     # close sim app
     simulation_app.close()
