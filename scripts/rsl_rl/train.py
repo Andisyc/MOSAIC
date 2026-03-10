@@ -104,14 +104,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-    agent_cfg.max_iterations = (
-        args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
-    )
+    agent_cfg.max_iterations = (args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations)
 
     # set seeds (explicit rank offset for distributed to avoid identical sampling across ranks)
     # note: certain randomizations occur in the environment initialization so we set the seed here
     base_seed = int(agent_cfg.seed)
     rank = int(os.environ.get("RANK", "0"))
+
     # stride avoids overlaps if some components use multiple RNG draws per step
     seed_stride = int(os.environ.get("SEED_STRIDE", "1000"))
     env_seed = base_seed + rank * seed_stride
@@ -124,12 +123,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(env_seed)
 
+    # specify device
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
         print(f"[INFO] Distributed seeding: base_seed={base_seed}, rank={rank}, env_seed={env_seed} (stride={seed_stride})")
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     agent_cfg.device = args_cli.device if args_cli.device is not None else agent_cfg.device
 
-    # 
+    # load in motion sequence
     env_cfg.commands.motion.motion = args_cli.motion
 
     # specify directory for logging experiments
