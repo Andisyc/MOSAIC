@@ -14,43 +14,24 @@ import cli_args  # isort: skip
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
-)
+parser.add_argument("--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations.")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--motion", type=str, default=None, help="Path to the motion file or motion directory.")
 parser.add_argument("--skip_critic", action="store_true", default=False, help="Only load actor weights.")
 parser.add_argument("--disable_motion_group_sampling", action="store_true", default=False, help="Disable motion group sampling ratios (use uniform sampling).")
-parser.add_argument(
-    "--start_frame",
-    type=int,
-    default=10,
-    help="Start frame index (0-based) for motion playback.",
-)
-parser.add_argument(
-    "--enable_motion_randomization",
-    action="store_true",
-    default=False,
-    help="Keep motion randomization ranges (pose/velocity/joint) instead of zeroing them.",
-)
-parser.add_argument(
-    "--disable_obs_noise",
-    action="store_true",
-    default=True,
-    help="Disable observation corruption/noise during playback.",
-)
-parser.add_argument(
-    "--disable_events",
-    action="store_true",
-    default=True,
-    help="Disable event manager randomizations during playback.",
-)
+parser.add_argument("--start_frame", type=int, default=10, help="Start frame index (0-based) for motion playback.")
+parser.add_argument("--enable_motion_randomization", action="store_true", default=False, help="Keep motion randomization ranges (pose/velocity/joint) instead of zeroing them.")
+parser.add_argument("--disable_obs_noise", action="store_true", default=True, help="Disable observation corruption/noise during playback.")
+parser.add_argument("--disable_events", action="store_true", default=True, help="Disable event manager randomizations during playback.")
+
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
+
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
@@ -107,8 +88,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if "model" in args_cli.wandb_path:
             run_path = "/".join(args_cli.wandb_path.split("/")[:-1])
         wandb_run = api.run(run_path)
+
         # loop over files in the run
         files = [file.name for file in wandb_run.files() if "model" in file.name]
+
         # files are all model_xxx.pt find the largest filename
         if "model" in args_cli.wandb_path:
             file = args_cli.wandb_path.split("/")[-1]
@@ -147,6 +130,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.motion is not None:
         print(f"[INFO]: Using motion directory or file from CLI: {args_cli.motion}")
         env_cfg.commands.motion.motion = args_cli.motion
+
         # Optionally disable motion group sampling ratios for evaluation
         if args_cli.disable_motion_group_sampling and hasattr(env_cfg.commands.motion, "motion_group_sampling_ratios"):
             env_cfg.commands.motion.motion_group_sampling_ratios = None
@@ -167,8 +151,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "z": (0.0, 0.0),
                 "roll": (0.0, 0.0),
                 "pitch": (0.0, 0.0),
-                "yaw": (0.0, 0.0),
-            }
+                "yaw": (0.0, 0.0),}
             if hasattr(motion_cfg, "pose_range"):
                 motion_cfg.pose_range = dict(zero_ranges)
             if hasattr(motion_cfg, "velocity_range"):
@@ -310,5 +293,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 if __name__ == "__main__":
     # run the main function
     main()
+
     # close sim app
     simulation_app.close()
