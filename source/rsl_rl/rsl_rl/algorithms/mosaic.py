@@ -97,6 +97,8 @@ class MOSAIC:
 
         self.use_estimate_ref_vel = use_estimate_ref_vel
         self.ref_vel_estimator = None
+
+        # 速度估计器模块加载 (抹平真机和仿真差异的特化模块)
         if use_estimate_ref_vel:
             if ref_vel_estimator_checkpoint_path is None:
                 raise ValueError("ref_vel_estimator_checkpoint_path must be provided when use_estimate_ref_vel=True")
@@ -104,6 +106,7 @@ class MOSAIC:
             print(f"[MOSAIC] Loading reference velocity estimator from: {ref_vel_estimator_checkpoint_path}")
             print(f"[MOSAIC] Estimator type: {ref_vel_estimator_type}")
 
+            # 依据网络结构加载速度估计器
             if ref_vel_estimator_type == "mlp":
                 from rsl_rl.modules import VelocityEstimator
                 self.ref_vel_estimator = VelocityEstimator.load(ref_vel_estimator_checkpoint_path, device=self.device)
@@ -122,6 +125,7 @@ class MOSAIC:
             else:
                 raise ValueError(f"Unknown ref_vel_estimator_type: {ref_vel_estimator_type}. Must be 'mlp' or 'transformer'")
 
+            # 将速度估计器置于eval模式并冻结梯度
             self.ref_vel_estimator.eval()
             for param in self.ref_vel_estimator.parameters():
                 param.requires_grad = False
@@ -151,10 +155,12 @@ class MOSAIC:
         self.policy = policy
         self.policy.to(self.device)
 
+        # 优化器参数选择
         from rsl_rl.modules import ResidualActorCritic
         if isinstance(policy, ResidualActorCritic):
             # Residual learning: only optimize residual network + critic
             # GMT policy is frozen and should not be in optimizer
+            # 模式A: 残差学习, 冻结GMT, 只更新RES与Critic
             trainable_params = list(policy.residual_actor.parameters())
             trainable_params.extend(policy.critic.parameters())
             if hasattr(policy, 'std'):
@@ -163,14 +169,14 @@ class MOSAIC:
                 trainable_params.append(policy.log_std)
             self.optimizer = optim.Adam(trainable_params, lr=learning_rate)
             print("[MOSAIC] Residual learning: optimizer updates residual_actor + critic")
-        elif not use_ppo:
+        elif not use_ppo: # 模式B: 纯行为克隆, 只更新Actor, 不更新Critic
             if teacher_critic_checkpoint_path is not None and not teacher_critic_frozen:
                 self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
                 print("[MOSAIC] Pure BC mode with critic fine-tuning: optimizer updates both actor and critic")
             else:
                 self.optimizer = optim.Adam(self.policy.actor.parameters(), lr=learning_rate)
                 print("[MOSAIC] Pure BC mode: optimizer only updates actor network")
-        else:
+        else: # 模式C: PPO混合模式, Actor与Critic同时更新
             self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
         self.storage: RolloutStorage = None
@@ -218,16 +224,16 @@ class MOSAIC:
             self.teacher_obs_source_mapping = {group_name: "teacher" for group_name in teacher_checkpoint_path.keys()}
             print(f"[MOSAIC] No teacher_obs_source_mapping provided, defaulting all teachers to 'teacher' observations")
 
+        # 多教师模型 (Multi-Teacher)
         if self.use_multi_teacher:
             print(f"[MOSAIC] Multi-teacher mode enabled with {len(teacher_checkpoint_path)} teachers")
             self.teacher_policies = {}
             self.teacher_normalizers = {}
 
+            # 加载多个专家模型 
             for group_name, checkpoint_path in teacher_checkpoint_path.items():
                 print(f"[MOSAIC] Loading teacher for group '{group_name}': {checkpoint_path}")
-
                 checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-
                 state_dict = checkpoint["model_state_dict"]
 
                 def _iter_linear_layers(prefix: str):
@@ -248,8 +254,7 @@ class MOSAIC:
                 critic_layers = _iter_linear_layers("critic.")
                 if not actor_layers or not critic_layers:
                     raise ValueError(
-                        f"[MOSAIC] Could not infer teacher architecture from checkpoint: {checkpoint_path}"
-                    )
+                        f"[MOSAIC] Could not infer teacher architecture from checkpoint: {checkpoint_path}")
 
                 teacher_actor_input_dim = actor_layers[0][1].shape[1]
                 teacher_critic_input_dim = critic_layers[0][1].shape[1]
@@ -341,7 +346,7 @@ class MOSAIC:
             self.teacher_policy = None
             self.teacher_normalizer = None
 
-        else:
+        else: # 单教师模型 (Single-Teacher)
             self.teacher_normalizer = None 
             if teacher_checkpoint_path is not None and teacher_policy is None:
                 print(f"[MOSAIC] Loading teacher policy from: {teacher_checkpoint_path}")
@@ -609,19 +614,18 @@ class MOSAIC:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
 
+        # 如果使用速度估计器, 首先使用历史观测估计一个参考速度, 并拼接到原始观测
         if self.use_estimate_ref_vel and self.ref_vel_estimator is not None:
             estimator_input = ref_vel_estimator_obs if ref_vel_estimator_obs is not None else obs
-
             with torch.no_grad():
                 estimated_ref_vel = self.ref_vel_estimator(estimator_input)  # [N, 3]
-
                 self.last_estimated_ref_vel = estimated_ref_vel.clone()
-
                 obs_augmented = torch.cat([obs, estimated_ref_vel], dim=-1)  # [N, obs_dim + 3]
         else:
             obs_augmented = obs
             self.last_estimated_ref_vel = None
 
+        # 学生模型根据增强后的观测输出Action
         if not self.use_ppo and self.use_teacher_bc:
             self.policy.update_distribution(obs_augmented)
             self.policy.distribution.sample()
@@ -629,6 +633,7 @@ class MOSAIC:
         else:
             self.transition.actions = self.policy.act(obs_augmented).detach()
 
+        # 记录更新PPO梯度的信息: Value, 动作的对数概率, 均值, 方差
         self.transition.values = self.policy.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
@@ -649,8 +654,7 @@ class MOSAIC:
 
         if "time_outs" in infos:
             self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1
-            )
+                self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1)
 
         self.storage.add_transitions(self.transition)
         self.transition.clear()
@@ -662,8 +666,7 @@ class MOSAIC:
 
         last_values = self.policy.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(
-            last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
-        )
+            last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch)
 
     def _sample_expert_batch(self):
         """Sample a batch from expert trajectories
@@ -824,6 +827,7 @@ class MOSAIC:
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
+        # 使用数据生成器提取一个mini-batch的数据
         for (
             obs_batch,
             critic_obs_batch,
@@ -859,7 +863,8 @@ class MOSAIC:
             # ========== On-Policy Forward Pass (PPO) ==========
             self.policy.act(obs_batch_augmented, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, 
+                                               hidden_states=hid_states_batch[1])
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
@@ -872,8 +877,8 @@ class MOSAIC:
                         + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
                         / (2.0 * torch.square(sigma_batch))
                         - 0.5,
-                        axis=-1,
-                    )
+                        axis=-1,)
+                    
                     kl_mean = torch.mean(kl)
 
                     if self.is_multi_gpu:
@@ -895,20 +900,20 @@ class MOSAIC:
                         param_group["lr"] = self.learning_rate
 
             # ========== PPO Losses ==========
-            if self.use_ppo:
-                # Surrogate loss
+            if self.use_ppo: # 计算PPO Loss
+                # Surrogate loss 截断代理Loss防止更新步幅太大
                 ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
                 surrogate = -torch.squeeze(advantages_batch) * ratio
                 surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
-                    ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-                )
+                    ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+                
                 surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
                 # Value function loss
                 if self.use_clipped_value_loss:
                     value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                        -self.clip_param, self.clip_param
-                    )
+                        -self.clip_param, self.clip_param)
+                    
                     value_losses = (value_batch - returns_batch).pow(2)
                     value_losses_clipped = (value_clipped - returns_batch).pow(2)
                     value_loss = torch.max(value_losses, value_losses_clipped).mean()
@@ -924,8 +929,8 @@ class MOSAIC:
                     # Train critic via value loss (for distillation stage)
                     if self.use_clipped_value_loss:
                         value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                            -self.clip_param, self.clip_param
-                        )
+                            -self.clip_param, self.clip_param)
+                        
                         value_losses = (value_batch - returns_batch).pow(2)
                         value_losses_clipped = (value_clipped - returns_batch).pow(2)
                         value_loss = torch.max(value_losses, value_losses_clipped).mean()
@@ -936,6 +941,7 @@ class MOSAIC:
                     value_loss = torch.tensor(0.0, device=self.device)
 
             # ========== Teacher BC Loss ==========
+            # 计算多教师的行为克隆损失值
             bc_teacher_loss = torch.tensor(0.0, device=self.device)
 
             if self.use_teacher_bc:
@@ -943,6 +949,7 @@ class MOSAIC:
                     if teacher_obs_batch is None:
                         teacher_obs_batch = critic_obs_batch
 
+                    # 计算每个专家的Loss
                     for group_name, teacher_policy in self.teacher_policies.items():
                         if self.env_group_name_to_idx is not None:
                             if group_name not in self.env_group_name_to_idx:
@@ -953,6 +960,7 @@ class MOSAIC:
                                 continue
                             group_idx = self.group_name_to_idx[group_name]
 
+                        # 使用掩码挑选出当前专家的数据
                         group_mask = (motion_groups_batch == group_idx)
 
                         if group_mask.sum() == 0:
@@ -987,6 +995,7 @@ class MOSAIC:
                                 else:
                                     teacher_obs_group = self.teacher_normalizers[group_name](teacher_obs_group)
 
+                        # 专家在无梯度模式下输出动作
                         with torch.no_grad():
                             teacher_mu_group = teacher_policy.act_inference(teacher_obs_group)
                             if self.teacher_loss_type == "kl" and hasattr(teacher_policy, 'std'):
@@ -994,6 +1003,7 @@ class MOSAIC:
                             else:
                                 teacher_sigma_group = None
 
+                        # 计算学生动作与教师动作的KL散度或MSE (均方差)
                         if self.teacher_loss_type == "kl" and teacher_sigma_group is not None:
                             student_dist = dist.Normal(mu_group, sigma_group)
                             teacher_dist = dist.Normal(teacher_mu_group, teacher_sigma_group)
@@ -1003,6 +1013,7 @@ class MOSAIC:
                         else:
                             group_loss = torch.tensor(0.0, device=self.device)
 
+                        # 根据该组动作序列在Batch中的比例分配权重, 并加权相加到总Loss中
                         group_weight = group_mask.sum().float() / len(motion_groups_batch)
                         bc_teacher_loss += group_loss * group_weight
 
@@ -1015,29 +1026,28 @@ class MOSAIC:
                                     self.writer.add_scalar(
                                         f"BC_Loss/{group_name}_loss",
                                         group_loss.item(),
-                                        self.current_learning_iteration
-                                    )
+                                        self.current_learning_iteration)
+                                    
                                     self.writer.add_scalar(
                                         f"BC_Loss/{group_name}_weight",
                                         group_weight.item(),
-                                        self.current_learning_iteration
-                                    )
+                                        self.current_learning_iteration)
+                                    
                                     self.writer.add_scalar(
                                         f"BC_Loss/{group_name}_weighted_loss",
                                         (group_loss * group_weight).item(),
-                                        self.current_learning_iteration
-                                    )
+                                        self.current_learning_iteration)
+                                    
                                     self.writer.add_scalar(
                                         f"BC_Loss/{group_name}_action_diff_l2",
                                         action_diff_l2,
-                                        self.current_learning_iteration
-                                    )
+                                        self.current_learning_iteration)
+                                    
                                     self.writer.add_scalar(
                                         f"BC_Loss/{group_name}_num_samples",
                                         group_mask.sum().item(),
-                                        self.current_learning_iteration
-                                    )
-
+                                        self.current_learning_iteration)
+                                    
                     if self.current_learning_iteration % self.log_interval == 0:
                         if hasattr(self.policy, 'last_gmt_actions') and hasattr(self.policy, 'last_residual_actions'):
                             with torch.no_grad():
@@ -1069,19 +1079,18 @@ class MOSAIC:
                                         self.writer.add_scalar(
                                             f"Residual/{group_name}_gmt_l2",
                                             gmt_l2,
-                                            self.current_learning_iteration
-                                        )
+                                            self.current_learning_iteration)
+                                        
                                         self.writer.add_scalar(
                                             f"Residual/{group_name}_residual_l2",
                                             residual_l2,
-                                            self.current_learning_iteration
-                                        )
+                                            self.current_learning_iteration)
+                                        
                                         self.writer.add_scalar(
                                             f"Residual/{group_name}_residual_ratio",
                                             residual_ratio,
-                                            self.current_learning_iteration
-                                        )
-
+                                            self.current_learning_iteration)
+                
                 elif self.teacher_policy is not None:
                     if teacher_obs_batch is None:
                         teacher_obs_batch = critic_obs_batch
@@ -1100,6 +1109,7 @@ class MOSAIC:
                         bc_teacher_loss = nn.functional.mse_loss(mu_batch, teacher_mu_batch)
 
             # ========== Off-Policy Expert BC Loss ==========
+            # 使用本地储存的数据集中计算Loss
             bc_off_policy_loss = torch.tensor(0.0, device=self.device)
             if self.use_off_policy_bc and self.lambda_off_policy_current > 0:
                 expert_batch = self._sample_expert_batch()
@@ -1123,6 +1133,7 @@ class MOSAIC:
                     else:
                         expert_obs_augmented = expert_obs
 
+                    # 学生模型在专家状态下输出动作, 并与专家动作计算KL或MSE
                     student_mu_batch = self.policy.act_inference(expert_obs_augmented)
                     student_sigma_batch = None
                     if self.expert_loss_type == "kl":
@@ -1133,8 +1144,7 @@ class MOSAIC:
                         else:
                             raise ValueError(
                                 f"Unknown standard deviation type: {self.policy.noise_std_type}. "
-                                "Should be 'scalar' or 'log'"
-                            )
+                                "Should be 'scalar' or 'log'")
 
                     expert_mu_batch = expert_batch.get('action_mean')
                     expert_sigma_batch = expert_batch.get('action_sigma')
@@ -1154,31 +1164,33 @@ class MOSAIC:
                             target_actions = expert_mu_batch if expert_mu_batch is not None else expert_actions
                             if target_actions is not None:
                                 bc_off_policy_loss = nn.functional.mse_loss(
-                                    student_mu_batch, target_actions.detach()
-                                )
+                                    student_mu_batch, target_actions.detach())
+                                
                     else:
                         target_actions = expert_mu_batch if expert_mu_batch is not None else expert_actions
                         if target_actions is not None:
                             bc_off_policy_loss = nn.functional.mse_loss(
-                                student_mu_batch, target_actions.detach()
-                            )
+                                student_mu_batch, target_actions.detach())
 
             # ========== MOSAIC Combined Loss ==========
+            # Loss相加与反向传播
             loss = torch.tensor(0.0, device=self.device)
 
+            # L = L_PPO + λ_off * L_BC_expert + λ_teacher * L_BC_teacher
             if self.use_ppo:
                 loss = loss + surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
             loss = loss + self.lambda_off_policy_current * bc_off_policy_loss + self.lambda_teacher_current * bc_teacher_loss
 
-            self.optimizer.zero_grad()
-            loss.backward()
+            # 反向传播三部曲: 清空梯度, 计算梯度, 更新权重
+            self.optimizer.zero_grad() # 清空梯度
+            loss.backward() # 更新权重
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
                 self.reduce_parameters()
 
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.optimizer.step()
+            self.optimizer.step() # 更新优化器
 
             # ========== Record Losses ==========
             mean_value_loss += value_loss.item()
