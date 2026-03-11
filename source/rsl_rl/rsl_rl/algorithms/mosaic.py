@@ -321,54 +321,64 @@ class MOSAIC:
                     num_actor_obs=teacher_actor_input_dim,
                     num_critic_obs=teacher_critic_input_dim,
                     num_actions=num_actions,
-                    **current_teacher_policy_cfg
-                ).to(self.device)
+                    **current_teacher_policy_cfg).to(self.device)
 
                 # 向实例化的教师模型导入权重
                 teacher_policy_instance.load_state_dict(state_dict)
 
-                teacher_normalizer_instance = None
+                teacher_normalizer_instance = None 
+
+                # 检查教师模型是否存在obs_norm_state_dict
                 if "obs_norm_state_dict" in checkpoint:
+                    # 使用EmpiricalNormalization记录观测量的滑动平均值和方差
+                    # 再把观测值缩放到均值为0方差为1的范围, 输入给模型
+                    # 使用先前反推出的教师模型输入维度初始化EmpiricalNormalization
                     from rsl_rl.modules import EmpiricalNormalization
                     teacher_normalizer_instance = EmpiricalNormalization(
                         shape=[teacher_actor_input_dim], until=1.0e8).to(self.device)
                     
+                    # 装载并冻结EmpiricalNormalization, 不再更新均值和方差
                     teacher_normalizer_instance.load_state_dict(checkpoint["obs_norm_state_dict"])
-                    teacher_normalizer_instance.until = 0 
+                    teacher_normalizer_instance.until = 0
                     teacher_normalizer_instance.eval()
                     print(f"[MOSAIC]   Group '{group_name}' teacher normalizer loaded (frozen)")
                 else:
                     print(f"[MOSAIC]   WARNING: No normalizer found for group '{group_name}' teacher!")
 
+                # 储存教师模型实例与观测归一化器到字典
                 self.teacher_policies[group_name] = teacher_policy_instance
                 self.teacher_normalizers[group_name] = teacher_normalizer_instance
 
                 print(f"[MOSAIC]   Group '{group_name}' teacher loaded successfully!")
 
+            # 遍历教师模型的键并排序再分配ID
             self.group_name_to_idx = {name: idx for idx, name in enumerate(sorted(self.teacher_policies.keys()))}
             self.idx_to_group_name = {idx: name for name, idx in self.group_name_to_idx.items()}
             print(f"[MOSAIC] Group name to index mapping: {self.group_name_to_idx}")
 
             self.env_group_name_to_idx = None
 
+            # 检查教师模型的观测是否正确 (有些教师模型需要特权信息, 有些不需要)
             print(f"[MOSAIC] Teacher observation sources:")
             for group_name in sorted(self.teacher_policies.keys()):
                 obs_source = self.teacher_obs_source_mapping.get(group_name, "teacher")
                 print(f"[MOSAIC]   - Group '{group_name}': using '{obs_source}' observations")
 
+            # 防呆设计, 防止导入错误教师模型
             self.teacher_policy = None
             self.teacher_normalizer = None
 
         else: # 单教师模型 (Single-Teacher)
             self.teacher_normalizer = None 
             if teacher_checkpoint_path is not None and teacher_policy is None:
+                # 导入教师模型checkpoint并读取权重, 再读取Actor&Critic的输入维度
                 print(f"[MOSAIC] Loading teacher policy from: {teacher_checkpoint_path}")
                 checkpoint = torch.load(teacher_checkpoint_path, map_location=self.device, weights_only=False)
-
                 state_dict = checkpoint["model_state_dict"]
                 teacher_actor_input_dim = state_dict["actor.0.weight"].shape[1]
                 teacher_critic_input_dim = state_dict["critic.0.weight"].shape[1]
 
+                # 寻找机器人维度
                 if hasattr(self.policy, 'std'):
                     num_actions = self.policy.std.shape[0]
                 elif hasattr(self.policy, 'log_std'):
@@ -378,6 +388,7 @@ class MOSAIC:
 
                 print(f"[MOSAIC] Teacher architecture: actor_input={teacher_actor_input_dim}, critic_input={teacher_critic_input_dim}, actions={num_actions}")
 
+                # 使用先前读取的输入维度作为教师模型的配置参数
                 if teacher_policy_cfg is None:
                     if hasattr(self.policy, 'ref_vel_skip_first_layer') and self.policy.ref_vel_skip_first_layer:
                         layer1_dim = self.policy.actor_layer1.out_features
@@ -391,23 +402,28 @@ class MOSAIC:
                         "actor_hidden_dims": actor_hidden_dims,
                         "critic_hidden_dims": [layer.out_features for layer in self.policy.critic if hasattr(layer, 'out_features')][:-1],
                         "activation": "elu", 
-                        "ref_vel_skip_first_layer": False,
-                    }
+                        "ref_vel_skip_first_layer": False,}
 
+                # 实例化教师模型并送入GPU
                 self.teacher_policy = ActorCritic(
                     num_actor_obs=teacher_actor_input_dim,
                     num_critic_obs=teacher_critic_input_dim,
                     num_actions=num_actions,
-                    **teacher_policy_cfg
-                ).to(self.device)
+                    **teacher_policy_cfg).to(self.device)
 
+                # 装载教师模型权重
                 self.teacher_policy.load_state_dict(state_dict)
 
+                # 检查教师模型是否存在obs_norm_state_dict
                 if "obs_norm_state_dict" in checkpoint:
+                    # 使用EmpiricalNormalization记录观测量的滑动平均值和方差
+                    # 再把观测值缩放到均值为0方差为1的范围, 输入给模型
+                    # 使用先前反推出的教师模型输入维度初始化EmpiricalNormalization
                     from rsl_rl.modules import EmpiricalNormalization
                     self.teacher_normalizer = EmpiricalNormalization(
-                        shape=[teacher_actor_input_dim], until=1.0e8
-                    ).to(self.device)
+                        shape=[teacher_actor_input_dim], until=1.0e8).to(self.device)
+                    
+                    # 装载并冻结EmpiricalNormalization, 不再更新均值和方差
                     self.teacher_normalizer.load_state_dict(checkpoint["obs_norm_state_dict"])
                     self.teacher_normalizer.until = 0 
                     self.teacher_normalizer.eval()
@@ -423,21 +439,25 @@ class MOSAIC:
         self.lambda_teacher_decay = lambda_teacher_decay
         self.lambda_teacher_min = lambda_teacher_min
         self.lambda_teacher_current = lambda_teacher_init
+
+        # 设定模仿学习的Loss: KL还是MSE
         self.use_teacher_bc = (self.teacher_policy is not None) or (self.use_multi_teacher and len(self.teacher_policies) > 0)
         self.teacher_loss_type = teacher_loss_type
         if self.teacher_loss_type not in ["kl", "mse"]:
             raise ValueError(f"teacher_loss_type must be 'kl' or 'mse', got {self.teacher_loss_type}")
 
+        # 设定梯度累加步数
         self.gradient_accumulation_steps = gradient_accumulation_steps
         if self.gradient_accumulation_steps < 1:
             raise ValueError(f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}")
 
+        # 设定混合模式: 同时使用PPO和BC
         if not self.hybrid and (self.use_ppo or not self.use_teacher_bc):
             raise ValueError(
                 f"hybrid=False (pure BC mode) requires use_ppo=False and teacher BC enabled, "
-                f"but got use_ppo={self.use_ppo}, teacher_bc={self.use_teacher_bc}"
-            )
+                f"but got use_ppo={self.use_ppo}, teacher_bc={self.use_teacher_bc}")
 
+        # 关闭教师模型训练模式
         if self.use_multi_teacher:
             for group_name, teacher_policy in self.teacher_policies.items():
                 teacher_policy.eval()
@@ -450,6 +470,7 @@ class MOSAIC:
                 param.requires_grad = False
             print("[MOSAIC] Teacher policy frozen")
 
+        # 将教师模型的Critic权重导入学生模型的Critic中
         self.teacher_critic_normalizer = None
         if self.teacher_critic_checkpoint_path is not None:
             print(f"[MOSAIC] Loading teacher critic from: {self.teacher_critic_checkpoint_path}")
