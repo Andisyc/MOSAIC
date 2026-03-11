@@ -136,24 +136,28 @@ class MOSAIC:
         else:
             self.ref_vel_estimator_obs_shape = None
 
+        # 教师模型checkpoint路径与在训练中是否冻结
         self.teacher_critic_checkpoint_path = teacher_critic_checkpoint_path
         self.teacher_critic_frozen = teacher_critic_frozen
+
+        # 蒸馏时是否同时训练Critic
         self.train_critic_during_distillation = train_critic_during_distillation
 
+        # 多卡分布式训练
         if multi_gpu_cfg is not None:
-            self.gpu_global_rank = multi_gpu_cfg["global_rank"]
-            self.gpu_world_size = multi_gpu_cfg["world_size"]
+            self.gpu_global_rank = multi_gpu_cfg["global_rank"] # 当前进程所在卡序号
+            self.gpu_world_size = multi_gpu_cfg["world_size"] # 总卡数
         else:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
 
-        self.rnd = None
+        self.rnd = None # Random Network Distillation 鼓励探索的机制
         self.rnd_optimizer = None
 
-        self.symmetry = None
+        self.symmetry = None # 动作&状态左右对称约束
 
-        self.policy = policy
-        self.policy.to(self.device)
+        self.policy = policy # 导入学生模型结构
+        self.policy.to(self.device) # 模型上GPU
 
         # 优化器参数选择
         from rsl_rl.modules import ResidualActorCritic
@@ -230,18 +234,19 @@ class MOSAIC:
             self.teacher_policies = {}
             self.teacher_normalizers = {}
 
-            # 加载多个专家模型 
+            # 加载多个专家模型
             for group_name, checkpoint_path in teacher_checkpoint_path.items():
                 print(f"[MOSAIC] Loading teacher for group '{group_name}': {checkpoint_path}")
                 checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-                state_dict = checkpoint["model_state_dict"]
+                state_dict = checkpoint["model_state_dict"] # 读取权重
 
+                # 过滤全连接层
                 def _iter_linear_layers(prefix: str):
                     layers = []
                     for key, value in state_dict.items():
                         if not (key.startswith(prefix) and key.endswith(".weight")):
                             continue
-                        if value.ndim != 2:
+                        if value.ndim != 2: # 只提取线性层
                             continue
                         parts = key.split(".")
                         if len(parts) < 2 or not parts[1].isdigit():
@@ -250,15 +255,18 @@ class MOSAIC:
                     layers.sort(key=lambda item: item[0])
                     return layers
 
+                # 提取全连接层
                 actor_layers = _iter_linear_layers("actor.")
                 critic_layers = _iter_linear_layers("critic.")
                 if not actor_layers or not critic_layers:
                     raise ValueError(
                         f"[MOSAIC] Could not infer teacher architecture from checkpoint: {checkpoint_path}")
 
+                # 反推教师模型的输入张量形态
                 teacher_actor_input_dim = actor_layers[0][1].shape[1]
                 teacher_critic_input_dim = critic_layers[0][1].shape[1]
 
+                # 寻找机器人维度
                 if hasattr(self.policy, 'std'):
                     num_actions = self.policy.std.shape[0]
                 elif hasattr(self.policy, 'log_std'):
@@ -266,6 +274,7 @@ class MOSAIC:
                 else:
                     num_actions = state_dict["std"].shape[0] if "std" in state_dict else state_dict["log_std"].shape[0]
 
+                # 提取Actor&Critic隐藏层
                 actor_hidden_dims = [layer.shape[0] for _, layer in actor_layers if layer.shape[0] != num_actions]
                 critic_hidden_dims = [layer.shape[0] for _, layer in critic_layers if layer.shape[0] != 1]
 
