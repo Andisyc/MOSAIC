@@ -455,7 +455,7 @@ class OnPolicyRunner:
                     else: # 提取速度估计器的速度观测量
                         ref_vel_estimator_obs = None
 
-                    # process the step
+                    # process the step 更新回放池的数据 (奖励值, 完成布尔值, 额外信息)
                     self.alg.process_env_step(rewards, dones, infos)
 
                     # Extract intrinsic rewards (only for logging)

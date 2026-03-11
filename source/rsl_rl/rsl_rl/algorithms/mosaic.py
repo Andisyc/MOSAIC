@@ -711,6 +711,8 @@ class MOSAIC:
         if not self.use_ppo and self.use_teacher_bc and not self.train_critic_during_distillation:
             return
 
+        # 可能在Rollout只跑了很少步数就停止了, 动作序列没结束, 机器人完全正常
+        # 不能简单把之后的收益算作0, 因此使用最后的观测量给Critic盲猜后续的收益
         last_values = self.policy.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch)
