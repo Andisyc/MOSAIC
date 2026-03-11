@@ -278,10 +278,10 @@ class MOSAIC:
                 actor_hidden_dims = [layer.shape[0] for _, layer in actor_layers if layer.shape[0] != num_actions]
                 critic_hidden_dims = [layer.shape[0] for _, layer in critic_layers if layer.shape[0] != 1]
 
+                # 尝试从checkpoint路径读取配置文件
                 policy_cfg_from_file = None
                 try:
-                    import os
-                    import yaml
+                    import os, yaml
                     params_yaml_path = os.path.join(os.path.dirname(checkpoint_path), "params", "agent.yaml")
                     if os.path.exists(params_yaml_path):
                         with open(params_yaml_path, "r") as f:
@@ -294,6 +294,7 @@ class MOSAIC:
                 print(f"[MOSAIC]   Group '{group_name}' teacher architecture: actor_input={teacher_actor_input_dim}, critic_input={teacher_critic_input_dim}, actions={num_actions}")
                 print(f"[MOSAIC]   Inferred actor_hidden_dims={actor_hidden_dims}, critic_hidden_dims={critic_hidden_dims}")
 
+                # 将读取的配置参数字典化
                 current_teacher_policy_cfg = {}
                 if policy_cfg_from_file:
                     for key in ("actor_hidden_dims", "critic_hidden_dims", "activation", "noise_std_type", "init_noise_std"):
@@ -304,7 +305,8 @@ class MOSAIC:
                 if "init_noise_std" not in current_teacher_policy_cfg:
                     current_teacher_policy_cfg["init_noise_std"] = (
                         self.policy.std.data[0].item() if hasattr(self.policy, "std") else 1.0)
-                    
+                
+                # 如果没有yaml文件也没手动传参就使用先前读取的隐藏层补全
                 if "actor_hidden_dims" not in current_teacher_policy_cfg:
                     current_teacher_policy_cfg["actor_hidden_dims"] = actor_hidden_dims
                 if "critic_hidden_dims" not in current_teacher_policy_cfg:
@@ -313,7 +315,8 @@ class MOSAIC:
                     current_teacher_policy_cfg["activation"] = "elu"
                 if "ref_vel_skip_first_layer" not in current_teacher_policy_cfg:
                     current_teacher_policy_cfg["ref_vel_skip_first_layer"] = False
-
+                
+                # 实例化教师模型并送入GPU
                 teacher_policy_instance = ActorCritic(
                     num_actor_obs=teacher_actor_input_dim,
                     num_critic_obs=teacher_critic_input_dim,
@@ -321,14 +324,15 @@ class MOSAIC:
                     **current_teacher_policy_cfg
                 ).to(self.device)
 
+                # 向实例化的教师模型导入权重
                 teacher_policy_instance.load_state_dict(state_dict)
 
                 teacher_normalizer_instance = None
                 if "obs_norm_state_dict" in checkpoint:
                     from rsl_rl.modules import EmpiricalNormalization
                     teacher_normalizer_instance = EmpiricalNormalization(
-                        shape=[teacher_actor_input_dim], until=1.0e8
-                    ).to(self.device)
+                        shape=[teacher_actor_input_dim], until=1.0e8).to(self.device)
+                    
                     teacher_normalizer_instance.load_state_dict(checkpoint["obs_norm_state_dict"])
                     teacher_normalizer_instance.until = 0 
                     teacher_normalizer_instance.eval()
