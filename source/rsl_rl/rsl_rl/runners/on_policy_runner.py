@@ -425,7 +425,7 @@ class OnPolicyRunner:
                     else:
                         actions = self.alg.act(obs, privileged_obs)
                     
-                    # Step the environment 更新仿真环境
+                    # Step the environment 仿真环境更新观测量/动作评分/序列结束与否/监控数据
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
 
                     # Move to device
@@ -436,7 +436,7 @@ class OnPolicyRunner:
                     else:
                         obs = obs.to(self.device)
                     
-                    # perform normalization
+                    # perform normalization 对观测量进行归一化
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None and self.privileged_obs_type in obs_dict:
                         privileged_obs = self.privileged_obs_normalizer(
@@ -452,7 +452,7 @@ class OnPolicyRunner:
                     # Extract ref_vel_estimator observations (NO normalization - must match offline training!)
                     if self.ref_vel_estimator_obs_type is not None and self.ref_vel_estimator_obs_type in obs_dict:
                         ref_vel_estimator_obs = obs_dict[self.ref_vel_estimator_obs_type].to(self.device)
-                    else:
+                    else: # 提取速度估计器的速度观测量
                         ref_vel_estimator_obs = None
 
                     # process the step
@@ -467,6 +467,7 @@ class OnPolicyRunner:
                             ep_infos.append(infos["episode"])
                         elif "log" in infos:
                             ep_infos.append(infos["log"])
+                        
                         # Update rewards
                         if self.alg.rnd:
                             cur_ereward_sum += rewards
@@ -485,6 +486,7 @@ class OnPolicyRunner:
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
+
                         # -- intrinsic and extrinsic rewards
                         if self.alg.rnd:
                             erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
@@ -500,7 +502,7 @@ class OnPolicyRunner:
                 if self.training_type in ["rl", "mosaic"]:
                     self.alg.compute_returns(privileged_obs)
 
-            # update policy
+            # update policy Rollout结束, 开始使用buffer计算Loss更新权重
             # Pass current iteration to algorithm for logging (needed by MOSAIC)
             self.alg.current_learning_iteration = it
             loss_dict = self.alg.update()
