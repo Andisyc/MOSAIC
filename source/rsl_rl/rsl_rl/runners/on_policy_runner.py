@@ -205,7 +205,7 @@ class OnPolicyRunner:
             self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
             self.teacher_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
 
-        # For MOSAIC, use teacher normalizer from checkpoint and freeze it.
+        # For MOSAIC, use teacher normalizer from checkpoint and freeze it. 教师观测量归一器
         # IMPORTANT: In multi-teacher mode, skip runner-level normalization
         # because each teacher will use its own normalizer in MOSAIC.update()
         if (alg_class_name == "MOSAIC" and self.teacher_obs_type == "teacher"):
@@ -221,7 +221,7 @@ class OnPolicyRunner:
                 print("[Runner] Using teacher observation normalizer from checkpoint (frozen)")
             # else: keep the EmpiricalNormalization created above
 
-        # For MOSAIC, pass obs_normalizer and privileged_obs_normalizer for teacher BC
+        # For MOSAIC, pass obs_normalizer and privileged_obs_normalizer for teacher BC 学生观测量&特权信息归一器
         if alg_class_name == "MOSAIC":
             self.alg.obs_normalizer = self.obs_normalizer
             self.alg.privileged_obs_normalizer = self.privileged_obs_normalizer
@@ -263,6 +263,7 @@ class OnPolicyRunner:
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
+        
         # Logging
         self.log_dir = log_dir
         self.writer = None
@@ -319,7 +320,6 @@ class OnPolicyRunner:
                         raise RuntimeError(
                             "[Runner] FATAL: motion_command does not have 'group_name_to_idx' attribute!\n"
                             "Multi-teacher training cannot proceed without environment's group mapping.")
-                        
                 else:
                     raise RuntimeError(
                         "[Runner] FATAL: Cannot retrieve environment's group mapping!\n"
@@ -345,6 +345,7 @@ class OnPolicyRunner:
             teacher_obs = teacher_obs.to(self.device)
         else:
             teacher_obs = privileged_obs
+        
         # Initialize ref_vel_estimator observations (NO normalization!)
         ref_vel_estimator_obs = obs_dict.get(self.ref_vel_estimator_obs_type)
         if ref_vel_estimator_obs is not None:
@@ -355,7 +356,7 @@ class OnPolicyRunner:
         privileged_obs = self.privileged_obs_normalizer(privileged_obs)
         teacher_obs = self.teacher_obs_normalizer(teacher_obs)
 
-        self.train_mode()  # switch to train mode (for dropout for example)
+        self.train_mode() # switch to train mode (for dropout for example)
 
         # Book keeping
         ep_infos = []
@@ -528,6 +529,7 @@ class OnPolicyRunner:
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         # Compute the collection size
         collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+
         # Update total time-steps and time
         self.tot_timesteps += collection_size
         self.tot_time += locs["collection_time"] + locs["learn_time"]
@@ -548,6 +550,7 @@ class OnPolicyRunner:
                         ep_info[key] = ep_info[key].unsqueeze(0)
                     infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
                 value = torch.mean(infotensor)
+
                 # log to logger and terminal
                 if "/" in key:
                     self.writer.add_scalar(key, value, locs["it"])
@@ -596,8 +599,8 @@ class OnPolicyRunner:
                 f"""{str.center(width, ' ')}\n\n"""
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                     'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
-            )
+                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""")
+            
             # -- Losses
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f'Mean {key} loss:':>{pad}} {value:.4f}\n"""
@@ -605,8 +608,8 @@ class OnPolicyRunner:
             if self.alg.rnd:
                 log_string += (
                     f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
-                    f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n"""
-                )
+                    f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n""")
+                
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
             # -- Velocity estimator error (if available)
             if 'vel_est_error_buffer' in locs and len(locs['vel_est_error_buffer']) > 0:
@@ -619,8 +622,8 @@ class OnPolicyRunner:
                 f"""{str.center(width, ' ')}\n\n"""
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                     'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
-            )
+                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""")
+            
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
 
@@ -631,8 +634,8 @@ class OnPolicyRunner:
             f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
             f"""{'Time elapsed:':>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
             f"""{'ETA:':>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time / (locs['it'] - locs['start_iter'] + 1) * (
-                               locs['start_iter'] + locs['num_learning_iterations'] - locs['it'])))}\n"""
-        )
+                               locs['start_iter'] + locs['num_learning_iterations'] - locs['it'])))}\n""")
+        
         print(log_string)
 
     def save(self, path: str, infos=None):
@@ -642,8 +645,8 @@ class OnPolicyRunner:
             # Save only residual network + critic (GMT is frozen, no need to save)
             model_state_dict = {
                 'residual_actor': self.alg.policy.residual_actor.state_dict(),
-                'critic': self.alg.policy.critic.state_dict(),
-            }
+                'critic': self.alg.policy.critic.state_dict(),}
+            
             # Save noise std parameter
             if hasattr(self.alg.policy, 'std'):
                 model_state_dict['std'] = self.alg.policy.std
@@ -658,12 +661,13 @@ class OnPolicyRunner:
             "model_state_dict": model_state_dict,
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
-            "infos": infos,
-        }
+            "infos": infos,}
+        
         # -- Save RND model if used
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
+        
         # -- Save observation normalizer if used
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
@@ -708,8 +712,8 @@ class OnPolicyRunner:
                 actor_only_state_dict = {
                     key: value
                     for key, value in loaded_dict["model_state_dict"].items()
-                    if not key.startswith("critic.")
-                }
+                    if not key.startswith("critic.")}
+                
                 resumed_training = self.alg.policy.load_state_dict(actor_only_state_dict, strict=False)
 
         # Load RND model if used
@@ -884,12 +888,12 @@ class OnPolicyRunner:
         self.multi_gpu_cfg = {
             "global_rank": self.gpu_global_rank,  # rank of the main process
             "local_rank": self.gpu_local_rank,  # rank of the current process
-            "world_size": self.gpu_world_size,  # total number of processes
-        }
+            "world_size": self.gpu_world_size,}  # total number of processes
 
         # check if user has device specified for local rank
         if self.device != f"cuda:{self.gpu_local_rank}":
             raise ValueError(f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'.")
+        
         # validate multi-gpu configuration
         if self.gpu_local_rank >= self.gpu_world_size:
             raise ValueError(f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'.")
@@ -898,7 +902,7 @@ class OnPolicyRunner:
 
         # initialize torch distributed
         torch.distributed.init_process_group(
-            backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size
-        )
+            backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        
         # set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
