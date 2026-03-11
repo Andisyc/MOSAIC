@@ -263,7 +263,7 @@ class OnPolicyRunner:
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
-        
+
         # Logging
         self.log_dir = log_dir
         self.writer = None
@@ -300,13 +300,13 @@ class OnPolicyRunner:
         if hasattr(self, 'writer') and self.writer is not None:
             self.alg.writer = self.writer
             
-        self.alg.log_interval = 1  # Default log interval
+        self.alg.log_interval = 1 # Default log interval
 
         # check if teacher is loaded
         if self.training_type == "distillation" and not self.alg.policy.loaded_teacher:
             raise ValueError("Teacher model parameters not loaded. Please load a teacher model to distill.")
 
-        # For MOSAIC multi-teacher: ensure env_group_name_to_idx is set before training
+        # For MOSAIC multi-teacher: ensure env_group_name_to_idx is set before training 整理动作序号
         if self.training_type == "mosaic" and hasattr(self.alg, 'use_multi_teacher') and self.alg.use_multi_teacher:
             if self.alg.env_group_name_to_idx is None:
                 print("[Runner] Retrieving environment's group mapping...")
@@ -333,12 +333,12 @@ class OnPolicyRunner:
                 self.env.episode_length_buf, high=int(self.env.max_episode_length))
 
         # start learning
-        obs, extras = self.env.get_observations()
+        obs, extras = self.env.get_observations() # 获取观测
         obs_dict = extras.get("observations", {})
         if self.policy_obs_type is not None and self.policy_obs_type in obs_dict:
             obs = obs_dict[self.policy_obs_type]
-        privileged_obs = obs_dict.get(self.privileged_obs_type, obs)
-        teacher_obs = obs_dict.get(self.teacher_obs_type)
+        privileged_obs = obs_dict.get(self.privileged_obs_type, obs) # 获取特权信息
+        teacher_obs = obs_dict.get(self.teacher_obs_type) # 获取教师观测
         obs = obs.to(self.device)
         privileged_obs = privileged_obs.to(self.device)
         if teacher_obs is not None:
@@ -346,13 +346,13 @@ class OnPolicyRunner:
         else:
             teacher_obs = privileged_obs
         
-        # Initialize ref_vel_estimator observations (NO normalization!)
+        # Initialize ref_vel_estimator observations (NO normalization!) 速度估计器
         ref_vel_estimator_obs = obs_dict.get(self.ref_vel_estimator_obs_type)
         if ref_vel_estimator_obs is not None:
             ref_vel_estimator_obs = ref_vel_estimator_obs.to(self.device)
 
-        # Normalize initial observations (same as in training loop)
-        obs = self.obs_normalizer(obs)
+        # Normalize initial observations (same as in training loop) 观测归一器
+        obs = self.obs_normalizer(obs) # 三种观测量分别使用不同观测归一器
         privileged_obs = self.privileged_obs_normalizer(privileged_obs)
         teacher_obs = self.teacher_obs_normalizer(teacher_obs)
 
@@ -360,8 +360,11 @@ class OnPolicyRunner:
 
         # Book keeping
         ep_infos = []
-        rewbuffer = deque(maxlen=100)
-        lenbuffer = deque(maxlen=100)
+        rewbuffer = deque(maxlen=100) # deque滑动窗口, 储存机器人的最终得分
+        lenbuffer = deque(maxlen=100) # deque滑动窗口, 储存机器人的存活时间
+
+        # self.env.num_envs: 仿真中同时运行的机器人数量
+        # cur_reward_sum & cur_episode_length: 每个机器人的总得分与存活时间
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
@@ -388,8 +391,8 @@ class OnPolicyRunner:
         for it in range(start_iter, tot_iter):
             start = time.time()
 
-            # Rollout
-            with torch.inference_mode():
+            # Rollout: 训练首先需要积攒数据, 等数据攒够才能调用self.alg.update()更新权重
+            with torch.inference_mode(): # 关闭计算图的梯度追踪, 只进行推理
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
                     if self.training_type == "mosaic":
@@ -397,30 +400,32 @@ class OnPolicyRunner:
                         motion_groups = None
 
                         # CRITICAL FIX: Use unwrapped env to access command_manager
+                        # 对仿真环境进行unwrapped, 直接调用底层指令管理器得到正在运行的动作标签
+                        # 因为仿真环境知道正在运行的动作序列, 但算法不知道, 需要把动作序号传递给算法
                         env = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
                         if hasattr(env, 'command_manager') and 'motion' in env.command_manager._terms:
                             motion_command = env.command_manager._terms['motion']
                             if hasattr(motion_command, 'env_motion_groups'):
                                 motion_groups = motion_command.env_motion_groups.clone()
 
+                        # 前向传播获得动作
                         actions = self.alg.act(obs, privileged_obs, teacher_obs=teacher_obs, ref_vel_estimator_obs=ref_vel_estimator_obs, motion_groups=motion_groups)
 
-                        # Track velocity estimator error if available
+                        # Track velocity estimator error if available 仿真器有速度真值, 但学生模型只能瞎猜
                         if hasattr(self.alg, 'last_estimated_ref_vel') and self.alg.last_estimated_ref_vel is not None:
                             # Get ground truth ref_anchor_lin_vel_b from environment using existing mdp function
                             # This uses anchor body coordinate system to match offline training
                             from whole_body_tracking.tasks.tracking.mdp import observations as mdp
                             gt_ref_vel_b = mdp.ref_base_lin_vel_b(self.env.unwrapped, "motion")  # [N, 3]
 
-                            # Compute MAE (same metric as training validation)
+                            # Compute MAE (same metric as training validation) 计算两者均方差
                             # MAE per environment (averaging across 3 velocity dimensions)
                             vel_error = (self.alg.last_estimated_ref_vel - gt_ref_vel_b).abs().mean(dim=-1)  # [N]
-
-                            vel_est_error_buffer.extend(vel_error.cpu().numpy().tolist())
+                            vel_est_error_buffer.extend(vel_error.cpu().numpy().tolist()) # 送入buffer
                     else:
                         actions = self.alg.act(obs, privileged_obs)
                     
-                    # Step the environment
+                    # Step the environment 更新仿真环境
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
 
                     # Move to device
