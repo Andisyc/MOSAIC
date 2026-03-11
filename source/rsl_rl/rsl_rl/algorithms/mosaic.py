@@ -714,6 +714,8 @@ class MOSAIC:
         # 可能在Rollout只跑了很少步数就停止了, 动作序列没结束, 机器人完全正常
         # 不能简单把之后的收益算作0, 因此使用最后的观测量给Critic盲猜后续的收益
         last_values = self.policy.evaluate(last_critic_obs).detach()
+
+        # 使用γ (折扣因子) 和λ (平滑因子) 计算GEA (广义优势估计)
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch)
 
