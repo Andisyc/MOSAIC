@@ -274,7 +274,7 @@ class MOSAIC:
                 else:
                     num_actions = state_dict["std"].shape[0] if "std" in state_dict else state_dict["log_std"].shape[0]
 
-                # 提取Actor&Critic隐藏层
+                # 提取Actor&Critic隐藏层 (排除最后一层剩下即隐藏层)
                 actor_hidden_dims = [layer.shape[0] for _, layer in actor_layers if layer.shape[0] != num_actions]
                 critic_hidden_dims = [layer.shape[0] for _, layer in critic_layers if layer.shape[0] != 1]
 
@@ -303,8 +303,8 @@ class MOSAIC:
                     current_teacher_policy_cfg.update(teacher_policy_cfg)
                 if "init_noise_std" not in current_teacher_policy_cfg:
                     current_teacher_policy_cfg["init_noise_std"] = (
-                        self.policy.std.data[0].item() if hasattr(self.policy, "std") else 1.0
-                    )
+                        self.policy.std.data[0].item() if hasattr(self.policy, "std") else 1.0)
+                    
                 if "actor_hidden_dims" not in current_teacher_policy_cfg:
                     current_teacher_policy_cfg["actor_hidden_dims"] = actor_hidden_dims
                 if "critic_hidden_dims" not in current_teacher_policy_cfg:
