@@ -473,41 +473,51 @@ class MOSAIC:
         # 将教师模型的Critic权重导入学生模型的Critic中
         self.teacher_critic_normalizer = None
         if self.teacher_critic_checkpoint_path is not None:
+            # 导入教师模型的Critic网络的checkpoint
             print(f"[MOSAIC] Loading teacher critic from: {self.teacher_critic_checkpoint_path}")
             critic_checkpoint = torch.load(self.teacher_critic_checkpoint_path, map_location=self.device, weights_only=False)
 
+            # 读取教师模型的Critic网络的权重
             critic_state_dict = critic_checkpoint["model_state_dict"]
             critic_only_state_dict = {k.replace("critic.", ""): v for k, v in critic_state_dict.items() if k.startswith("critic.")}
 
             if len(critic_only_state_dict) == 0:
                 raise ValueError(f"No critic weights found in checkpoint: {self.teacher_critic_checkpoint_path}")
 
+            # 读取教师模型Critic输入维度
             critic_input_dim = critic_only_state_dict["0.weight"].shape[1]
             print(f"[MOSAIC] Teacher critic input dim: {critic_input_dim}")
 
+            # 将教师模型Critic权重导入学生模型Critic
             self.policy.critic.load_state_dict(critic_only_state_dict)
             print("[MOSAIC] Teacher critic weights loaded into student's critic")
 
             if "privileged_obs_norm_state_dict" in critic_checkpoint:
+                # 使用EmpiricalNormalization记录观测量的滑动平均值和方差
+                # 再把观测值缩放到均值为0方差为1的范围, 输入给模型
+                # 使用先前反推出的教师模型输入维度初始化EmpiricalNormalization
                 from rsl_rl.modules import EmpiricalNormalization
                 self.teacher_critic_normalizer = EmpiricalNormalization(
-                    shape=[critic_input_dim], until=1.0e8
-                ).to(self.device)
+                    shape=[critic_input_dim], until=1.0e8).to(self.device)
+                
+                # 装载并冻结EmpiricalNormalization, 不再更新均值和方差
                 self.teacher_critic_normalizer.load_state_dict(critic_checkpoint["privileged_obs_norm_state_dict"])
                 if self.teacher_critic_frozen:
                     self.teacher_critic_normalizer.until = 0
                     self.teacher_critic_normalizer.eval()
                 print(f"[MOSAIC] Teacher critic normalizer loaded ({'frozen' if self.teacher_critic_frozen else 'trainable'})")
 
+            # 如果学生模型Critic使用教师模型Critic则冻结梯度
             if self.teacher_critic_frozen:
                 for param in self.policy.critic.parameters():
                     param.requires_grad = False
                 print("[MOSAIC] Teacher critic frozen (no fine-tuning)")
-            else:
+            else: # 如果学生模型Critic不使用教师模型Critic则启动更新
                 for param in self.policy.critic.parameters():
                     param.requires_grad = True
                 print("[MOSAIC] Teacher critic trainable (fine-tuning enabled)")
 
+            # 设置学生模型Critic的优化器
             if self.teacher_critic_frozen:
                 self.optimizer = optim.Adam(self.policy.actor.parameters(), lr=learning_rate)
                 print("[MOSAIC] Optimizer recreated to only update actor")
@@ -769,13 +779,16 @@ class MOSAIC:
             epoch_loss_sum = 0
             epoch_samples = 0
 
+            # 重置RNN隐藏状态
             if self.policy.is_recurrent:
                 self.policy.reset(hidden_states=getattr(self, 'last_hidden_states', None))
                 self.policy.detach_hidden_states()
             else:
                 self.policy.reset()
 
+            # 严格按照时间步遍历动作序列
             for t in range(self.storage.num_transitions_per_env):
+                # 读取观测量与特权信息
                 obs = self.storage.observations[t]
                 privileged_obs = self.storage.privileged_observations[t]
                 if self.storage.teacher_observations is not None:
@@ -788,6 +801,7 @@ class MOSAIC:
                     ref_vel_estimator_obs = None
                 dones = self.storage.dones[t]
 
+                # 读取速度估计器的速度并拼接到obs后 (靠腿足里程计很难估准)
                 if self.use_estimate_ref_vel and self.ref_vel_estimator is not None:
                     with torch.no_grad():
                         estimator_input = ref_vel_estimator_obs if ref_vel_estimator_obs is not None else obs
@@ -796,19 +810,24 @@ class MOSAIC:
                 else:
                     obs_augmented = obs
 
+                # 学生模型依据观测量预测动作
                 student_actions = self.policy.act_inference(obs_augmented)
 
+                # 教师模型依据特权信息给出标答
                 with torch.no_grad():
                     teacher_actions = self.teacher_policy.act_inference(teacher_obs)
 
+                # 计算均方差损失值 (MSE Loss)
                 behavior_loss = nn.functional.mse_loss(student_actions, teacher_actions)
 
+                # 梯度累加: 累加一定步数的梯度才更新 (相当于增加Batch-Size)
                 loss = loss + behavior_loss
                 mean_bc_teacher_loss += behavior_loss.item()
                 epoch_loss_sum += behavior_loss.item()
                 epoch_samples += 1
                 cnt += 1
 
+                # 更新梯度: 优化器置零 -> 更新权重 -> 优化器步进
                 if cnt % self.gradient_accumulation_steps == 0:
                     self.optimizer.zero_grad()
                     loss.backward()
@@ -830,6 +849,7 @@ class MOSAIC:
 
         self.storage.clear()
 
+        # 隐藏状态截断: 防止梯度反向传播到仿真器启动的第0步
         if self.policy.is_recurrent:
             self.last_hidden_states = self.policy.get_hidden_states()
             self.policy.detach_hidden_states()
@@ -861,7 +881,6 @@ class MOSAIC:
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-        # 使用数据生成器提取一个mini-batch的数据
         for (
             obs_batch,
             critic_obs_batch,
@@ -881,11 +900,13 @@ class MOSAIC:
             ref_vel_estimator_obs_batch, 
             motion_groups_batch,
         ) in generator:
+            # 使用generator提取一个mini-batch的数据
             original_batch_size = obs_batch.shape[0]
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
+            # 从速度估计器中获取速度值并拼接到obs后: 腿足速度估计器很难估计准
             if self.use_estimate_ref_vel and self.ref_vel_estimator is not None:
                 with torch.no_grad():
                     estimator_input = ref_vel_estimator_obs_batch if ref_vel_estimator_obs_batch is not None else obs_batch
@@ -895,17 +916,27 @@ class MOSAIC:
                 obs_batch_augmented = obs_batch
 
             # ========== On-Policy Forward Pass (PPO) ==========
+            # 学生模型前向传播得到动作
             self.policy.act(obs_batch_augmented, masks=masks_batch, hidden_states=hid_states_batch[0])
+
+            # 计算旧动作在新网络中的对数概率 (计算PPO Loss时要用)
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
+
+            # Critic对当前状态进行评分
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, 
                                                hidden_states=hid_states_batch[1])
+            
+            # 提取当前动作分布的均值和方差方便后续计算KL散度 (假设动作是高斯分布)
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
+
+            # 提取当前动作分布的熵 (熵低说明网络置信度高, 熵高说明网络在随机探索)
             entropy_batch = self.policy.entropy[:original_batch_size]
 
             # ========== Adaptive Learning Rate (KL-based) ==========
             if self.use_ppo and self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
+                    # 计算KL散度
                     kl = torch.sum(
                         torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
                         + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
@@ -913,12 +944,15 @@ class MOSAIC:
                         - 0.5,
                         axis=-1,)
                     
+                    # 求KL散度均值 (KL散度是多个样本的张量, 求均值压缩成标量, 方便后续计算全局学习率)
                     kl_mean = torch.mean(kl)
 
                     if self.is_multi_gpu:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
 
+                    # 若kl_mean超过期望值两倍说明更新过大, 学习率除以1.5
+                    # 若kl_mean小于期望值两倍说明更新过大, 学习率乘以1.5
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
                             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
@@ -936,38 +970,44 @@ class MOSAIC:
             # ========== PPO Losses ==========
             if self.use_ppo: # 计算PPO Loss
                 # Surrogate loss 截断代理Loss防止更新步幅太大
+                # 计算新旧策略比值 (若ratio>1则新网络更倾向执行这个动作)
                 ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+
+                # advantages_batch优势函数 (该动作比均值好多少, 正数说明更好, 负数说明更差)
+                # 负号是因为梯度下降是最小化Loss, 相当于最大化奖励值
                 surrogate = -torch.squeeze(advantages_batch) * ratio
+
+                # 截断限制: 若某动作特别好, 容易对网络产生巨大影响导致崩溃, 因此施加截断; 若某动作特别坏, 则不加限制得惩罚
                 surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                     ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
                 
                 surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-                # Value function loss
-                if self.use_clipped_value_loss:
+                # Value function loss 训练Critic使得评分更准
+                if self.use_clipped_value_loss: # 截断限制: 防止更新过大导致网络崩溃
                     value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
                         -self.clip_param, self.clip_param)
                     
-                    value_losses = (value_batch - returns_batch).pow(2)
+                    value_losses = (value_batch - returns_batch).pow(2) # Critic的预测值与仿真得到的真实值做均方差
                     value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                    value_loss = torch.max(value_losses, value_losses_clipped).mean() # 使用torch.max做悲观约束防止网络震荡
                 else:
                     value_loss = (returns_batch - value_batch).pow(2).mean()
-            else:
-                # PPO disabled: set surrogate loss to zero
+            else: # PPO disabled: set surrogate loss to zero
+                # 纯行为克隆模式下直接将代理Loss与熵值置零
                 surrogate_loss = torch.tensor(0.0, device=self.device)
                 entropy_batch = torch.tensor(0.0, device=self.device)
 
                 # Value loss: train critic if flag is enabled
-                if self.train_critic_during_distillation:
+                if self.train_critic_during_distillation: # 纯行为克隆也可以使用真实值训练Critic
                     # Train critic via value loss (for distillation stage)
-                    if self.use_clipped_value_loss:
+                    if self.use_clipped_value_loss: # 截断限制: 防止更新过大导致网络崩溃
                         value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
                             -self.clip_param, self.clip_param)
                         
-                        value_losses = (value_batch - returns_batch).pow(2)
+                        value_losses = (value_batch - returns_batch).pow(2) # Critic的预测值与仿真得到的真实值做均方差
                         value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                        value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                        value_loss = torch.max(value_losses, value_losses_clipped).mean() # 使用torch.max做悲观约束防止网络震荡
                     else:
                         value_loss = (returns_batch - value_batch).pow(2).mean()
                 else:
@@ -983,7 +1023,8 @@ class MOSAIC:
                     if teacher_obs_batch is None:
                         teacher_obs_batch = critic_obs_batch
 
-                    # 计算每个专家的Loss
+                    # 由于当前Batch中混杂了多种动作, 需要将不同的动作分别交给不同的Critic评分
+                    # 因此通过不同的group_name将不同的动作和观察量区分开
                     for group_name, teacher_policy in self.teacher_policies.items():
                         if self.env_group_name_to_idx is not None:
                             if group_name not in self.env_group_name_to_idx:
@@ -997,9 +1038,11 @@ class MOSAIC:
                         # 使用掩码挑选出当前专家的数据
                         group_mask = (motion_groups_batch == group_idx)
 
+                        # 防呆设计, 若没有该动作直接跳过
                         if group_mask.sum() == 0:
                             continue
 
+                        # 由于学生模型、教师模型、Critic都有自己的观测量量纲和归一化方式, 因此必须进行量纲解绑和再对齐
                         obs_source = self.teacher_obs_source_mapping.get(group_name, "teacher")
                         if obs_source == "policy":
                             obs_for_teacher = obs_batch
@@ -1013,6 +1056,7 @@ class MOSAIC:
                         mu_group = mu_batch[group_mask]
                         sigma_group = sigma_batch[group_mask]
 
+                        # 若观测量来自学生模型, 则先乘以标准差再加上均值 (还原成原始量), 再使用教师标准差和均值重新进行归一化
                         if group_name in self.teacher_normalizers and self.teacher_normalizers[group_name] is not None:
                             if obs_source == "teacher":
                                 teacher_obs_group = self.teacher_normalizers[group_name](teacher_obs_group)
@@ -1029,7 +1073,7 @@ class MOSAIC:
                                 else:
                                     teacher_obs_group = self.teacher_normalizers[group_name](teacher_obs_group)
 
-                        # 专家在无梯度模式下输出动作
+                        # 专家在无梯度模式下输出动作, 方便后续计算KL散度或MSE
                         with torch.no_grad():
                             teacher_mu_group = teacher_policy.act_inference(teacher_obs_group)
                             if self.teacher_loss_type == "kl" and hasattr(teacher_policy, 'std'):
@@ -1037,7 +1081,7 @@ class MOSAIC:
                             else:
                                 teacher_sigma_group = None
 
-                        # 计算学生动作与教师动作的KL散度或MSE (均方差)
+                        # 使用学生均值方差与教师均值方差计算学生动作与教师动作的KL散度或MSE
                         if self.teacher_loss_type == "kl" and teacher_sigma_group is not None:
                             student_dist = dist.Normal(mu_group, sigma_group)
                             teacher_dist = dist.Normal(teacher_mu_group, teacher_sigma_group)
@@ -1051,6 +1095,7 @@ class MOSAIC:
                         group_weight = group_mask.sum().float() / len(motion_groups_batch)
                         bc_teacher_loss += group_loss * group_weight
 
+                        # 更新Tensorboard记录
                         if self.current_learning_iteration % self.log_interval == 0:
                             with torch.no_grad():
                                 action_diff = mu_group - teacher_mu_group
@@ -1081,13 +1126,17 @@ class MOSAIC:
                                         f"BC_Loss/{group_name}_num_samples",
                                         group_mask.sum().item(),
                                         self.current_learning_iteration)
-                                    
+                    
+                    # 训练结束
                     if self.current_learning_iteration % self.log_interval == 0:
                         if hasattr(self.policy, 'last_gmt_actions') and hasattr(self.policy, 'last_residual_actions'):
                             with torch.no_grad():
+                                # 得到GMT动作与RES动作
                                 gmt_actions_batch = self.policy.last_gmt_actions
                                 residual_actions_batch = self.policy.last_residual_actions
 
+                                # 由于当前Batch中混杂了多种动作, 需要将不同的动作分别交给不同的Critic评分
+                                # 因此通过不同的group_name将不同的动作和观察量区分开
                                 for group_name in self.teacher_policies.keys():
                                     if self.env_group_name_to_idx is not None:
                                         if group_name not in self.env_group_name_to_idx:
@@ -1105,10 +1154,14 @@ class MOSAIC:
                                     gmt_group = gmt_actions_batch[group_mask]
                                     residual_group = residual_actions_batch[group_mask]
 
+                                    # 计算GMT动作&RES动作的L2范数 (基础动作的绝对力度/幅度)
                                     gmt_l2 = torch.norm(gmt_group, dim=-1).mean().item()
                                     residual_l2 = torch.norm(residual_group, dim=-1).mean().item()
+
+                                    # 计算RES动作与GMT动作的比例 (防暴走机制, 占比低才正常，占比高则网络崩溃)
                                     residual_ratio = residual_l2 / (gmt_l2 + 1e-8)
 
+                                    # 更新Tensorboard记录
                                     if hasattr(self, "writer"):
                                         self.writer.add_scalar(
                                             f"Residual/{group_name}_gmt_l2",
@@ -1125,16 +1178,17 @@ class MOSAIC:
                                             residual_ratio,
                                             self.current_learning_iteration)
                 
-                elif self.teacher_policy is not None:
+                elif self.teacher_policy is not None: # 单教师模型
                     if teacher_obs_batch is None:
                         teacher_obs_batch = critic_obs_batch
-                    with torch.no_grad():
+                    with torch.no_grad(): # 将观测量输入教师模型中得到动作均值和标准差
                         teacher_mu_batch = self.teacher_policy.act_inference(teacher_obs_batch)
                         if self.teacher_loss_type == "kl" and hasattr(self.teacher_policy, 'std'):
                             teacher_sigma_batch = self.teacher_policy.std.expand_as(teacher_mu_batch)
                         else:
                             teacher_sigma_batch = None
 
+                    # 使用均值和标准差计算学生模型与教师模型的KL散度或均方差
                     if self.teacher_loss_type == "kl" and teacher_sigma_batch is not None:
                         student_dist = dist.Normal(mu_batch, sigma_batch)
                         teacher_dist = dist.Normal(teacher_mu_batch, teacher_sigma_batch)
@@ -1143,13 +1197,20 @@ class MOSAIC:
                         bc_teacher_loss = nn.functional.mse_loss(mu_batch, teacher_mu_batch)
 
             # ========== Off-Policy Expert BC Loss ==========
-            # 使用本地储存的数据集中计算Loss
+            # 使用本地储存的数据集训练学生模型, 初始化Loss张量
             bc_off_policy_loss = torch.tensor(0.0, device=self.device)
+
+            # 若开启离线行为克隆, 且λ值大于0
             if self.use_off_policy_bc and self.lambda_off_policy_current > 0:
+
+                # 从本地储存的数据提取一个Batch
                 expert_batch = self._sample_expert_batch()
                 if expert_batch is not None and 'observations' in expert_batch:
+                    # 使用detach()将观测量从计算图中剥离
                     expert_obs = expert_batch['observations'].detach()
 
+                    # 如果存在专家观测值归一器, 则关闭学生模型观测值归一器的更新, 不计算该轨迹的方差均值
+                    # 由于离线专家轨迹可能与学生模型之前学习的轨迹完全不同, 可能会产生污染, 因此必须做隔离
                     if self.expert_normalize_obs and self.obs_normalizer is not None:
                         if not self.expert_update_normalizer:
                             was_training = self.obs_normalizer.training
@@ -1160,6 +1221,7 @@ class MOSAIC:
                         else:
                             expert_obs = self.obs_normalizer(expert_obs)
 
+                    # 从速度估计器中获取速度值并拼接到obs后: 腿足速度估计器很难估计准
                     if self.use_estimate_ref_vel and self.ref_vel_estimator is not None:
                         with torch.no_grad():
                             estimated_ref_vel_expert = self.ref_vel_estimator(expert_obs)
@@ -1167,7 +1229,7 @@ class MOSAIC:
                     else:
                         expert_obs_augmented = expert_obs
 
-                    # 学生模型在专家状态下输出动作, 并与专家动作计算KL或MSE
+                    # 学生模型使用专家观测量输出动作, 得到均值标准差
                     student_mu_batch = self.policy.act_inference(expert_obs_augmented)
                     student_sigma_batch = None
                     if self.expert_loss_type == "kl":
@@ -1180,10 +1242,12 @@ class MOSAIC:
                                 f"Unknown standard deviation type: {self.policy.noise_std_type}. "
                                 "Should be 'scalar' or 'log'")
 
+                    # 得到专家轨迹的均值标准差和动作
                     expert_mu_batch = expert_batch.get('action_mean')
                     expert_sigma_batch = expert_batch.get('action_sigma')
                     expert_actions = expert_batch.get('actions')
 
+                    # 使用学生模型与专家轨迹的均值标准差计算KL或MSE
                     if self.expert_loss_type == "kl" and student_sigma_batch is not None:
                         if expert_mu_batch is not None and expert_sigma_batch is not None:
                             expert_mu_batch = expert_mu_batch.detach()
@@ -1199,12 +1263,10 @@ class MOSAIC:
                             if target_actions is not None:
                                 bc_off_policy_loss = nn.functional.mse_loss(
                                     student_mu_batch, target_actions.detach())
-                                
-                    else:
+                    else: # 若没有学生模型的标准差则使用备选方案: 使用MSE
                         target_actions = expert_mu_batch if expert_mu_batch is not None else expert_actions
                         if target_actions is not None:
-                            bc_off_policy_loss = nn.functional.mse_loss(
-                                student_mu_batch, target_actions.detach())
+                            bc_off_policy_loss = nn.functional.mse_loss(student_mu_batch, target_actions.detach())
 
             # ========== MOSAIC Combined Loss ==========
             # Loss相加与反向传播

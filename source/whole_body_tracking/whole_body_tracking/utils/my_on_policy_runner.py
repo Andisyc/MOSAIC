@@ -23,9 +23,8 @@ class MyOnPolicyRunner(OnPolicyRunner):
 
 
 class MotionOnPolicyRunner(OnPolicyRunner):
-    def __init__(
-        self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"
-    ):
+    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
+    
         super().__init__(env, train_cfg, log_dir, device)
         # Note: Teacher policy is automatically loaded in MOSAIC.__init__ if teacher_checkpoint_path is set
 
@@ -52,7 +51,7 @@ class MotionOnPolicyRunner(OnPolicyRunner):
                 path=policy_path,
                 filename=filename,
                 ref_vel_estimator=ref_vel_estimator,
-                ref_vel_estimator_obs_dim=ref_vel_estimator_obs_dim,
-            )
+                ref_vel_estimator_obs_dim=ref_vel_estimator_obs_dim,)
+            
             attach_onnx_metadata(self.env.unwrapped, wandb.run.name, path=policy_path, filename=filename)
             wandb.save(policy_path + filename, base_path=os.path.dirname(policy_path))

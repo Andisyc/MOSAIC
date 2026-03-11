@@ -42,7 +42,7 @@ class OnPolicyRunner:
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
 
-        # resolve training type depending on the algorithm
+        # resolve training type depending on the algorithm 训练算法
         if self.alg_cfg["class_name"] == "PPO":
             self.training_type = "rl"
         elif self.alg_cfg["class_name"] == "MOSAIC":
@@ -52,7 +52,7 @@ class OnPolicyRunner:
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
-        # resolve dimensions of observations
+        # resolve dimensions of observations 观测量维度
         obs, extras = self.env.get_observations()
         obs_dict = extras.get("observations", {})
         if "policy" in obs_dict:
@@ -66,7 +66,7 @@ class OnPolicyRunner:
             self.teacher_obs_type = None
         num_obs = obs.shape[1]
 
-        # resolve type of privileged observations
+        # resolve type of privileged observations 特权信息
         if self.training_type == "rl":
             if "critic" in obs_dict:
                 self.privileged_obs_type = "critic"  # actor-critic reinforcement learning, e.g., PPO
@@ -91,7 +91,7 @@ class OnPolicyRunner:
             else:
                 self.privileged_obs_type = None
 
-        # resolve type of ref_vel_estimator observations (for MOSAIC with velocity estimator)
+        # resolve type of ref_vel_estimator observations (for MOSAIC with velocity estimator) 速度估计器
         if "ref_vel_estimator" in obs_dict:
             self.ref_vel_estimator_obs_type = "ref_vel_estimator"
             num_ref_vel_estimator_obs = obs_dict["ref_vel_estimator"].shape[1]
@@ -99,7 +99,7 @@ class OnPolicyRunner:
         else:
             self.ref_vel_estimator_obs_type = None
 
-        # resolve dimensions of privileged observations
+        # resolve dimensions of privileged observations 特权信息维度
         if self.privileged_obs_type is not None and self.privileged_obs_type in obs_dict:
             num_privileged_obs = obs_dict[self.privileged_obs_type].shape[1]
         else:
@@ -113,7 +113,7 @@ class OnPolicyRunner:
         # The actor will receive obs_augmented = [obs, estimated_ref_vel] where estimated_ref_vel is 3D
         # IMPORTANT: Keep num_obs unchanged for normalizer initialization!
         # IMPORTANT: For ResidualActorCritic, do NOT adjust num_actor_obs (it handles estimator internally)
-        num_actor_obs = num_obs  # Start with policy obs dimension
+        num_actor_obs = num_obs  # Start with policy obs dimension 动作维度
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
@@ -133,9 +133,11 @@ class OnPolicyRunner:
                 # - residual_actor uses num_actor_obs (770)
                 # - GMT policy uses num_actor_obs + 3 (773)
                 print(f"[Runner] Velocity estimator enabled for ResidualActorCritic: residual_actor uses {num_actor_obs} dims, GMT uses {num_actor_obs + 3} dims")
+        
+        # 选择网络架构 (Actor-Critic是网络架构, PPO是更新算法, AMP是Loss) (Actor-Critic与Teacher-Student可叠加)
+        # 无记忆Actor-Critic, 有记忆的Actor-Critic, 无记忆Teacher-Student, 有记忆Teacher-Student
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
-            num_actor_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
+            num_actor_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg).to(self.device)
 
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
@@ -155,15 +157,14 @@ class OnPolicyRunner:
             # this is used by the symmetry function for handling different observation terms
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
-        # initialize algorithm
+        # initialize algorithm 实例化训练方式
         alg_class_name = self.alg_cfg.pop("class_name")
         alg_class = eval(alg_class_name)
         self.alg: PPO | Distillation | MOSAIC = alg_class(
             policy,
             device=self.device,
             **self.alg_cfg,
-            multi_gpu_cfg=self.multi_gpu_cfg,
-        )
+            multi_gpu_cfg=self.multi_gpu_cfg,)
 
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -171,7 +172,7 @@ class OnPolicyRunner:
         self.empirical_normalization = self.cfg["empirical_normalization"]
 
         # Check if using ResidualActorCritic (special handling for GMT normalizer)
-        from rsl_rl.modules import ResidualActorCritic
+        from rsl_rl.modules import ResidualActorCritic # 创建观测量归一器
         if isinstance(policy, ResidualActorCritic):
             # Use GMT's frozen normalizer for observations
             if policy.gmt_normalizer is not None:
@@ -183,9 +184,8 @@ class OnPolicyRunner:
 
             # Create privileged obs normalizer (for critic)
             if self.empirical_normalization:
-                self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], until=1.0e8).to(
-                    self.device
-                )
+                self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], 
+                                                                        until=1.0e8).to(self.device)
             else:
                 self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)
 
@@ -193,13 +193,11 @@ class OnPolicyRunner:
             self.teacher_obs_normalizer = torch.nn.Identity().to(self.device)
         elif self.empirical_normalization:
             self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(self.device)
-            self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], until=1.0e8).to(
-                self.device
-            )
+            self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], 
+                                                                    until=1.0e8).to(self.device)
             if num_teacher_obs is not None:
-                self.teacher_obs_normalizer = EmpiricalNormalization(shape=[num_teacher_obs], until=1.0e8).to(
-                    self.device
-                )
+                self.teacher_obs_normalizer = EmpiricalNormalization(shape=[num_teacher_obs], 
+                                                                     until=1.0e8).to(self.device)
             else:
                 self.teacher_obs_normalizer = torch.nn.Identity().to(self.device)
         else:
@@ -210,10 +208,7 @@ class OnPolicyRunner:
         # For MOSAIC, use teacher normalizer from checkpoint and freeze it.
         # IMPORTANT: In multi-teacher mode, skip runner-level normalization
         # because each teacher will use its own normalizer in MOSAIC.update()
-        if (
-            alg_class_name == "MOSAIC"
-            and self.teacher_obs_type == "teacher"
-        ):
+        if (alg_class_name == "MOSAIC" and self.teacher_obs_type == "teacher"):
             # Check for multi-teacher mode
             if hasattr(self.alg, "teacher_normalizers") and self.alg.teacher_normalizers is not None:
                 # Multi-teacher: skip runner-level normalization
@@ -255,8 +250,7 @@ class OnPolicyRunner:
                 [num_privileged_obs],
                 [self.env.num_actions],
                 teacher_obs_shape=[num_teacher_obs] if num_teacher_obs is not None else None,
-                ref_vel_estimator_obs_shape=[num_ref_vel_estimator_obs] if self.ref_vel_estimator_obs_type is not None else None,
-            )
+                ref_vel_estimator_obs_shape=[num_ref_vel_estimator_obs] if self.ref_vel_estimator_obs_type is not None else None,)
         else:
             self.alg.init_storage(
                 self.training_type,
@@ -264,8 +258,7 @@ class OnPolicyRunner:
                 self.num_steps_per_env,
                 [num_obs],
                 [num_privileged_obs],
-                [self.env.num_actions],
-            )
+                [self.env.num_actions],)
 
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
@@ -325,21 +318,19 @@ class OnPolicyRunner:
                     else:
                         raise RuntimeError(
                             "[Runner] FATAL: motion_command does not have 'group_name_to_idx' attribute!\n"
-                            "Multi-teacher training cannot proceed without environment's group mapping."
-                        )
+                            "Multi-teacher training cannot proceed without environment's group mapping.")
+                        
                 else:
                     raise RuntimeError(
                         "[Runner] FATAL: Cannot retrieve environment's group mapping!\n"
                         f"Environment type: {type(env)}\n"
                         f"Has command_manager: {hasattr(env, 'command_manager')}\n"
-                        "Multi-teacher training cannot proceed."
-                    )
+                        "Multi-teacher training cannot proceed.")
 
         # randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
-            )
+                self.env.episode_length_buf, high=int(self.env.max_episode_length))
 
         # start learning
         obs, extras = self.env.get_observations()
@@ -403,6 +394,7 @@ class OnPolicyRunner:
                     if self.training_type == "mosaic":
                         # Extract motion groups for multi-teacher support
                         motion_groups = None
+
                         # CRITICAL FIX: Use unwrapped env to access command_manager
                         env = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
                         if hasattr(env, 'command_manager') and 'motion' in env.command_manager._terms:
@@ -426,8 +418,10 @@ class OnPolicyRunner:
                             vel_est_error_buffer.extend(vel_error.cpu().numpy().tolist())
                     else:
                         actions = self.alg.act(obs, privileged_obs)
+                    
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+
                     # Move to device
                     rewards, dones = rewards.to(self.device), dones.to(self.device)
                     obs_dict = infos.get("observations", {})
@@ -435,20 +429,20 @@ class OnPolicyRunner:
                         obs = obs_dict[self.policy_obs_type].to(self.device)
                     else:
                         obs = obs.to(self.device)
+                    
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None and self.privileged_obs_type in obs_dict:
                         privileged_obs = self.privileged_obs_normalizer(
-                            obs_dict[self.privileged_obs_type].to(self.device)
-                        )
+                            obs_dict[self.privileged_obs_type].to(self.device))
                     else:
                         privileged_obs = obs
                     if self.teacher_obs_type is not None and self.teacher_obs_type in obs_dict:
                         teacher_obs = self.teacher_obs_normalizer(
-                            obs_dict[self.teacher_obs_type].to(self.device)
-                        )
+                            obs_dict[self.teacher_obs_type].to(self.device))
                     else:
                         teacher_obs = privileged_obs
+                    
                     # Extract ref_vel_estimator observations (NO normalization - must match offline training!)
                     if self.ref_vel_estimator_obs_type is not None and self.ref_vel_estimator_obs_type in obs_dict:
                         ref_vel_estimator_obs = obs_dict[self.ref_vel_estimator_obs_type].to(self.device)
@@ -474,8 +468,10 @@ class OnPolicyRunner:
                             cur_reward_sum += rewards + intrinsic_rewards
                         else:
                             cur_reward_sum += rewards
+                        
                         # Update episode length
                         cur_episode_length += 1
+
                         # Clear data for completed episodes
                         # -- common
                         new_ids = (dones > 0).nonzero(as_tuple=False)
