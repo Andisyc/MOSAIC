@@ -693,16 +693,19 @@ class MOSAIC:
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
+        # 将张量存入临时数据结构, 防止内存地址被引用污染张量
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 
-        if "time_outs" in infos:
-            self.transition.rewards += self.gamma * torch.squeeze(
+        # 判别真死与假死: 摔倒即真死, 超时还没摔则假死
+        if "time_outs" in infos: # 若时限不够, 策略知道超时必死, 会在快到时限时做出怪异动作
+            self.transition.rewards += self.gamma * torch.squeeze( # 若因超时假死则额外补偿奖励值
                 self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1)
 
+        # 将临时池的数据存入经验回放池
         self.storage.add_transitions(self.transition)
-        self.transition.clear()
-        self.policy.reset(dones)
+        self.transition.clear() # 清空临时池
+        self.policy.reset(dones) # 重置rnn/LSTM结构的策略
 
     def compute_returns(self, last_critic_obs):
         if not self.use_ppo and self.use_teacher_bc and not self.train_critic_during_distillation:
