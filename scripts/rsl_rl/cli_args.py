@@ -38,7 +38,7 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     # -- logger arguments
     arg_group.add_argument("--logger", type=str, default=None, choices={"wandb", "tensorboard", "neptune"}, help="Logger module to use.")
     arg_group.add_argument("--log_project_name", type=str, default=None, help="Name of the logging project when using wandb or neptune.")
-    arg_group.add_argument("--wandb_path", type=str, default=None, help="Name of the logging project when using wandb or neptune.")
+    arg_group.add_argument("--wandb_path", type=str, default="andisyc", help="Name of the logging project when using wandb or neptune.")
     arg_group.add_argument("--distributed", action="store_true", default=False, help="Enable torchrun DDP.")
 
 

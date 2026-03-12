@@ -15,15 +15,16 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations.")
-parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
-parser.add_argument("--task", type=str, default=None, help="Name of the task.")
-parser.add_argument("--motion", type=str, default=None, help="Path to the motion file or motion directory.")
 parser.add_argument("--skip_critic", action="store_true", default=False, help="Only load actor weights.")
 parser.add_argument("--disable_motion_group_sampling", action="store_true", default=False, help="Disable motion group sampling ratios (use uniform sampling).")
 parser.add_argument("--start_frame", type=int, default=10, help="Start frame index (0-based) for motion playback.")
 parser.add_argument("--enable_motion_randomization", action="store_true", default=False, help="Keep motion randomization ranges (pose/velocity/joint) instead of zeroing them.")
 parser.add_argument("--disable_obs_noise", action="store_true", default=True, help="Disable observation corruption/noise during playback.")
 parser.add_argument("--disable_events", action="store_true", default=True, help="Disable event manager randomizations during playback.")
+
+parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to simulate.")
+parser.add_argument("--task", type=str, default="Tracking-Flat-G1-v0", help="Name of the task.")
+parser.add_argument("--motion", type=str, default=None, help="Path to the motion file or motion directory.")
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -79,6 +80,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
 
+    resume_path = './onnx/gmt.pt'
+    env_cfg.commands.motion.motion_file = args_cli.motion_file
+
     if args_cli.wandb_path:
         # import wandb
 
@@ -101,19 +105,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # wandb_file = wandb_run.file(str(file))
         # wandb_file.download("./logs/rsl_rl/temp", replace=True)
 
-        resume_path = args_cli.resume_path
-        env_cfg.commands.motion.motion_file = args_cli.motion_file
-        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-
         # print(f"[INFO]: Loading model checkpoint from: {run_path}/{file}")
         # resume_path = f"./logs/rsl_rl/temp/{file}"
+
+        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
 
     else:
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         # resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-        resume_path = log_root_path + '/onnx/gmt.pt'
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        env_cfg.commands.motion.motion_file = args_cli.motion_file
 
     # Load policy configuration from checkpoint's params/agent.yaml to ensure compatibility
     # This overrides the default configuration with the checkpoint's actual configuration
