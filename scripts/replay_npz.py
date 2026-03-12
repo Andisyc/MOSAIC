@@ -52,7 +52,7 @@ from isaaclab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay converted motions.")
-parser.add_argument("--motion_file", type=str, required=True, help="the path to the motion file.")
+parser.add_argument("--motion_file", type=str, default="./motion_npz/dance1_subject1.npz", help="the path to the motion file.") # required=True, 
 parser.add_argument(
     "--robot",
     type=str,
