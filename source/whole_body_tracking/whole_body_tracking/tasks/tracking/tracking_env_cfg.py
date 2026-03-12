@@ -155,7 +155,7 @@ class ActionsCfg:
     joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], use_default_offset=True)
 
 @configclass
-class ObservationsCfg:
+class ObservationsCfg: # 学生模型观测量
     """Observation specifications for the MDP."""
 
     @configclass
@@ -201,7 +201,7 @@ class ObservationsCfg:
     critic: PrivilegedCfg = PrivilegedCfg()
 
 @configclass
-class ObservationsExpertCfg:
+class ObservationsExpertCfg: # 教师模型观测量
     """Observation specifications for the MDP."""
 
     @configclass
@@ -287,48 +287,58 @@ class EventCfg: # 域泛化
 
 
 @configclass
-class RewardsCfg:
+class RewardsCfg: # 奖励项
     """Reward terms for the MDP."""
 
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-1)
+
+    # 关节限位, 惩罚策略让关节超越极限
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-10.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},)
     
+    # 关节速度与扭矩限制
     joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
     joint_torque = RewTerm(func=mdp.joint_torques_l2, weight=-1e-5)
 
+    # 全局锚点追踪: Robot在世界坐标系的位置
     motion_global_anchor_pos = RewTerm(
         func=mdp.motion_global_anchor_position_error_exp,
         weight=0.5,
         params={"command_name": "motion", "std": 0.3},)
     
+    # 全局锚点追踪: Robot在世界坐标系的朝向
     motion_global_anchor_ori = RewTerm(
         func=mdp.motion_global_anchor_orientation_error_exp,
         weight=0.5,
         params={"command_name": "motion", "std": 0.4},)
     
+    # 相对躯干追踪: 肢体中心点与Ref Motion对齐
     motion_body_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 0.3},)
     
+    # 相对躯干追踪: 肢体朝向与Ref Motion对齐
     motion_body_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 0.4},)
     
+    # 速度追踪: 躯干线速度与Ref Motion对齐
     motion_body_lin_vel = RewTerm(
         func=mdp.motion_global_body_linear_velocity_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 1.0},)
     
+    # 速度追踪: 躯干角速度与Ref Motion对齐
     motion_body_ang_vel = RewTerm(
         func=mdp.motion_global_body_angular_velocity_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 3.14},)
     
+    # 防摔倒: 除了手和脚, 其他区域触地则惩罚
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=-0.05,
@@ -341,7 +351,7 @@ class RewardsCfg:
             "threshold": 1.0,},)
 
 @configclass
-class RewardsExpertCfg:
+class RewardsExpertCfg: # 专家特调奖励项
     """
     Expert reward configuration - MOSAIC.
     """
@@ -381,7 +391,7 @@ class RewardsExpertCfg:
         weight=1.0,  # 2*1.0
         params={"command_name": "motion", "std": 1.0},)
 
-    teleop_body_position_extend = RewTerm(
+    teleop_body_position_extend = RewTerm( # 上下半身分离追踪
         func=mdp.teleop_body_position_extend,
         weight=1.0,
         params={
@@ -480,7 +490,7 @@ class CurriculumCfg:
 
 
 @configclass
-class TrackingEnvCfg(ManagerBasedRLEnvCfg):
+class TrackingEnvCfg(ManagerBasedRLEnvCfg): # 基础Env, 将场景、观测、动作空间、奖励项组装起来
     """Configuration for the locomotion velocity-tracking environment."""
 
     # Scene settings
@@ -502,7 +512,7 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
         # general settings
         self.decimation = 4
         self.episode_length_s = 10.0
-        
+
         # simulation settings
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
@@ -516,7 +526,7 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
     
 
 @configclass
-class GeneralTrackingEnvCfg(TrackingEnvCfg):
+class GeneralTrackingEnvCfg(TrackingEnvCfg): # 泛化Env, 能同时加载多组动作
     """Configuration for the general tracking environment."""
 
     commands: MultiMotionCommandsCfg = MultiMotionCommandsCfg()
@@ -525,9 +535,10 @@ class GeneralTrackingEnvCfg(TrackingEnvCfg):
         """Post initialization."""
         super().__post_init__()
         self.commands = MultiMotionCommandsCfg()
-        
+
+
 @configclass
-class ExpertGeneralTrackingEnvCfg(GeneralTrackingEnvCfg):
+class ExpertGeneralTrackingEnvCfg(GeneralTrackingEnvCfg): # 教师模型训练Env, 将观测量替换为专家观测量, 奖励项替换成教师奖励项
     """
     Expert general tracking environment.
     """
@@ -541,8 +552,9 @@ class ExpertGeneralTrackingEnvCfg(GeneralTrackingEnvCfg):
         super().__post_init__()
         self.commands = MultiMotionCommandsCfg()
 
+
 @configclass
-class DistillationTrackingEnvCfg(GeneralTrackingEnvCfg):
+class DistillationTrackingEnvCfg(GeneralTrackingEnvCfg): # 师生蒸馏Env, 同时具有学生模型、教师模型、Critic
     """
     Student-teacher distillation environment configuration.
     """
@@ -632,9 +644,8 @@ class DistillationTrackingEnvCfg(GeneralTrackingEnvCfg):
         self.commands = MultiMotionCommandsCfg()
 
 
-
 @configclass
-class OneStageTrackingEnvCfg(GeneralTrackingEnvCfg):
+class OneStageTrackingEnvCfg(GeneralTrackingEnvCfg): # 消融实验配置, 不使用教师模型, 直接训练学生模型
     """
     Teacher-student distillation environment configuration.
     """
@@ -678,8 +689,7 @@ class OneStageTrackingEnvCfg(GeneralTrackingEnvCfg):
 
             # def __post_init__(self):
             #     self.history_length = 5
-            
-
+        
         # observation groups
         policy: PolicyCfg = PolicyCfg()
         critic: PrivilegedCfg = PrivilegedCfg()
@@ -693,9 +703,8 @@ class OneStageTrackingEnvCfg(GeneralTrackingEnvCfg):
         self.commands = MultiMotionCommandsCfg()
 
 
-
 @configclass
-class MultiDistillationTrackingEnvCfg(GeneralTrackingEnvCfg):
+class MultiDistillationTrackingEnvCfg(GeneralTrackingEnvCfg): # 多专家蒸馏, 学生模型观测量, 教师模型观测量, 特权信息
     """
     Teacher-student distillation environment configuration.
     """
@@ -739,9 +748,7 @@ class MultiDistillationTrackingEnvCfg(GeneralTrackingEnvCfg):
                 self.enable_corruption = True
                 self.concatenate_terms = True
                 self.history_length = 5
-
-
-                
+        
         @configclass
         class PrivilegedCfg(ObsGroup):
             command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
@@ -755,7 +762,6 @@ class MultiDistillationTrackingEnvCfg(GeneralTrackingEnvCfg):
             joint_pos = ObsTerm(func=mdp.joint_pos_rel)
             joint_vel = ObsTerm(func=mdp.joint_vel_rel)
             actions = ObsTerm(func=mdp.last_action)
-
 
         @configclass
         class RefVelEstimatorCfg(ObsGroup):
@@ -782,4 +788,3 @@ class MultiDistillationTrackingEnvCfg(GeneralTrackingEnvCfg):
         """Post initialization."""
         super().__post_init__()
         self.commands = MultiMotionCommandsCfg()
-
