@@ -102,12 +102,12 @@ class MySceneCfg(InteractiveSceneCfg):
 
 
 ##
-# MDP settings
+# MDP settings: State/Observation, Action, Transition Probability, Reward
 ##
 
 
 @configclass
-class SingleMotionCommandsCfg:
+class SingleMotionCommandsCfg: # 本Episode只执行一个动作序列
     """Command specifications for the MDP."""
 
     motion = mdp.MotionCommandCfg(
@@ -126,7 +126,7 @@ class SingleMotionCommandsCfg:
         joint_position_range=(-0.1, 0.1),)
 
 @configclass
-class MultiMotionCommandsCfg:
+class MultiMotionCommandsCfg: # 本Episode执行多个动作序列
     """Command specifications for the MDP."""
 
     motion = mdp.MultiMotionCommandCfg(
@@ -149,7 +149,7 @@ class MultiMotionCommandsCfg:
         joint_position_range=(-0.1, 0.1),)
 
 @configclass
-class ActionsCfg:
+class ActionsCfg: # 将Policy的输出结果翻译成目标关节角
     """Action specifications for the MDP."""
 
     joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], use_default_offset=True)
@@ -283,13 +283,12 @@ class EventCfg: # 域泛化
         mode="interval",
         interval_range_s=(1.0, 3.0),
         params={"velocity_range": VELOCITY_RANGE},)
-    
-
 
 @configclass
 class RewardsCfg: # 奖励项
     """Reward terms for the MDP."""
 
+    # 动作平滑率的L2范数 (当前帧力矩与上帧力矩的差异)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-1)
 
     # 关节限位, 惩罚策略让关节超越极限
@@ -356,42 +355,50 @@ class RewardsExpertCfg: # 专家特调奖励项
     Expert reward configuration - MOSAIC.
     """
 
-    motion_global_anchor_pos = RewTerm( # 
+    # 全局锚点追踪: Robot在世界坐标系的位置
+    motion_global_anchor_pos = RewTerm(
         func=mdp.motion_global_anchor_position_error_exp,
         weight=0.5,
         params={"command_name": "motion", "std": 0.3},)
     
+    # 全局锚点追踪: Robot在世界坐标系的朝向
     motion_global_anchor_ori = RewTerm(
         func=mdp.motion_global_anchor_orientation_error_exp,
         weight=0.5,
         params={"command_name": "motion", "std": 0.4},)
     
+    # 相对躯干追踪: 肢体中心点与Ref Motion对齐
     motion_body_pos = RewTerm( # 跟踪奖励
         func=mdp.motion_relative_body_position_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 0.3},)
     
+    # 相对躯干追踪: 肢体朝向与Ref Motion对齐
     motion_body_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 0.4},)
     
+    # 速度追踪: 躯干线速度与Ref Motion对齐
     motion_body_lin_vel = RewTerm( # 
         func=mdp.motion_global_body_linear_velocity_error_exp,
         weight=1.5,
         params={"command_name": "motion", "std": 1.0},)
     
+    # 速度追踪: 躯干角速度与Ref Motion对齐
     motion_body_ang_vel = RewTerm(
         func=mdp.motion_global_body_angular_velocity_error_exp,
         weight=1.5,
         params={"command_name": "motion", "std": 3.14},)
     
+    # 速度追踪: 锚点(机器人盆骨)线速度与Ref Motion对齐
     motion_anchor_lin_vel = RewTerm(
         func=mdp.motion_anchor_linear_velocity_error_exp,
         weight=1.0,  # 2*1.0
         params={"command_name": "motion", "std": 1.0},)
 
-    teleop_body_position_extend = RewTerm( # 上下半身分离追踪
+    # 上下半身分离追踪
+    teleop_body_position_extend = RewTerm(
         func=mdp.teleop_body_position_extend,
         weight=1.0,
         params={
@@ -446,7 +453,7 @@ class RewardsExpertCfg: # 专家特调奖励项
         weight=-10.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},)
     
-    # joint_acc & joint_torque: 限制电机速度与扭矩, 防止烧毁电机
+    # 限制电机速度与扭矩, 防止烧毁电机
     joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)  # -2*2.5e-7
     joint_torque = RewTerm(func=mdp.joint_torques_l2, weight=-1e-5)  # -2*1e-5
     
@@ -716,15 +723,14 @@ class MultiDistillationTrackingEnvCfg(GeneralTrackingEnvCfg): # 多专家蒸馏,
         """Observation specifications for distillation."""
 
         @configclass
-        class PolicyCfg(ObsGroup):
+        class PolicyCfg(ObsGroup): # 学生模型观测量: 无绝对坐标和绝对线速度, 只有本体感知 (姿态角, 角速度, 关节位置, 关节速度)
             """Observations for policy group."""
             command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
-            motion_anchor_ori_b = ObsTerm(
+            motion_anchor_ori_b = ObsTerm( # 姿态角
                 func=mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05))
-            
-            base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
-            joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-            joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5))
+            base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2)) # 角速度
+            joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01)) # 关节位置
+            joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5)) # 关节速度
             actions = ObsTerm(func=mdp.last_action)
 
             def __post_init__(self):
@@ -733,12 +739,11 @@ class MultiDistillationTrackingEnvCfg(GeneralTrackingEnvCfg): # 多专家蒸馏,
                 self.history_length = 5
 
         @configclass
-        class TeacherCfg(ObsGroup):
+        class TeacherCfg(ObsGroup): # 教师模型观测量: 与学生模型同样的观测量, 因为要计算KL散度, 如果观测量不一致会导致分布差异
             """Observations for policy group."""
             command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
             motion_anchor_ori_b = ObsTerm(
                 func=mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05))
-            
             base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
             joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
             joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5))
@@ -750,7 +755,7 @@ class MultiDistillationTrackingEnvCfg(GeneralTrackingEnvCfg): # 多专家蒸馏,
                 self.history_length = 5
         
         @configclass
-        class PrivilegedCfg(ObsGroup):
+        class PrivilegedCfg(ObsGroup): # Critic的特权信息: 绝对位置与速度, 绝对肢体坐标
             command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
             motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b, params={"command_name": "motion"})
             motion_anchor_ori_b = ObsTerm(func=mdp.motion_anchor_ori_b, params={"command_name": "motion"})
