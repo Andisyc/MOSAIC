@@ -498,14 +498,14 @@ class OnPolicyRunner:
                 collection_time = stop - start
                 start = stop
 
-                # compute returns
+                # compute returns 计算广义优势值
                 if self.training_type in ["rl", "mosaic"]:
                     self.alg.compute_returns(privileged_obs)
 
             # update policy Rollout结束, 开始使用buffer计算Loss更新权重
             # Pass current iteration to algorithm for logging (needed by MOSAIC)
             self.alg.current_learning_iteration = it
-            loss_dict = self.alg.update()
+            loss_dict = self.alg.update() # 调用mosaic.py中的update()函数进行权重更新
 
             stop = time.time()
             learn_time = stop - start
@@ -521,11 +521,11 @@ class OnPolicyRunner:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
             # Clear episode infos
-            ep_infos.clear()
+            ep_infos.clear() # 清空记录机器人人得分和存活长度的字典
 
             # Save code state
             if it == start_iter and not self.disable_logs:
-                # obtain all the diff files
+                # obtain all the diff files 防呆设计, 自动扫描本地改动并保存在log_dir
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
 
                 # if possible store them to wandb
