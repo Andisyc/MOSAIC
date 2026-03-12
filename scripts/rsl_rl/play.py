@@ -80,34 +80,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.abspath(log_root_path)
 
     if args_cli.wandb_path:
-        import wandb
+        # import wandb
 
-        run_path = args_cli.wandb_path
+        # run_path = args_cli.wandb_path
 
-        api = wandb.Api()
-        if "model" in args_cli.wandb_path:
-            run_path = "/".join(args_cli.wandb_path.split("/")[:-1])
-        wandb_run = api.run(run_path)
+        # api = wandb.Api()
+        # if "model" in args_cli.wandb_path:
+        #     run_path = "/".join(args_cli.wandb_path.split("/")[:-1])
+        # wandb_run = api.run(run_path)
 
-        # loop over files in the run
-        files = [file.name for file in wandb_run.files() if "model" in file.name]
+        # # loop over files in the run
+        # files = [file.name for file in wandb_run.files() if "model" in file.name]
 
-        # files are all model_xxx.pt find the largest filename
-        if "model" in args_cli.wandb_path:
-            file = args_cli.wandb_path.split("/")[-1]
-        else:
-            file = max(files, key=lambda x: int(x.split("_")[1].split(".")[0]))
+        # # files are all model_xxx.pt find the largest filename
+        # if "model" in args_cli.wandb_path:
+        #     file = args_cli.wandb_path.split("/")[-1]
+        # else:
+        #     file = max(files, key=lambda x: int(x.split("_")[1].split(".")[0]))
 
-        wandb_file = wandb_run.file(str(file))
-        wandb_file.download("./logs/rsl_rl/temp", replace=True)
+        # wandb_file = wandb_run.file(str(file))
+        # wandb_file.download("./logs/rsl_rl/temp", replace=True)
 
-        print(f"[INFO]: Loading model checkpoint from: {run_path}/{file}")
-        resume_path = f"./logs/rsl_rl/temp/{file}"
+        resume_path = args_cli.resume_path
+        env_cfg.commands.motion.motion_file = args_cli.motion_file
+        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+
+        # print(f"[INFO]: Loading model checkpoint from: {run_path}/{file}")
+        # resume_path = f"./logs/rsl_rl/temp/{file}"
 
     else:
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        # resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        resume_path = log_root_path + '/wave-single/model_16000.pt'
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+        env_cfg.commands.motion.motion_file = args_cli.motion_file
 
     # Load policy configuration from checkpoint's params/agent.yaml to ensure compatibility
     # This overrides the default configuration with the checkpoint's actual configuration
@@ -237,8 +243,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         path=export_model_dir,
         filename="policy.onnx",
         ref_vel_estimator=ref_vel_estimator,
-        ref_vel_estimator_obs_dim=ref_vel_estimator_obs_dim,
-    )
+        ref_vel_estimator_obs_dim=ref_vel_estimator_obs_dim,)
 
     attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
 
