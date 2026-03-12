@@ -51,13 +51,13 @@ class MySceneCfg(InteractiveSceneCfg):
     #         friction_combine_mode="multiply",
     #         restitution_combine_mode="multiply",
     #         static_friction=1.0,
-    #         dynamic_friction=1.0,
-    #     ),
+    #         dynamic_friction=1.0,),
+    #     
     #     visual_material=sim_utils.MdlFileCfg(
     #         mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
-    #         project_uvw=True,
-    #     ),
-    # )
+    #         project_uvw=True,),)
+
+    # 创建地形: 50%的平地, 50%的轻微颠簸地形
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator", 
@@ -86,22 +86,19 @@ class MySceneCfg(InteractiveSceneCfg):
         visual_material=sim_utils.MdlFileCfg(
             mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
             project_uvw=True,),)
-        
     
-    # robots
-    robot: ArticulationCfg = MISSING
-    # lights
-    light = AssetBaseCfg(
+    robot: ArticulationCfg = MISSING # robots
+    
+    light = AssetBaseCfg( # lights
         prim_path="/World/light",
         spawn=sim_utils.DistantLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),)
     
-    sky_light = AssetBaseCfg(
+    sky_light = AssetBaseCfg( # 
         prim_path="/World/skyLight",
         spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=1000.0),)
     
-    contact_forces = ContactSensorCfg(
+    contact_forces = ContactSensorCfg( # 虚拟接触力传感器
         prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True, force_threshold=10.0, debug_vis=True)
-    
 
 
 ##
@@ -127,7 +124,6 @@ class SingleMotionCommandsCfg:
         
         velocity_range=VELOCITY_RANGE,
         joint_position_range=(-0.1, 0.1),)
-    
 
 @configclass
 class MultiMotionCommandsCfg:
@@ -158,13 +154,12 @@ class ActionsCfg:
 
     joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], use_default_offset=True)
 
-
 @configclass
 class ObservationsCfg:
     """Observation specifications for the MDP."""
 
     @configclass
-    class PolicyCfg(ObsGroup):
+    class PolicyCfg(ObsGroup): # 学生模型的Actor的观测量
         """Observations for policy group."""
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
         motion_anchor_pos_b = ObsTerm(
@@ -185,7 +180,7 @@ class ObservationsCfg:
             self.history_length = 5
 
     @configclass
-    class PrivilegedCfg(ObsGroup):
+    class PrivilegedCfg(ObsGroup): # 学生模型的Critic的特权信息
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
         motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b, params={"command_name": "motion"})
         motion_anchor_ori_b = ObsTerm(func=mdp.motion_anchor_ori_b, params={"command_name": "motion"})
@@ -253,11 +248,11 @@ class ObservationsExpertCfg:
     critic: PrivilegedCfg = PrivilegedCfg()
 
 @configclass
-class EventCfg:
+class EventCfg: # 域泛化
     """Configuration for events."""
 
     # startup
-    physics_material = EventTerm(
+    physics_material = EventTerm( # 地面摩擦力
         func=mdp.randomize_rigid_body_material,
         mode="startup",
         params={
@@ -267,7 +262,7 @@ class EventCfg:
             "restitution_range": (0.0, 0.5),
             "num_buckets": 64,},)
 
-    add_joint_default_pos = EventTerm(
+    add_joint_default_pos = EventTerm( # 电机零位偏差
         func=mdp.randomize_joint_default_pos,
         mode="startup",
         params={
@@ -275,7 +270,7 @@ class EventCfg:
             "pos_distribution_params": (-0.01, 0.01),
             "operation": "add",},)
 
-    base_com = EventTerm(
+    base_com = EventTerm( # 机器人质心
         func=mdp.randomize_rigid_body_com,
         mode="startup",
         params={
@@ -283,7 +278,7 @@ class EventCfg:
             "com_range": {"x": (-0.025, 0.025), "y": (-0.05, 0.05), "z": (-0.05, 0.05)},},)
 
     # interval
-    push_robot = EventTerm(
+    push_robot = EventTerm( # 随机外力
         func=mdp.push_by_setting_velocity,
         mode="interval",
         interval_range_s=(1.0, 3.0),
@@ -342,8 +337,7 @@ class RewardsCfg:
                 "contact_forces",
                 body_names=[
                     r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_wrist_yaw_link$)(?!right_wrist_yaw_link$).+$"
-                ],
-            ),
+                ],),
             "threshold": 1.0,},)
 
 @configclass
@@ -352,7 +346,7 @@ class RewardsExpertCfg:
     Expert reward configuration - MOSAIC.
     """
 
-    motion_global_anchor_pos = RewTerm(
+    motion_global_anchor_pos = RewTerm( # 
         func=mdp.motion_global_anchor_position_error_exp,
         weight=0.5,
         params={"command_name": "motion", "std": 0.3},)
@@ -362,7 +356,7 @@ class RewardsExpertCfg:
         weight=0.5,
         params={"command_name": "motion", "std": 0.4},)
     
-    motion_body_pos = RewTerm(
+    motion_body_pos = RewTerm( # 跟踪奖励
         func=mdp.motion_relative_body_position_error_exp,
         weight=1.0,
         params={"command_name": "motion", "std": 0.3},)
@@ -372,7 +366,7 @@ class RewardsExpertCfg:
         weight=1.0,
         params={"command_name": "motion", "std": 0.4},)
     
-    motion_body_lin_vel = RewTerm(
+    motion_body_lin_vel = RewTerm( # 
         func=mdp.motion_global_body_linear_velocity_error_exp,
         weight=1.5,
         params={"command_name": "motion", "std": 1.0},)
@@ -431,8 +425,7 @@ class RewardsExpertCfg:
                 "contact_forces",
                 body_names=[
                     r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_wrist_yaw_link$)(?!right_wrist_yaw_link$).+$"
-                ],
-            ),
+                ],),
             "threshold": 1.0,},)
     
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-1)  # 2*1e-1
@@ -554,7 +547,7 @@ class DistillationTrackingEnvCfg(GeneralTrackingEnvCfg):
         """Observation specifications for distillation."""
 
         @configclass
-        class PolicyCfg(ObsGroup):
+        class PolicyCfg(ObsGroup): # 学生模型观测量
             """Observations for policy group."""
             command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
             motion_anchor_ori_b = ObsTerm(
@@ -571,7 +564,7 @@ class DistillationTrackingEnvCfg(GeneralTrackingEnvCfg):
                 self.history_length = 5
 
         @configclass
-        class TeacherCfg(ObsGroup):
+        class TeacherCfg(ObsGroup): # 教师模型观测量
             """Teacher observations - teacehr information."""
             command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
             motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b, params={"command_name": "motion"})
