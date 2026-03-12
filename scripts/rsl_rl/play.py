@@ -111,7 +111,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         # resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-        resume_path = log_root_path + '/wave-single/model_16000.pt'
+        resume_path = log_root_path + '/onnx/gmt.pt'
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         env_cfg.commands.motion.motion_file = args_cli.motion_file
 
