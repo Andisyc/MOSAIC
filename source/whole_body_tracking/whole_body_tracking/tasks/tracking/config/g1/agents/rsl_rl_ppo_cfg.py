@@ -21,8 +21,7 @@ class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=1.0,
         actor_hidden_dims=[1024, 1024, 512, 256],
         critic_hidden_dims=[1024, 1024, 512, 256],
-        activation="elu",
-    )
+        activation="elu",)
 
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
@@ -36,8 +35,7 @@ class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         gamma=0.99,
         lam=0.95,
         desired_kl=0.01,
-        max_grad_norm=1.0,
-    )
+        max_grad_norm=1.0,)
 
 
 LOW_FREQ_SCALE = 0.5
@@ -63,15 +61,14 @@ class G1FlatDistillationRunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=1.0,
         student_hidden_dims=[1024, 1024, 512, 256],
         teacher_hidden_dims=[1024, 1024, 512, 256],
-        activation="elu",
-    )
+        activation="elu",)
 
     algorithm = RslRlDistillationAlgorithmCfg(
         class_name="Distillation",
         num_learning_epochs=5,
         learning_rate=1.0e-3,
-        gradient_length = 15
-    )
+        gradient_length = 15)
+    
 
 @configclass
 class G1FlatKLDistillationRunnerCfg(RslRlOnPolicyRunnerCfg):
@@ -92,5 +89,4 @@ class G1FlatKLDistillationRunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=1.0,
         student_hidden_dims=[1024, 1024, 512, 256],
         teacher_hidden_dims=[1024, 1024, 512, 256],
-        activation="elu",
-    )
+        activation="elu",)

@@ -21,8 +21,7 @@ class G1FlatMOSAICRunnerCfg(RslRlOnPolicyRunnerCfg):
         critic_hidden_dims=[1024, 1024, 512, 256],
         activation="elu",
         ref_vel_skip_first_layer=False, 
-        ref_vel_dim=3, 
-    )
+        ref_vel_dim=3, )
 
     algorithm = RslRlMOSAICAlgorithmCfg(
         # ========== Mode Selection ==========
@@ -51,8 +50,7 @@ class G1FlatMOSAICRunnerCfg(RslRlOnPolicyRunnerCfg):
         expert_allow_repeat_sampling=False,
         lambda_teacher_init=1.0,
         lambda_teacher_decay=0.995,
-        lambda_teacher_min=0.1,
-    )
+        lambda_teacher_min=0.1,)
 
 
 @configclass
@@ -73,8 +71,7 @@ class G1FlatMOSAICHybridRunnerCfg(RslRlOnPolicyRunnerCfg):
         critic_hidden_dims=[1024, 1024, 512, 256],
         activation="elu",
         ref_vel_skip_first_layer=False,
-        ref_vel_dim=3,
-    )
+        ref_vel_dim=3,)
 
     algorithm = RslRlMOSAICAlgorithmCfg(
         # ========== Mode Selection ==========
@@ -123,8 +120,7 @@ class G1FlatMOSAICHybridRunnerCfg(RslRlOnPolicyRunnerCfg):
         # ========== Reference Velocity Estimator Configuration ==========
         use_estimate_ref_vel=False, 
         ref_vel_estimator_checkpoint_path=None,
-        ref_vel_estimator_type="transformer", 
-    )
+        ref_vel_estimator_type="transformer", )
 
 
 @configclass
@@ -146,8 +142,7 @@ class G1FlatMOSAICPureDistillationRunnerCfg(RslRlOnPolicyRunnerCfg):
         critic_hidden_dims=[1024, 1024, 512, 256],
         activation="elu",
         ref_vel_skip_first_layer=True, 
-        ref_vel_dim=3,
-    )
+        ref_vel_dim=3,)
 
     algorithm = RslRlMOSAICAlgorithmCfg(
         # ========== Mode Selection ==========
@@ -199,8 +194,7 @@ class G1FlatMOSAICPureDistillationRunnerCfg(RslRlOnPolicyRunnerCfg):
         # ========== Reference Velocity Estimator Configuration ==========
         use_estimate_ref_vel=True, 
         ref_vel_estimator_checkpoint_path="path/to/ref_vel_estimator_checkpoint.pt",  # Optional checkpoint for pre-trained estimator
-        ref_vel_estimator_type="mlp",  # "mlp" or "transformer"
-    )
+        ref_vel_estimator_type="mlp",)  # "mlp" or "transformer"
 
 
 @configclass
@@ -229,8 +223,7 @@ class G1FlatMOSAICRLContinueRunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=0.5, 
         actor_hidden_dims=[1024, 1024, 512, 256],
         critic_hidden_dims=[1024, 1024, 512, 256],
-        activation="elu",
-    )
+        activation="elu",)
 
     algorithm = RslRlMOSAICAlgorithmCfg(
         # ========== Mode Selection ==========
@@ -281,8 +274,7 @@ class G1FlatMOSAICRLContinueRunnerCfg(RslRlOnPolicyRunnerCfg):
         # ========== Reference Velocity Estimator Configuration ==========
         use_estimate_ref_vel=False,
         ref_vel_estimator_checkpoint_path=None,
-        ref_vel_estimator_type="transformer",  # "mlp" or "transformer"
-    )
+        ref_vel_estimator_type="transformer",)  # "mlp" or "transformer"
 
 
 @configclass
@@ -309,8 +301,7 @@ class G1FlatMOSAICRLContinueResidualRunnerCfg(RslRlOnPolicyRunnerCfg):
         # Standard ActorCritic parameters
         init_noise_std=0.8,
         noise_std_type="scalar",
-        activation="elu",
-    )
+        activation="elu",)
 
     algorithm = RslRlMOSAICAlgorithmCfg(
         # ========== Mode Selection ==========
@@ -359,8 +350,7 @@ class G1FlatMOSAICRLContinueResidualRunnerCfg(RslRlOnPolicyRunnerCfg):
         # ========== Reference Velocity Estimator Configuration ==========
         use_estimate_ref_vel=False, 
         ref_vel_estimator_checkpoint_path=None,
-        ref_vel_estimator_type="transformer",  # "mlp" or "transformer"
-    )
+        ref_vel_estimator_type="transformer",)  # "mlp" or "transformer"
 
 
 @configclass
@@ -385,8 +375,8 @@ class G1FlatMOSAICMultiTeacherResidualRunnerCfg(RslRlOnPolicyRunnerCfg):
         activation="elu",
         num_ref_vel_estimator_obs=305,
         ref_vel_estimator_checkpoint_path="path/to/ref_vel_estimator_checkpoint.pt",
-        ref_vel_estimator_type="mlp",
-    )
+        ref_vel_estimator_type="mlp",)
+    
 
     algorithm = RslRlMOSAICAlgorithmCfg(
         hybrid=True,
@@ -406,13 +396,13 @@ class G1FlatMOSAICMultiTeacherResidualRunnerCfg(RslRlOnPolicyRunnerCfg):
         # Multi-teacher BC configuration
         teacher_checkpoint_path={
             "motions": "path/to/gmt_checkpoint.pt", # same as gmt_checkpoint_path="path/to/gmt_checkpoint.pt when using one stage rl training for gmt",
-            "teleop_motions": "path/to/finetuned_gmt_checkpoint.pt",
-        },
+            "teleop_motions": "path/to/finetuned_gmt_checkpoint.pt",},
+        
         # Teacher observation source mapping: which observations each teacher uses
         teacher_obs_source_mapping={
             "motions": "teacher",  # Use teacher observations
-            "teleop_motions": "policy",     # Use policy observations
-        },
+            "teleop_motions": "policy",},     # Use policy observations
+        
         lambda_teacher_init=1.0,
         lambda_teacher_decay=0.995,
         lambda_teacher_min=1.0,
@@ -431,5 +421,5 @@ class G1FlatMOSAICMultiTeacherResidualRunnerCfg(RslRlOnPolicyRunnerCfg):
         gradient_accumulation_steps=1,
         teacher_critic_checkpoint_path=None,
         teacher_critic_frozen=False,
-        train_critic_during_distillation=False,
-    )
+        train_critic_during_distillation=False,)
+    
