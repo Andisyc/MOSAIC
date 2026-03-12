@@ -429,21 +429,25 @@ class RewardsExpertCfg:
             "threshold": 1.0,},)
     
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-1)  # 2*1e-1
+
+    # 限制关节极限, 防止关节超限
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-10.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},)
     
+    # joint_acc & joint_torque: 限制电机速度与扭矩, 防止烧毁电机
     joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)  # -2*2.5e-7
     joint_torque = RewTerm(func=mdp.joint_torques_l2, weight=-1e-5)  # -2*1e-5
     
 @configclass
-class TerminationsCfg:
+class TerminationsCfg: # Episode结束判定
     """Termination terms for the MDP."""
 
     motion_end = DoneTerm(func=mdp.motion_end, params={"command_name": "motion"}, time_out=True)
-    time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    anchor_pos = DoneTerm(
+    time_out = DoneTerm(func=mdp.time_out, time_out=True) # 超时
+
+    anchor_pos = DoneTerm( # 关节触地
         func=mdp.bad_anchor_pos_z_only,
         params={"command_name": "motion", "threshold": 0.25},)
     
@@ -451,7 +455,7 @@ class TerminationsCfg:
         func=mdp.bad_anchor_ori,
         params={"asset_cfg": SceneEntityCfg("robot"), "command_name": "motion", "threshold": 0.8},)
     
-    ee_body_pos = DoneTerm(
+    ee_body_pos = DoneTerm( # 根节点触地
         func=mdp.bad_motion_body_pos_z_only,
         params={
             "command_name": "motion",
@@ -481,6 +485,7 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
 
     # Scene settings
     scene: MySceneCfg = MySceneCfg(num_envs=8192, env_spacing=2.5)
+
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
@@ -497,11 +502,13 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
         # general settings
         self.decimation = 4
         self.episode_length_s = 10.0
+        
         # simulation settings
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
         self.sim.physx.gpu_max_rigid_patch_count = 15 * 2**17
+
         # viewer settings
         self.viewer.eye = (3.5, 3.5, 3.5)
         self.viewer.origin_type = "env"
