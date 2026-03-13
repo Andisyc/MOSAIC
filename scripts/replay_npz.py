@@ -108,6 +108,11 @@ def create_replay_scene_cfg(robot_cfg: ArticulationCfg):
 
 
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
+    # 必须在simulation_app启动后导入
+    # 必须使用--enable_cameras参数
+    import imageio
+    import omni.replicator.core as rep
+    
     # Extract scene entities
     robot: Articulation = scene["robot"]
     # Define simulation stepping
@@ -128,16 +133,38 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     motion = MotionLoader(
         motion_file,
         torch.tensor([0], dtype=torch.long, device=sim.device),
-        sim.device,
-    )
+        sim.device,)
+    
     time_steps = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
+
+    # === [新增 1/3] 初始化录像机与画布 ===
+    video_frames = []
+
+    # 绑定IsaacSim的默认透视相机, 设定分辨率为720p
+    # "/OmniverseKit_Persp"是IsaacSim的默认透视相机路径
+    render_product = rep.create.render_product("/OmniverseKit_Persp", (1280, 720))
+
+    # 挂载图像传感器: Annotator是Replicator的核心组件
+    # "rgb"表示使用真实彩色画面数据, 还可以挂载"depth"深度图
+    rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+    rgb_annotator.attach([render_product])
+    print("🎥 Recoder initialized, starting recording...")
+    # ====================================
 
     # Simulation loop
     while simulation_app.is_running():
         time_steps += 1
-        reset_ids = time_steps >= motion.time_step_total
-        time_steps[reset_ids] = 0
 
+        # reset_ids = time_steps >= motion.time_step_total
+        # time_steps[reset_ids] = 0
+
+        # === [新增 2/3] 动作播完一遍后自动退出循环 ===
+        # 安全锁: 时间步到动作最后帧时主动跳出循环
+        if time_steps[0] >= motion.time_step_total - 1:
+            print("⏳ Motion finished, prepare for recording...")
+            break
+        # =============================================
+        
         root_states = robot.data.default_root_state.clone()
         root_states[:, :3] = motion.body_pos_w[time_steps][:, 0] + scene.env_origins[:, None, :]
         root_states[:, 3:7] = motion.body_quat_w[time_steps][:, 0]
@@ -147,12 +174,45 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         robot.write_root_state_to_sim(root_states)
         robot.write_joint_state_to_sim(motion.joint_pos[time_steps], motion.joint_vel[time_steps])
         scene.write_data_to_sim()
-        sim.render()  # We don't want physic (sim.step())
-        scene.update(sim_dt)
 
+        # sim.render() # We don't want physic (sim.step())
+        # scene.update(sim_dt)
+
+        # pos_lookat = root_states[0, :3].cpu().numpy()
+        # sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
+
+        # === [修改] 极其关键：必须先移动相机，再让底层渲染！ ===
+        # 渲染(render)前把相机位置摆好
+        # 读取机器人当前的质心坐标 (X, Y, Z)
         pos_lookat = root_states[0, :3].cpu().numpy()
-        sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
 
+        # set_camera_view(相机所在位置, 镜头对准的位置)
+        # 相机架设在机器人质心的侧后方上方并且镜头自动平滑跟随质心
+        sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
+        
+        # 物理状态步进更新
+        # 显卡渲染当前帧
+        scene.update(sim_dt)
+        sim.render()
+        # =======================================================
+
+        # === [新增 3/3] 从相机抓取当前帧并存入内存 ===
+        # 渲染完成抽取显存里的像素矩阵
+        rgb_data = rgb_annotator.get_data()
+
+        # 防空判断: 引擎刚启动的前几帧底层可能还没准备好数据
+        if rgb_data is not None and rgb_data.size > 0:
+            # 底层抓出来的是RGBA格式, 我们只需要前3个通道(RGB)
+            video_frames.append(rgb_data[..., :3])
+        # =============================================
+
+    # === 退出循环后：将内存中的画面生成 MP4 文件 ===
+    if len(video_frames) > 0:
+        save_path = "./motion_replay.mp4"
+        # 物理dt通常为0.02, 所以视频FPS为50
+        fps = int(1.0 / sim_dt)
+        imageio.mimsave(save_path, video_frames, fps=fps)
+        print(f"🎉 video saved at: {save_path}")
 
 def main():
     # Resolve robot platform from registry
@@ -169,6 +229,7 @@ def main():
     scene_cfg = scene_cfg_class(num_envs=1, env_spacing=2.0)
     scene = InteractiveScene(scene_cfg)
     sim.reset()
+
     # Run the simulator
     run_simulator(sim, scene)
 
@@ -176,5 +237,6 @@ def main():
 if __name__ == "__main__":
     # run the main function
     main()
+
     # close sim app
     simulation_app.close()
