@@ -115,6 +115,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     
     # Extract scene entities
     robot: Articulation = scene["robot"]
+
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
 
@@ -208,9 +209,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
     # === 退出循环后：将内存中的画面生成 MP4 文件 ===
     if len(video_frames) > 0:
-        save_path = "./motion_replay.mp4"
-        # 物理dt通常为0.02, 所以视频FPS为50
-        fps = int(1.0 / sim_dt)
+        save_path = "./motion_mp4/" + os.path.splitext(os.path.basename(motion_file))[0] + "mp4"
+        fps = int(1.0 / sim_dt) # 物理dt通常为0.02, 所以视频FPS为50
         imageio.mimsave(save_path, video_frames, fps=fps)
         print(f"🎉 video saved at: {save_path}")
 
