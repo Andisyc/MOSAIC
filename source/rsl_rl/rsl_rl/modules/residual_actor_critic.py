@@ -157,19 +157,24 @@ class ResidualActorCritic(nn.Module):
 
             # IMPORTANT: Layer1 input dimension tells us the ACTUAL policy_obs_dim used during training
             # This might differ from expected due to bugs or different configurations
-            layer1_input_dim = state_dict["actor.actor_layer1.weight"].shape[1] # 设置第一层的输入维度
+            layer1_input_dim = state_dict["actor.actor_layer1.weight"].shape[1] # 设置第一层的输入维度 (观测向量的维度)
             gmt_critic_input_dim = state_dict["critic.0.weight"].shape[1] # 设置GMT的Critic第一层输入维度
 
-            # Infer ref_vel_dim from the second layer input size difference
-            layer1_output = state_dict["actor.actor_layer1.weight"].shape[0]
-            remaining_0_input = state_dict["actor.actor_remaining.0.weight"].shape[1]
+            # Infer ref_vel_dim from the second layer input size difference 通过两层维度反推参考速度向量维度
+            layer1_output = state_dict["actor.actor_layer1.weight"].shape[0] # 设置第一层的输出维度
+            remaining_0_input = state_dict["actor.actor_remaining.0.weight"].shape[1] # 设置第二层输入维度
+
+            # 参考速度维度是第二层输入维度减去第一层输出维度 (第二层输入时拼接了参考速度向量)
+            # 在第一层结束才输入ref_vel是因为观测量太高维, 直接输入会导致信息淹没, 但ref_vel
+            # 相比其他信息更重要 (代表了往哪走), 因此将第一层作为Encoder, 压缩信息后才进行拼接
             ref_vel_dim = remaining_0_input - layer1_output
 
             # Calculate gmt_actor_input_dim: layer1_input + ref_vel_dim
             # This is the total observation dimension expected by GMT policy
-            gmt_actor_input_dim = layer1_input_dim + ref_vel_dim
+            gmt_actor_input_dim = layer1_input_dim + ref_vel_dim # 在IsaacLab中注册时需要总观测维度
 
-            # Find the last actor layer in actor_remaining
+            # Find the last actor layer in actor_remaining 使用remaining的命名方式是因为ref_vel在第二层才输入, 导致梯度截断, 因此特意申明
+            # 寻找最后一层维度 (输出动作维度), 如果无法找到, 就使用输入层的维度
             actor_remaining_keys = [k for k in state_dict.keys() if k.startswith("actor.actor_remaining.") and ".weight" in k]
             if actor_remaining_keys:
                 last_actor_key = max(actor_remaining_keys, key=lambda k: int(k.split(".")[2]))
@@ -190,8 +195,7 @@ class ResidualActorCritic(nn.Module):
         if gmt_num_actions != num_actions:
             raise ValueError(
                 f"GMT action dimension ({gmt_num_actions}) does not match "
-                f"specified num_actions ({num_actions})"
-            )
+                f"specified num_actions ({num_actions})")
 
         print(f"[ResidualActorCritic] GMT architecture: "
               f"actor_input={gmt_actor_input_dim}, "
@@ -213,24 +217,24 @@ class ResidualActorCritic(nn.Module):
                 gmt_policy_cfg["ref_vel_skip_first_layer"] = True
                 gmt_policy_cfg["ref_vel_dim"] = ref_vel_dim
 
+        # GMT实例化: 依据架构创建实例
         self.gmt_policy = ActorCritic(
             num_actor_obs=gmt_actor_input_dim,
             num_critic_obs=gmt_critic_input_dim,
             num_actions=gmt_num_actions,
-            **gmt_policy_cfg
-        )
+            **gmt_policy_cfg)
 
         # Load GMT weights directly (no conversion needed if architectures match)
-        self.gmt_policy.load_state_dict(state_dict)
+        self.gmt_policy.load_state_dict(state_dict) # 导入GMT权重
 
         # Freeze GMT completely
-        self.gmt_policy.eval()
-        for param in self.gmt_policy.parameters():
+        self.gmt_policy.eval() # GMT设为eval模式
+        for param in self.gmt_policy.parameters(): # 梯度置为False
             param.requires_grad = False
         print("[ResidualActorCritic] GMT policy frozen (all parameters require_grad=False)")
 
         # Load GMT's observation normalizer (critical!)
-        self.gmt_normalizer = None
+        self.gmt_normalizer = None # 导入GMT观测量归一器
         if "obs_norm_state_dict" in checkpoint:
             # Infer normalizer dimension from checkpoint (usually policy_obs_dim, not gmt_actor_input_dim)
             # This is because normalizer operates on policy_obs before ref_vel is concatenated
@@ -238,8 +242,7 @@ class ResidualActorCritic(nn.Module):
             normalizer_dim = obs_norm_state["_mean"].shape[1]
 
             self.gmt_normalizer = EmpiricalNormalization(
-                shape=[normalizer_dim], until=1.0e8
-            )
+                shape=[normalizer_dim], until=1.0e8)
             self.gmt_normalizer.load_state_dict(obs_norm_state)
             self.gmt_normalizer.eval()
             self.gmt_normalizer.until = 0  # Freeze statistics
@@ -248,7 +251,7 @@ class ResidualActorCritic(nn.Module):
             print("[ResidualActorCritic] WARNING: No observation normalizer found in GMT checkpoint!")
 
         # ========== Load Ref Vel Estimator ==========
-        self.ref_vel_estimator = None
+        self.ref_vel_estimator = None # 导入速度归一器
         self.num_ref_vel_estimator_obs = num_ref_vel_estimator_obs
 
         if ref_vel_estimator_checkpoint_path is not None:
@@ -263,22 +266,19 @@ class ResidualActorCritic(nn.Module):
                 from rsl_rl.modules import VelocityEstimator
                 self.ref_vel_estimator = VelocityEstimator.load(
                     ref_vel_estimator_checkpoint_path,
-                    device=str(next(self.gmt_policy.parameters()).device)
-                )
+                    device=str(next(self.gmt_policy.parameters()).device))
             elif ref_vel_estimator_type == "transformer":
                 from rsl_rl.modules import VelocityEstimatorTransformer
                 estimator_checkpoint = torch.load(
                     ref_vel_estimator_checkpoint_path,
                     map_location=str(next(self.gmt_policy.parameters()).device),
-                    weights_only=False
-                )
+                    weights_only=False)
                 self.ref_vel_estimator = VelocityEstimatorTransformer(
                     feature_dim=estimator_checkpoint.get('feature_dim', 61),
                     history_length=estimator_checkpoint.get('history_length', 5),
                     d_model=estimator_checkpoint.get('d_model', 128),
                     nhead=estimator_checkpoint.get('nhead', 4),
-                    num_layers=estimator_checkpoint.get('num_layers', 2),
-                )
+                    num_layers=estimator_checkpoint.get('num_layers', 2),)
                 self.ref_vel_estimator.load_state_dict(estimator_checkpoint['model_state_dict'])
                 self.ref_vel_estimator = self.ref_vel_estimator.to(next(self.gmt_policy.parameters()).device)
                 print(f"[ResidualActorCritic] Transformer estimator loaded successfully")
@@ -294,35 +294,45 @@ class ResidualActorCritic(nn.Module):
             print("[ResidualActorCritic] WARNING: No ref_vel estimator provided, will use zero padding for GMT policy")
 
         # ========== Build Residual Network ==========
+        # RES实例化
         self.residual_actor = self._build_residual_actor(
             input_dim=num_actor_obs,
             output_dim=num_actions,
             hidden_dims=residual_hidden_dims,
             activation=activation_fn,
-            last_layer_gain=residual_last_layer_gain
-        )
+            last_layer_gain=residual_last_layer_gain)
         print(f"[ResidualActorCritic] Residual network: {self.residual_actor}")
 
         # ========== Build Critic ==========
         critic_layers: list[nn.Module] = []
         prev_dim = num_critic_obs
+        
+        # 创建critic网络架构
         if critic_hidden_dims:
+            # 创建首层: 线性层+激活层
             critic_layers.append(nn.Linear(prev_dim, critic_hidden_dims[0]))
             critic_layers.append(activation_fn)
+
+            # 创建隐藏层
             for layer_index in range(len(critic_hidden_dims)):
+                # 取出每层的输入维度
                 in_dim = critic_hidden_dims[layer_index]
+
+                # 达到最后一层时将输出维度设置为1, 因为只需要输出评分
                 if layer_index == len(critic_hidden_dims) - 1:
                     critic_layers.append(nn.Linear(in_dim, 1))
-                else:
+                else: # 取出每层的输出维度并创建层级: 线性层+激活层
                     out_dim = critic_hidden_dims[layer_index + 1]
                     critic_layers.append(nn.Linear(in_dim, out_dim))
                     critic_layers.append(activation_fn)
         else:
             critic_layers.append(nn.Linear(prev_dim, 1))
+
+        # List 2 Sequence实例化Critic网络
         self.critic = nn.Sequential(*critic_layers)
         print(f"[ResidualActorCritic] Critic MLP: {self.critic}")
 
-        if init_critic_from_gmt:
+        if init_critic_from_gmt: # 导入GMT的Critic权重作为RES的Critic
             self._load_critic_from_checkpoint(state_dict, num_critic_obs)
 
         # ========== Action Noise ==========
@@ -335,6 +345,7 @@ class ResidualActorCritic(nn.Module):
 
         # Action distribution (populated in update_distribution)
         self.distribution = None
+
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
 
@@ -345,8 +356,7 @@ class ResidualActorCritic(nn.Module):
             self.gmt_policy,
             self.residual_actor,
             gmt_actor_input_dim,
-            num_actor_obs
-        )
+            num_actor_obs)
         print("[ResidualActorCritic] Created composed actor for ONNX export")
 
         # ========== Store GMT input dimension for padding ==========
