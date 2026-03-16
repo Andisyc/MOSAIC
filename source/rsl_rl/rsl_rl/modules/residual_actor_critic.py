@@ -52,21 +52,20 @@ class ComposedActor(nn.Module):
                 padding = torch.zeros(
                     *observations.shape[:-1], padding_size,
                     device=observations.device,
-                    dtype=observations.dtype
-                )
+                    dtype=observations.dtype)
                 gmt_obs = torch.cat([observations, padding], dim=-1)
             else:
                 gmt_obs = observations
         elif obs_dim == self.gmt_actor_input_dim:
             # Input is already concatenated [policy_obs, ref_vel] (773 dims)
             gmt_obs = observations
+            
             # Extract policy_obs for residual actor
             policy_obs = observations[:, :self.num_actor_obs]
         else:
             raise ValueError(
                 f"Unexpected observation dimension: {obs_dim}. "
-                f"Expected {self.num_actor_obs} or {self.gmt_actor_input_dim}"
-            )
+                f"Expected {self.num_actor_obs} or {self.gmt_actor_input_dim}")
 
         # GMT forward (frozen, no grad)
         with torch.no_grad():

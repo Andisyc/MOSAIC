@@ -115,7 +115,9 @@ class OnPolicyRunner:
         # IMPORTANT: For ResidualActorCritic, do NOT adjust num_actor_obs (it handles estimator internally)
         num_actor_obs = num_obs  # Start with policy obs dimension 动作维度
 
-        # evaluate the policy class
+        # evaluate the policy class (非常危险的做法)
+        # eval会将字符串直接作为python代码执行, class_name="ResidualActorCritic"
+        # eval会直接将字符串"ResidualActorCritic"变为ResidualActorCritic类的实例
         policy_class = eval(self.policy_cfg.pop("class_name"))
 
         # Check if using ResidualActorCritic (special handling for estimator dimension)
