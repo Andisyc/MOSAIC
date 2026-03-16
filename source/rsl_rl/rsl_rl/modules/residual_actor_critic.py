@@ -143,13 +143,13 @@ class ResidualActorCritic(nn.Module):
 
         # ========== Load GMT Policy ==========
         print(f"[ResidualActorCritic] Loading GMT policy from: {gmt_checkpoint_path}")
-        checkpoint = torch.load(gmt_checkpoint_path, map_location="cpu", weights_only=False)
+        checkpoint = torch.load(gmt_checkpoint_path, map_location="cpu", weights_only=False) # 导入checkpoint
 
         # Infer GMT architecture from checkpoint
-        state_dict = checkpoint["model_state_dict"]
+        state_dict = checkpoint["model_state_dict"] # 导入权重
 
         # Detect checkpoint format: standard or ref_vel skip connection
-        has_skip_connection = "actor.actor_layer1.weight" in state_dict
+        has_skip_connection = "actor.actor_layer1.weight" in state_dict # 确定有跳连接的布尔变量
 
         if has_skip_connection:
             # Skip connection format: actor.actor_layer1, actor.actor_remaining.X
@@ -157,8 +157,8 @@ class ResidualActorCritic(nn.Module):
 
             # IMPORTANT: Layer1 input dimension tells us the ACTUAL policy_obs_dim used during training
             # This might differ from expected due to bugs or different configurations
-            layer1_input_dim = state_dict["actor.actor_layer1.weight"].shape[1]
-            gmt_critic_input_dim = state_dict["critic.0.weight"].shape[1]
+            layer1_input_dim = state_dict["actor.actor_layer1.weight"].shape[1] # 设置第一层的输入维度
+            gmt_critic_input_dim = state_dict["critic.0.weight"].shape[1] # 设置GMT的Critic第一层输入维度
 
             # Infer ref_vel_dim from the second layer input size difference
             layer1_output = state_dict["actor.actor_layer1.weight"].shape[0]
