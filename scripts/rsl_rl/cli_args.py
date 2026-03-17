@@ -32,12 +32,12 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     arg_group.add_argument("--load_teacher_run", type=str, default=None, help="Name of the teacher run folder (for MOSAIC).")
     arg_group.add_argument("--teacher_checkpoint", type=str, default=None, help="Teacher checkpoint file (for MOSAIC).")
 
-    # -- logger arguments
+    # -- logger arguments: log_project_name (wandb的项目名), wandb_path (wandb的用户名)
     arg_group.add_argument("--logger", type=str, default="wandb", choices={"wandb", "tensorboard", "neptune"}, help="Logger module to use.")
     arg_group.add_argument("--log_project_name", type=str, default="MOSAIC", help="Name of the logging project when using wandb or neptune.")
     arg_group.add_argument("--wandb_path", type=str, default="Andisyc", help="Name of the logging project when using wandb or neptune.")
 
-    # -- experiment arguments
+    # -- experiment arguments: experiment_name (本地logs/的权重文件夹), run_name (wandb的任务名)
     arg_group.add_argument("--experiment_name", type=str, default=None, help="Name of the experiment folder where logs will be stored.")
     arg_group.add_argument("--run_name", type=str, default="test_1", help="Run name suffix to the log directory.")
 
