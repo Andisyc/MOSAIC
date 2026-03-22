@@ -8,6 +8,28 @@ from whole_body_tracking.utils.rsl_rl_cfg import (
     RslRlDistillationCfg,
 )
 
+
+@configclass
+class G1FlatSupervisedRunnerCfg(RslRlOnPolicyRunnerCfg):
+    num_steps_per_env = 24
+    max_iterations = 200000
+    save_interval = 500
+    experiment_name = "g1_flat"
+    empirical_normalization = True
+    policy = RslRlDistillationCfg(
+        class_name="StudentTeacher",
+        init_noise_std=1.0,
+        student_hidden_dims=[1024, 1024, 512, 256],
+        # teacher_hidden_dims=[1024, 1024, 512, 256],
+        activation="elu",)
+
+    algorithm = RslRlDistillationAlgorithmCfg(
+        class_name="Distillation",
+        num_learning_epochs=5,
+        learning_rate=1.0e-3,
+        gradient_length = 15)
+
+
 @configclass
 class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
