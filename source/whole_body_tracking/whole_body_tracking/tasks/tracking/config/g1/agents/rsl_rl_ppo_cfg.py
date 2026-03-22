@@ -1,5 +1,16 @@
 from isaaclab.utils import configclass
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg, RslRlDistillationAlgorithmCfg
+
+# IsaacLab/source/isaaclab_rl/isaaclab_rl/rsl_rl/
+# algorithm: RslRlPpoAlgorithmCfg, RslRlDistillationAlgorithmCfg
+# policy: RslRlPpoActorCriticCfg
+from isaaclab_rl.rsl_rl import (
+    RslRlOnPolicyRunnerCfg, 
+    RslRlPpoActorCriticCfg, 
+    RslRlPpoAlgorithmCfg, 
+    RslRlDistillationAlgorithmCfg
+)
+
+# policy: RslRlDistillationCfg
 from whole_body_tracking.utils.rsl_rl_cfg import (
     RslRlPpoActorCriticTransformerCfg, 
     RslRlPpoActorCriticFSQCfg, 
@@ -23,7 +34,7 @@ class G1FlatSupervisedRunnerCfg(RslRlOnPolicyRunnerCfg):
         # teacher_hidden_dims=[1024, 1024, 512, 256],
         activation="elu",)
 
-    algorithm = RslRlDistillationAlgorithmCfg(
+    algorithm = RslRlDistillationAlgorithmCfg( # 从IsaacLab/source/isaaclab_rl/isaaclab_rl/rsl_rl/distillation_cfg.py导入, 实际位于leggedrobotics/rsl_rl/rsl_rl/algorithms/distillation.py
         class_name="Distillation",
         num_learning_epochs=5,
         learning_rate=1.0e-3,

@@ -71,7 +71,7 @@ class RslRlDistillationCfg(RslRlPpoActorCriticCfg):
 
 
 @configclass
-class RslRlSuperviseJointPositionCfg():
+class RslRlSuperviseJointPosCfg():
     class_name: str = "SuperviseLearning"
     student_hidden_dims: list[int] = [256, 256, 256]
     # teacher_hidden_dims: list[int] = [256, 256, 256]
