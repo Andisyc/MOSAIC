@@ -34,7 +34,6 @@ class SuperviseLearning(nn.Module):
         self.loaded_teacher = False  # indicates if teacher has been loaded
 
         mlp_input_dim_s = num_student_obs
-        # mlp_input_dim_t = num_teacher_obs
 
         # ========== student ==========
         student_layers = []
@@ -48,21 +47,7 @@ class SuperviseLearning(nn.Module):
                 student_layers.append(activation)
         self.student = nn.Sequential(*student_layers)
 
-        # ========== teacher ==========
-        # teacher_layers = []
-        # teacher_layers.append(nn.Linear(mlp_input_dim_t, teacher_hidden_dims[0]))
-        # teacher_layers.append(activation)
-        # for layer_index in range(len(teacher_hidden_dims)):
-        #     if layer_index == len(teacher_hidden_dims) - 1:
-        #         teacher_layers.append(nn.Linear(teacher_hidden_dims[layer_index], num_actions))
-        #     else:
-        #         teacher_layers.append(nn.Linear(teacher_hidden_dims[layer_index], teacher_hidden_dims[layer_index + 1]))
-        #         teacher_layers.append(activation)
-        # self.teacher = nn.Sequential(*teacher_layers)
-        # self.teacher.eval()
-
         print(f"Student MLP: {self.student}")
-        # print(f"Teacher MLP: {self.teacher}")
 
         # ========== action noise ==========
         self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
@@ -94,10 +79,6 @@ class SuperviseLearning(nn.Module):
         std = self.std.expand_as(mean)
         self.distribution = Normal(mean, std)
 
-    # def act(self, observations):
-    #     self.update_distribution(observations)
-    #     return self.distribution.sample()
-
     def act(self, observations):
         self.update_distribution(observations)
         self.distribution.sample()
@@ -107,47 +88,25 @@ class SuperviseLearning(nn.Module):
         actions_mean = self.student(observations)
         return actions_mean
 
-    def evaluate(self, teacher_observations):
-        with torch.no_grad():
-            actions = self.teacher(teacher_observations)
-        return actions
-
     def load_state_dict(self, state_dict, strict=True):
-        """Load the parameters of the student and teacher networks.
+        """Load the parameters of the student network.
 
         Args:
             state_dict (dict): State dictionary of the model.
             strict (bool): Whether to strictly enforce that the keys in state_dict match the keys returned by this
                            module's state_dict() function.
-
-        Returns:
-            bool: Whether this training resumes a previous training. This flag is used by the `load()` function of
-                  `OnPolicyRunner` to determine how to load further parameters.
         """
 
-        # check if state_dict contains teacher and student or just teacher parameters
-        if any("actor" in key for key in state_dict.keys()):  # loading parameters from rl training
-            # rename keys to match teacher and remove critic parameters
-            teacher_state_dict = {}
+        # Load specifically for FrontRES / supervised learning
+        if any("actor" in key for key in state_dict.keys()):  # adapting RL checkpoint format
+            student_state_dict = {}
             for key, value in state_dict.items():
                 if "actor." in key:
-                    teacher_state_dict[key.replace("actor.", "")] = value
-            self.teacher.load_state_dict(teacher_state_dict, strict=strict)
-            # also load recurrent memory if teacher is recurrent
-            if self.is_recurrent and self.teacher_recurrent:
-                raise NotImplementedError("Loading recurrent memory for the teacher is not implemented yet")  # TODO
-            # set flag for successfully loading the parameters
-            self.loaded_teacher = True
-            self.teacher.eval()
-            return False
-        elif any("student" in key for key in state_dict.keys()):  # loading parameters from distillation training
-            super().load_state_dict(state_dict, strict=strict)
-            # set flag for successfully loading the parameters
-            self.loaded_teacher = True
-            self.teacher.eval()
-            return True
+                    student_state_dict[key.replace("actor.", "")] = value
+            self.student.load_state_dict(student_state_dict, strict=strict)
         else:
-            raise ValueError("state_dict does not contain student or teacher parameters")
+            super().load_state_dict(state_dict, strict=strict)
+        return True
 
     def get_hidden_states(self):
         return None
