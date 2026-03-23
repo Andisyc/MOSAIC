@@ -10,6 +10,11 @@ from isaaclab_rl.rsl_rl import (
     RslRlDistillationAlgorithmCfg
 )
 
+# PAMR: Stage 1 Training
+from whole_body_tracking.utils.supervise import (
+    SuperviseTrainer
+)
+
 # policy: RslRlDistillationCfg
 from whole_body_tracking.utils.rsl_rl_cfg import (
     RslRlPpoActorCriticTransformerCfg, 
@@ -17,6 +22,7 @@ from whole_body_tracking.utils.rsl_rl_cfg import (
     RslRlPpoActorCriticVQCfg,
     RslRlPpoActorCriticAttentionCfg,
     RslRlDistillationCfg,
+    RslRlSuperviseJointPosCfg, # PAMR: Stage 1 Training
 )
 
 
@@ -27,14 +33,17 @@ class G1FlatSupervisedRunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 500
     experiment_name = "g1_flat"
     empirical_normalization = True
-    policy = RslRlDistillationCfg(
-        class_name="StudentTeacher",
+    
+    policy = RslRlSuperviseJointPosCfg(
+        class_name="SuperviseLearning",
         init_noise_std=1.0,
         student_hidden_dims=[1024, 1024, 512, 256],
-        # teacher_hidden_dims=[1024, 1024, 512, 256],
         activation="elu",)
-
-    algorithm = RslRlDistillationAlgorithmCfg( # 从IsaacLab/source/isaaclab_rl/isaaclab_rl/rsl_rl/distillation_cfg.py导入, 实际位于leggedrobotics/rsl_rl/rsl_rl/algorithms/distillation.py
+    
+    # 模仿G1FlatDistillationRunnerCfg的distillation算法, distillation从
+    # IsaacLab/source/isaaclab_rl/isaaclab_rl/rsl_rl/distillation_cfg.py导入, 
+    # 实际位于leggedrobotics/rsl_rl/rsl_rl/algorithms/distillation.py
+    algorithm = SuperviseTrainer(
         class_name="Distillation",
         num_learning_epochs=5,
         learning_rate=1.0e-3,
