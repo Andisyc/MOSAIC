@@ -32,3 +32,12 @@ HYDRA_FULL_ERROR=1 nohup bash ~/IsaacLab_mosaic/isaaclab.sh -p ~/MOSAIC/scripts/
     --logger wandb \
     --headless \
     --device cuda:0 >~/MOSAIC/train.txt 2>&1 &
+
+HYDRA_FULL_ERROR=1 bash ~/IsaacLab_mosaic/isaaclab.sh -p ~/MOSAIC/scripts/rsl_rl/train.py \
+    --task=FrontRES-Supervised-Tracking-Flat-G1-v0 \
+    --num_envs=12000 \
+    --motion /home/chengyuxuan/MOSAIC/q_npz/01_01_poses.npz \
+    --headless \
+    --logger wandb \
+    --headless \
+    --device cuda:0

@@ -39,7 +39,7 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
 
     # -- experiment arguments: experiment_name (本地logs/的权重文件夹), run_name (wandb的任务名)
     arg_group.add_argument("--experiment_name", type=str, default=None, help="Name of the experiment folder where logs will be stored.")
-    arg_group.add_argument("--run_name", type=str, default="gmt", help="Run name suffix to the log directory.")
+    arg_group.add_argument("--run_name", type=str, default="frontres_test_run", help="Run name suffix to the log directory.")
 
 
 def parse_rsl_rl_cfg(task_name: str, args_cli: argparse.Namespace) -> RslRlOnPolicyRunnerCfg:
