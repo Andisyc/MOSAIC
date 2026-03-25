@@ -50,7 +50,7 @@ class G1FlatSupervisedRunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=1.0,
         student_hidden_dims=[1024, 1024, 512, 256],
         activation="elu",
-        gmt_path="path/to/your/pretrained_gmt_model.onnx",) # <--- 在这里传入预训练的 GMT ONNX 模型路径
+        gmt_path="/home/chengyuxuan/MOSAIC/onnx/gmt.onnx",) # <--- 在这里传入预训练的 GMT ONNX 模型路径
 
     algorithm = RslRlSuperviseAlgorithmCfg()
 

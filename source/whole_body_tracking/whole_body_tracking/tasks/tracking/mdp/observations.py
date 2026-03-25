@@ -123,3 +123,29 @@ def selected_keypoints_pos_w_heading(
     env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     return command.selected_keypoints_pos_w_heading.reshape(command.selected_keypoints_pos_w_heading.size(0), -1)
+
+def get_supervision_target_delta_q(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """
+    Computes the supervision target delta_q = q_sim - q_ref and stores it in the extras dictionary.
+    
+    This function is intended to be used as a "dummy" observation term to ensure that the
+    ground truth for the supervised learning is computed every step and passed out
+    via the infos dictionary.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    
+    # q_ref: reference joint positions from the motion data
+    q_ref = command.joint_pos
+    
+    # q_sim: simulated joint positions from the robot asset
+    q_sim = command.robot_joint_pos
+    
+    # The supervision target
+    delta_q_gt = q_sim - q_ref
+    
+    # Store the target in the extras dictionary to be passed out in the infos dict
+    env.extras["infos"]["target_delta_q"] = delta_q_gt
+    
+    # The return value doesn't matter as this is a dummy observation term
+    # Return a tensor of zeros with a compatible shape
+    return torch.zeros_like(delta_q_gt)

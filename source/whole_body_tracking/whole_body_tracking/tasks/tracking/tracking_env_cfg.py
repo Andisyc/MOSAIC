@@ -619,6 +619,7 @@ class DistillationTrackingEnvCfg(GeneralTrackingEnvCfg): # 师生蒸馏Env, 同�
             joint_pos = ObsTerm(func=mdp.joint_pos_rel)
             joint_vel = ObsTerm(func=mdp.joint_vel_rel)
             actions = ObsTerm(func=mdp.last_action)
+            supervision_target = ObsTerm(func=mdp.get_supervision_target_delta_q, params={"command_name": "motion"})
 
             # def __post_init__(self):
             #     self.history_length = 5
@@ -642,6 +643,55 @@ class DistillationTrackingEnvCfg(GeneralTrackingEnvCfg): # 师生蒸馏Env, 同�
 
     observations: DistillationObservationsCfg = DistillationObservationsCfg()
     rewards: RewardsExpertCfg = RewardsExpertCfg()
+
+    def __post_init__(self):
+        """Post initialization."""
+        super().__post_init__()
+        self.commands = MultiMotionCommandsCfg()
+
+
+@configclass
+class SupervisedTrackingEnvCfg(GeneralTrackingEnvCfg):
+    """
+    Configuration for Stage 1 Supervised Learning environment.
+    Used to train FrontRES to predict delta_q_gt = q_ref - q_sim.
+    """
+
+    commands: MultiMotionCommandsCfg = MultiMotionCommandsCfg()
+
+    @configclass
+    class SupervisedObservationsCfg:
+        """Observation specifications for Stage 1 Supervised Learning."""
+
+        @configclass
+        class PolicyCfg(ObsGroup): # FrontRES 模型的输入特征
+            """Observations for policy group."""
+            command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
+            motion_anchor_ori_b = ObsTerm(
+                func=mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05))
+            base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
+            joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+            joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5))
+            actions = ObsTerm(func=mdp.last_action)
+
+            def __post_init__(self):
+                self.enable_corruption = True
+                self.concatenate_terms = True
+                self.history_length = 5
+
+        @configclass
+        class TargetCfg(ObsGroup): # 监督信号目标: delta_q_gt = q_ref - q_sim
+            supervision_target = ObsTerm(func=mdp.get_supervision_target_delta_q, params={"command_name": "motion"})
+
+            def __post_init__(self):
+                self.enable_corruption = False
+                self.concatenate_terms = True
+
+        # observation groups
+        policy: PolicyCfg = PolicyCfg()
+        target: TargetCfg = TargetCfg()
+
+    observations: SupervisedObservationsCfg = SupervisedObservationsCfg()
 
     def __post_init__(self):
         """Post initialization."""
