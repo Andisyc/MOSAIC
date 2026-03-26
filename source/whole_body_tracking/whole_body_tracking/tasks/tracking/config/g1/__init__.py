@@ -180,12 +180,12 @@ gym.register( # FrontRES训练 (阶段1)
     },
 )
 
-gym.register( # FrontRES训练 (阶段2) TODO
+gym.register( # FrontRES训练 (阶段2)
     id="FrontRES-RLFinetune-Tracking-Flat-G1-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": flat_env_cfg.G1OneStageTrackingEnvCfg, # 仿真环境 & 观测量 (阶段二RL需要 Critic)
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatSupervisedRunnerCfg", # 网络结构 & 训练算法
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatFrontRESFinetuneRunnerCfg", # 网络结构 & 训练算法
     },
 )

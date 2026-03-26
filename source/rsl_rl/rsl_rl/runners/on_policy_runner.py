@@ -27,6 +27,7 @@ from rsl_rl.modules import (
     ActorCriticVQ,
     ActorCriticAttention,
     ResidualActorCritic,
+    FrontEndResidualActorCritic, # 引入第二阶段模型
 )
 from rsl_rl.utils import store_code_state
 
@@ -130,8 +131,7 @@ class OnPolicyRunner:
         policy_class = eval(self.policy_cfg.pop("class_name"))
 
         # Check if using ResidualActorCritic (special handling for estimator dimension)
-        from rsl_rl.modules import ResidualActorCritic
-        is_residual_policy = policy_class == ResidualActorCritic
+        is_residual_policy = policy_class in [ResidualActorCritic, FrontEndResidualActorCritic]
 
         if self.training_type == "mosaic" and self.alg_cfg.get("use_estimate_ref_vel", False):
             if not is_residual_policy:
@@ -183,8 +183,7 @@ class OnPolicyRunner:
         self.empirical_normalization = self.cfg["empirical_normalization"]
 
         # Check if using ResidualActorCritic (special handling for GMT normalizer)
-        from rsl_rl.modules import ResidualActorCritic # 创建观测量归一器
-        if isinstance(policy, ResidualActorCritic):
+        if isinstance(policy, (ResidualActorCritic, FrontEndResidualActorCritic)):
             # Use GMT's frozen normalizer for observations
             if policy.gmt_normalizer is not None:
                 self.obs_normalizer = policy.gmt_normalizer
@@ -443,8 +442,14 @@ class OnPolicyRunner:
                     else:
                         actions = self.alg.act(obs, privileged_obs)
                     
+                    # --- PAMR 动作映射 (RL Action -> Env Action) ---
+                    if hasattr(self.alg.policy, 'get_env_action'):
+                        env_actions = self.alg.policy.get_env_action(obs, actions)
+                    else:
+                        env_actions = actions
+
                     # Step the environment 仿真环境更新观测量/动作评分/序列结束与否/监控数据
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    obs, rewards, dones, infos = self.env.step(env_actions.to(self.env.device))
 
                     # Move to device
                     rewards, dones = rewards.to(self.device), dones.to(self.device)
@@ -474,7 +479,7 @@ class OnPolicyRunner:
                         ref_vel_estimator_obs = None
 
                     # process the step 更新回放池的数据 (奖励值, 完成布尔值, 额外信息)
-                    self.alg.process_env_step(rewards, dones, infos)
+                    self.alg.process_env_step(rewards, dones, infos) # 这里存入的 actions 依然是纯粹的 delta_q
 
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if hasattr(self.alg, "rnd") and self.alg.rnd else None
@@ -668,8 +673,7 @@ class OnPolicyRunner:
 
     def save(self, path: str, infos=None):
         # Check if using ResidualActorCritic (special handling)
-        from rsl_rl.modules import ResidualActorCritic
-        if isinstance(self.alg.policy, ResidualActorCritic):
+        if isinstance(self.alg.policy, (ResidualActorCritic, FrontEndResidualActorCritic)):
             # Save only residual network + critic (GMT is frozen, no need to save)
             model_state_dict = {
                 'residual_actor': self.alg.policy.residual_actor.state_dict(),
@@ -716,12 +720,20 @@ class OnPolicyRunner:
         loaded_dict = torch.load(path, weights_only=False)
 
         # Check if using ResidualActorCritic (special handling)
-        from rsl_rl.modules import ResidualActorCritic
-        if isinstance(self.alg.policy, ResidualActorCritic):
-            # Load only residual network + critic (GMT is already loaded in __init__)
-            self.alg.policy.residual_actor.load_state_dict(loaded_dict["model_state_dict"]["residual_actor"])
+        if isinstance(self.alg.policy, (ResidualActorCritic, FrontEndResidualActorCritic)):
+            # 智能映射：尝试从阶段一 (SuperviseLearning) 提取 student 权重
+            if isinstance(self.alg.policy, FrontEndResidualActorCritic) and "student.0.weight" in loaded_dict["model_state_dict"]:
+                mapped_dict = {k.replace("student.", ""): v for k, v in loaded_dict["model_state_dict"].items() if k.startswith("student.")}
+                self.alg.policy.residual_actor.load_state_dict(mapped_dict, strict=True)
+                print("[Runner] Success: Auto-mapped Stage 1 'student' weights to Stage 2 'residual_actor'!")
+            else:
+                self.alg.policy.residual_actor.load_state_dict(loaded_dict["model_state_dict"]["residual_actor"])
+
             if load_critic:
-                self.alg.policy.critic.load_state_dict(loaded_dict["model_state_dict"]["critic"])
+                if "critic" in loaded_dict["model_state_dict"]:
+                    self.alg.policy.critic.load_state_dict(loaded_dict["model_state_dict"]["critic"])
+                else:
+                    print("[Runner] No critic weights found. Critic will be initialized from scratch.")
             # Load noise std parameter
             if "std" in loaded_dict["model_state_dict"]:
                 self.alg.policy.std.data = loaded_dict["model_state_dict"]["std"].data

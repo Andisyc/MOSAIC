@@ -118,6 +118,31 @@ class RslRlResidualActorCriticCfg(RslRlPpoActorCriticCfg):
     ref_vel_estimator_type: str = "mlp"
     """Type of estimator: 'mlp' or 'transformer'."""
 
+@configclass
+class RslRlFrontEndResidualActorCriticCfg(RslRlPpoActorCriticCfg):
+    """
+    Front-End Residual Actor-Critic configuration.
+    Stage 2 RL Finetuning: FrontRES outputs Δq, which modifies q_ref before entering GMT.
+    """
+    class_name: str = "FrontEndResidualActorCritic"
+
+    # FrontRES network configuration
+    residual_hidden_dims: list[int] = [1024, 1024, 512, 256]
+    residual_last_layer_gain: float = 0.01
+
+    # Observation index configuration
+    q_ref_start_idx: int = MISSING
+    """The starting index of q_ref in the flattened observation vector."""
+
+    # GMT configuration
+    gmt_checkpoint_path: str = MISSING
+    gmt_policy_cfg: dict | None = None
+    init_critic_from_gmt: bool = False
+
+    # Ref vel estimator configuration (for GMT input)
+    num_ref_vel_estimator_obs: int | None = None
+    ref_vel_estimator_checkpoint_path: str | None = None
+    ref_vel_estimator_type: str = "mlp"
 
 @configclass
 class RslRlMOSAICAlgorithmCfg(RslRlPpoAlgorithmCfg):

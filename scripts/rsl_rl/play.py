@@ -24,6 +24,7 @@ parser.add_argument("--disable_events", action="store_true", default=True, help=
 parser.add_argument("--video", action="store_true", default=True, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=400, help="Length of the recorded video (in steps).")
 
+<<<<<<< HEAD
 parser.add_argument("--num_envs", 
                     type=int, 
                     default=2, 
@@ -47,6 +48,11 @@ parser.add_argument("--resume_path",
                     default="/home/yuxuancheng/MOSAIC/model/model_27000.pt", 
                     help="Path to the motion file."
                     )
+=======
+parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to simulate.")
+parser.add_argument("--task", type=str, default="Tracking-Flat-G1-Wo-State-Estimation-v0", help="Name of the task.")
+parser.add_argument("--motion", type=str, default="./motion_npz/dance1_subject1.npz", help="Path to the motion file.")
+>>>>>>> origin/main
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)

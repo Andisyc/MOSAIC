@@ -23,6 +23,7 @@ from whole_body_tracking.utils.rsl_rl_cfg import (
     RslRlPpoActorCriticAttentionCfg,
     RslRlDistillationCfg,
     RslRlSuperviseJointPosCfg, # PAMR: Stage 1 Training
+    RslRlFrontEndResidualActorCriticCfg, # PAMR: Stage 2 RL Finetuning
 )
 
 @configclass
@@ -53,6 +54,30 @@ class G1FlatSupervisedRunnerCfg(RslRlOnPolicyRunnerCfg):
         gmt_path="/home/yuxuancheng/MOSAIC/onnx/gmt.onnx",) # <--- 在这里传入预训练的 GMT ONNX 模型路径
 
     algorithm = RslRlSuperviseAlgorithmCfg()
+
+@configclass
+class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
+    num_steps_per_env = 24
+    max_iterations = 50000
+    save_interval = 500
+    experiment_name = "g1_flat_frontres_finetune"
+    empirical_normalization = True
+
+    policy = RslRlFrontEndResidualActorCriticCfg(
+        class_name="FrontEndResidualActorCritic",
+        residual_hidden_dims=[1024, 1024, 512, 256], # 保持与阶段一一致
+        q_ref_start_idx=41, # TODO: 请务必检查并修改此值, 定位观测量中 q_ref 向量的起始索引
+        init_noise_std=0.1, # 微调阶段给定一个较小的初始探索噪声
+        gmt_checkpoint_path="/home/yuxuancheng/MOSAIC/onnx/gmt.pt", # 这里需要放 Pytorch 的 Checkpoint 以实现 GPU 极速推理
+    )
+
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.005,
+        learning_rate=5.0e-4, # 较小的微调学习率
+    )
 
 @configclass
 class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
