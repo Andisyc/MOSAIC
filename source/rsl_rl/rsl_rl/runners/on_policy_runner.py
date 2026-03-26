@@ -13,6 +13,8 @@ from collections import deque
 
 import rsl_rl
 from rsl_rl.algorithms import PPO, Distillation, MOSAIC
+from whole_body_tracking.utils.supervise import SuperviseTrainer
+from rsl_rl.modules.supervise_learning import SuperviseLearning
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
@@ -49,6 +51,8 @@ class OnPolicyRunner:
             self.training_type = "mosaic"  # MOSAIC has its own training type with teacher action storage
         elif self.alg_cfg["class_name"] == "Distillation":
             self.training_type = "distillation"
+        elif self.alg_cfg["class_name"] == "SuperviseTrainer":
+            self.training_type = "supervise"
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
@@ -88,6 +92,11 @@ class OnPolicyRunner:
         elif self.training_type == "distillation":
             if "teacher" in obs_dict:
                 self.privileged_obs_type = "teacher"  # policy distillation
+            else:
+                self.privileged_obs_type = None
+        elif self.training_type == "supervise":
+            if "target" in obs_dict:
+                self.privileged_obs_type = "target"
             else:
                 self.privileged_obs_type = None
 
@@ -253,6 +262,13 @@ class OnPolicyRunner:
                 [self.env.num_actions],
                 teacher_obs_shape=[num_teacher_obs] if num_teacher_obs is not None else None,
                 ref_vel_estimator_obs_shape=[num_ref_vel_estimator_obs] if self.ref_vel_estimator_obs_type is not None else None,)
+        elif self.training_type == "supervise":
+            self.alg.init_storage(
+                self.env.num_envs,
+                self.num_steps_per_env,
+                [num_obs],
+                [num_privileged_obs],
+                [self.env.num_actions],)
         else:
             self.alg.init_storage(
                 self.training_type,
