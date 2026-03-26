@@ -37,7 +37,7 @@ from rsl_rl.utils import resolve_nn_activation
 
 class SuperviseLearning(nn.Module):
     """
-    一个用于监督学习的模块，旨在训练一个网络（student）来预测由专家模型（GMT）
+    一个用于监督学习的模块，旨在训练一个网络(student)来预测由专家模型(GMT)
     在仿真中产生的运动残差。
     这个模块仅包含第一阶段监督训练所需的核心功能。
     """
