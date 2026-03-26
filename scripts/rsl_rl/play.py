@@ -25,7 +25,7 @@ parser.add_argument("--video", action="store_true", default=True, help="Record v
 parser.add_argument("--video_length", type=int, default=400, help="Length of the recorded video (in steps).")
 
 parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to simulate.")
-parser.add_argument("--task", type=str, default="Tracking-Flat-G1-v0", help="Name of the task.")
+parser.add_argument("--task", type=str, default="Tracking-Flat-G1-Wo-State-Estimation-v0", help="Name of the task.")
 parser.add_argument("--motion", type=str, default="./motion_npz/dance1_subject1.npz", help="Path to the motion file.")
 
 # append RSL-RL cli arguments
