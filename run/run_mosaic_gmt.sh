@@ -28,7 +28,6 @@ HYDRA_FULL_ERROR=1 nohup bash ~/IsaacLab_mosaic/isaaclab.sh -p ~/MOSAIC/scripts/
     --task=General-Tracking-Flat-G1-Wo-State-Estimation-v0-World-Coordinate-Reward \
     --num_envs=12000 \
     --motion /ssd1/chengyuxuan/AMASS_G1NPZ_Final \
-    --headless \
     --logger wandb \
     --headless \
     --device cuda:0 >~/MOSAIC/train.txt 2>&1 &
