@@ -24,9 +24,35 @@ parser.add_argument("--disable_events", action="store_true", default=True, help=
 parser.add_argument("--video", action="store_true", default=True, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=400, help="Length of the recorded video (in steps).")
 
+<<<<<<< HEAD
+parser.add_argument("--num_envs", 
+                    type=int, 
+                    default=2, 
+                    help="Number of environments to simulate."
+                    )
+
+parser.add_argument("--task", 
+                    type=str, 
+                    default="Tracking-Flat-G1-Wo-State-Estimation-v0", 
+                    help="Name of the task."
+                    )
+
+parser.add_argument("--motion", 
+                    type=str, 
+                    default="./q_npz/01_01_poses.npz", 
+                    help="Path to the motion file."
+                    )
+
+parser.add_argument("--resume_path", 
+                    type=str, 
+                    default="/home/yuxuancheng/MOSAIC/model/model_27000.pt", 
+                    help="Path to the motion file."
+                    )
+=======
 parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to simulate.")
-parser.add_argument("--task", type=str, default="Tracking-Flat-G1-v0", help="Name of the task.")
+parser.add_argument("--task", type=str, default="Tracking-Flat-G1-Wo-State-Estimation-v0", help="Name of the task.")
 parser.add_argument("--motion", type=str, default="./motion_npz/dance1_subject1.npz", help="Path to the motion file.")
+>>>>>>> origin/main
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -82,7 +108,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
 
-    resume_path = '/home/chengyuxuan/MOSAIC/onnx/gmt.onnx'
     env_cfg.commands.motion.motion_file = args_cli.motion
 
     if args_cli.wandb_path:
@@ -110,15 +135,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # print(f"[INFO]: Loading model checkpoint from: {run_path}/{file}")
         # resume_path = f"./logs/rsl_rl/temp/{file}"
 
-        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+        print(f"[INFO]: Loading model checkpoint from: {args_cli.resume_path}")
     else:
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         # resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+        print(f"[INFO]: Loading model checkpoint from: {args_cli.resume_path}")
 
     # Load policy configuration from checkpoint's params/agent.yaml to ensure compatibility
     # This overrides the default configuration with the checkpoint's actual configuration
-    checkpoint_dir = os.path.dirname(resume_path)
+    checkpoint_dir = os.path.dirname(args_cli.resume_path)
     params_yaml_path = os.path.join(checkpoint_dir, "params", "agent.yaml")
     if os.path.exists(params_yaml_path):
         import yaml
@@ -187,7 +212,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
-    log_dir = os.path.dirname(resume_path)
+    log_dir = os.path.dirname(args_cli.resume_path)
 
     # wrap for video recording
     if args_cli.video:
@@ -210,7 +235,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path, load_optimizer=False, load_critic=not args_cli.skip_critic)
+    ppo_runner.load(args_cli.resume_path, load_optimizer=False, load_critic=not args_cli.skip_critic)
 
     # obtain the trained policy for inference
     # Check if velocity estimator is enabled
@@ -228,7 +253,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
     # export policy to onnx/jit
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+    export_model_dir = os.path.join(os.path.dirname(args_cli.resume_path), "exported")
 
     # Get velocity estimator info if available
     ref_vel_estimator = None
@@ -247,6 +272,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         ref_vel_estimator_obs_dim=ref_vel_estimator_obs_dim,)
 
     attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
+
+    # ==========================================
+    # --- 新增的 JIT 导出代码 ---
+    try:
+        print(f"\n[INFO] Exporting JIT to: {export_model_dir}")
+        import torch
+        
+        # 兼容不同版本的 rsl_rl 获取 Actor 的方式
+        if hasattr(ppo_runner.alg, "actor_critic"):
+            actor_model = ppo_runner.alg.actor_critic.actor.to("cpu")
+        else:
+            actor_model = ppo_runner.alg.policy.actor.to("cpu")
+            
+        actor_model.eval()
+        
+        # 将模型转换为 TorchScript (JIT)
+        jit_model = torch.jit.script(actor_model)
+        
+        # 保存模型
+        jit_path = os.path.join(export_model_dir, "policy_jit.pt")
+        torch.jit.save(jit_model, jit_path)
+        print(f"[INFO] Success! JIT saved as: {jit_path}\n")
+    except Exception as e:
+        print(f"[ERROR] JIT exported failed: {e}\n")
+    # ==========================================
 
     # reset environment
     env.reset()

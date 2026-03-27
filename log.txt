@@ -1,0 +1,32 @@
+Traceback (most recent call last):
+  File "/home/yuxuancheng/MOSAIC/scripts/rsl_rl/train.py", line 203, in <module>
+    main()
+  File "/home/yuxuancheng/IsaacLab_mosaic/source/isaaclab_tasks/isaaclab_tasks/utils/hydra.py", line 104, in wrapper
+    hydra_main()
+  File "/hdd0/yuxuancheng/miniconda3/envs/mosaic/lib/python3.10/site-packages/hydra/main.py", line 94, in decorated_main
+    _run_hydra(
+  File "/hdd0/yuxuancheng/miniconda3/envs/mosaic/lib/python3.10/site-packages/hydra/_internal/utils.py", line 394, in _run_hydra
+    _run_app(
+  File "/hdd0/yuxuancheng/miniconda3/envs/mosaic/lib/python3.10/site-packages/hydra/_internal/utils.py", line 457, in _run_app
+    run_and_report(
+  File "/hdd0/yuxuancheng/miniconda3/envs/mosaic/lib/python3.10/site-packages/hydra/_internal/utils.py", line 223, in run_and_report
+    raise ex
+  File "/hdd0/yuxuancheng/miniconda3/envs/mosaic/lib/python3.10/site-packages/hydra/_internal/utils.py", line 220, in run_and_report
+    return func()
+  File "/hdd0/yuxuancheng/miniconda3/envs/mosaic/lib/python3.10/site-packages/hydra/_internal/utils.py", line 458, in <lambda>
+    lambda: hydra.run(
+  File "/hdd0/yuxuancheng/miniconda3/envs/mosaic/lib/python3.10/site-packages/hydra/_internal/hydra.py", line 132, in run
+    _ = ret.return_value
+  File "/hdd0/yuxuancheng/miniconda3/envs/mosaic/lib/python3.10/site-packages/hydra/core/utils.py", line 260, in return_value
+    raise self._return_value
+  File "/hdd0/yuxuancheng/miniconda3/envs/mosaic/lib/python3.10/site-packages/hydra/core/utils.py", line 186, in run_job
+    ret.return_value = task_function(task_cfg)
+  File "/home/yuxuancheng/IsaacLab_mosaic/source/isaaclab_tasks/isaaclab_tasks/utils/hydra.py", line 101, in hydra_main
+    func(env_cfg, agent_cfg, *args, **kwargs)
+  File "/home/yuxuancheng/MOSAIC/scripts/rsl_rl/train.py", line 195, in main
+    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+  File "/home/yuxuancheng/MOSAIC/source/rsl_rl/rsl_rl/runners/on_policy_runner.py", line 377, in learn
+    self.train_mode() # switch to train mode (for dropout for example)
+  File "/home/yuxuancheng/MOSAIC/source/rsl_rl/rsl_rl/runners/on_policy_runner.py", line 865, in train_mode
+    if self.alg.rnd:
+AttributeError: 'SuperviseTrainer' object has no attribute 'rnd'

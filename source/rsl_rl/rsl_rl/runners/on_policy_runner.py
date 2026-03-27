@@ -13,6 +13,8 @@ from collections import deque
 
 import rsl_rl
 from rsl_rl.algorithms import PPO, Distillation, MOSAIC
+from whole_body_tracking.utils.supervise import SuperviseTrainer
+from rsl_rl.modules.supervise_learning import SuperviseLearning
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
@@ -25,6 +27,7 @@ from rsl_rl.modules import (
     ActorCriticVQ,
     ActorCriticAttention,
     ResidualActorCritic,
+    FrontEndResidualActorCritic, # 引入第二阶段模型
 )
 from rsl_rl.utils import store_code_state
 
@@ -49,6 +52,8 @@ class OnPolicyRunner:
             self.training_type = "mosaic"  # MOSAIC has its own training type with teacher action storage
         elif self.alg_cfg["class_name"] == "Distillation":
             self.training_type = "distillation"
+        elif self.alg_cfg["class_name"] == "SuperviseTrainer":
+            self.training_type = "supervise"
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
@@ -90,6 +95,11 @@ class OnPolicyRunner:
                 self.privileged_obs_type = "teacher"  # policy distillation
             else:
                 self.privileged_obs_type = None
+        elif self.training_type == "supervise":
+            if "target" in obs_dict:
+                self.privileged_obs_type = "target"
+            else:
+                self.privileged_obs_type = None
 
         # resolve type of ref_vel_estimator observations (for MOSAIC with velocity estimator) 速度估计器
         if "ref_vel_estimator" in obs_dict:
@@ -121,8 +131,7 @@ class OnPolicyRunner:
         policy_class = eval(self.policy_cfg.pop("class_name"))
 
         # Check if using ResidualActorCritic (special handling for estimator dimension)
-        from rsl_rl.modules import ResidualActorCritic
-        is_residual_policy = policy_class == ResidualActorCritic
+        is_residual_policy = policy_class in [ResidualActorCritic, FrontEndResidualActorCritic]
 
         if self.training_type == "mosaic" and self.alg_cfg.get("use_estimate_ref_vel", False):
             if not is_residual_policy:
@@ -174,8 +183,7 @@ class OnPolicyRunner:
         self.empirical_normalization = self.cfg["empirical_normalization"]
 
         # Check if using ResidualActorCritic (special handling for GMT normalizer)
-        from rsl_rl.modules import ResidualActorCritic # 创建观测量归一器
-        if isinstance(policy, ResidualActorCritic):
+        if isinstance(policy, (ResidualActorCritic, FrontEndResidualActorCritic)):
             # Use GMT's frozen normalizer for observations
             if policy.gmt_normalizer is not None:
                 self.obs_normalizer = policy.gmt_normalizer
@@ -253,6 +261,13 @@ class OnPolicyRunner:
                 [self.env.num_actions],
                 teacher_obs_shape=[num_teacher_obs] if num_teacher_obs is not None else None,
                 ref_vel_estimator_obs_shape=[num_ref_vel_estimator_obs] if self.ref_vel_estimator_obs_type is not None else None,)
+        elif self.training_type == "supervise":
+            self.alg.init_storage(
+                self.env.num_envs,
+                self.num_steps_per_env,
+                [num_obs],
+                [num_privileged_obs],
+                [self.env.num_actions],)
         else:
             self.alg.init_storage(
                 self.training_type,
@@ -371,7 +386,7 @@ class OnPolicyRunner:
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         # create buffers for logging extrinsic and intrinsic rewards
-        if self.alg.rnd:
+        if hasattr(self.alg, "rnd") and self.alg.rnd:
             erewbuffer = deque(maxlen=100)
             irewbuffer = deque(maxlen=100)
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
@@ -427,8 +442,14 @@ class OnPolicyRunner:
                     else:
                         actions = self.alg.act(obs, privileged_obs)
                     
+                    # --- PAMR 动作映射 (RL Action -> Env Action) ---
+                    if hasattr(self.alg.policy, 'get_env_action'):
+                        env_actions = self.alg.policy.get_env_action(obs, actions)
+                    else:
+                        env_actions = actions
+
                     # Step the environment 仿真环境更新观测量/动作评分/序列结束与否/监控数据
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    obs, rewards, dones, infos = self.env.step(env_actions.to(self.env.device))
 
                     # Move to device
                     rewards, dones = rewards.to(self.device), dones.to(self.device)
@@ -458,10 +479,10 @@ class OnPolicyRunner:
                         ref_vel_estimator_obs = None
 
                     # process the step 更新回放池的数据 (奖励值, 完成布尔值, 额外信息)
-                    self.alg.process_env_step(rewards, dones, infos)
+                    self.alg.process_env_step(rewards, dones, infos) # 这里存入的 actions 依然是纯粹的 delta_q
 
                     # Extract intrinsic rewards (only for logging)
-                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
+                    intrinsic_rewards = self.alg.intrinsic_rewards if hasattr(self.alg, "rnd") and self.alg.rnd else None
 
                     # book keeping
                     if self.log_dir is not None:
@@ -471,7 +492,7 @@ class OnPolicyRunner:
                             ep_infos.append(infos["log"])
                         
                         # Update rewards
-                        if self.alg.rnd:
+                        if hasattr(self.alg, "rnd") and self.alg.rnd:
                             cur_ereward_sum += rewards
                             cur_ireward_sum += intrinsic_rewards  # type: ignore
                             cur_reward_sum += rewards + intrinsic_rewards
@@ -490,7 +511,7 @@ class OnPolicyRunner:
                         cur_episode_length[new_ids] = 0
 
                         # -- intrinsic and extrinsic rewards
-                        if self.alg.rnd:
+                        if hasattr(self.alg, "rnd") and self.alg.rnd:
                             erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             cur_ereward_sum[new_ids] = 0
@@ -591,7 +612,7 @@ class OnPolicyRunner:
         # -- Training
         if len(locs["rewbuffer"]) > 0:
             # separate logging for intrinsic and extrinsic rewards
-            if self.alg.rnd:
+            if hasattr(self.alg, "rnd") and self.alg.rnd:
                 self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
@@ -617,7 +638,7 @@ class OnPolicyRunner:
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f'Mean {key} loss:':>{pad}} {value:.4f}\n"""
             # -- Rewards
-            if self.alg.rnd:
+            if hasattr(self.alg, "rnd") and self.alg.rnd:
                 log_string += (
                     f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
                     f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n""")
@@ -652,8 +673,7 @@ class OnPolicyRunner:
 
     def save(self, path: str, infos=None):
         # Check if using ResidualActorCritic (special handling)
-        from rsl_rl.modules import ResidualActorCritic
-        if isinstance(self.alg.policy, ResidualActorCritic):
+        if isinstance(self.alg.policy, (ResidualActorCritic, FrontEndResidualActorCritic)):
             # Save only residual network + critic (GMT is frozen, no need to save)
             model_state_dict = {
                 'residual_actor': self.alg.policy.residual_actor.state_dict(),
@@ -676,7 +696,7 @@ class OnPolicyRunner:
             "infos": infos,}
         
         # -- Save RND model if used
-        if self.alg.rnd:
+        if hasattr(self.alg, "rnd") and self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
         
@@ -700,12 +720,20 @@ class OnPolicyRunner:
         loaded_dict = torch.load(path, weights_only=False)
 
         # Check if using ResidualActorCritic (special handling)
-        from rsl_rl.modules import ResidualActorCritic
-        if isinstance(self.alg.policy, ResidualActorCritic):
-            # Load only residual network + critic (GMT is already loaded in __init__)
-            self.alg.policy.residual_actor.load_state_dict(loaded_dict["model_state_dict"]["residual_actor"])
+        if isinstance(self.alg.policy, (ResidualActorCritic, FrontEndResidualActorCritic)):
+            # 智能映射：尝试从阶段一 (SuperviseLearning) 提取 student 权重
+            if isinstance(self.alg.policy, FrontEndResidualActorCritic) and "student.0.weight" in loaded_dict["model_state_dict"]:
+                mapped_dict = {k.replace("student.", ""): v for k, v in loaded_dict["model_state_dict"].items() if k.startswith("student.")}
+                self.alg.policy.residual_actor.load_state_dict(mapped_dict, strict=True)
+                print("[Runner] Success: Auto-mapped Stage 1 'student' weights to Stage 2 'residual_actor'!")
+            else:
+                self.alg.policy.residual_actor.load_state_dict(loaded_dict["model_state_dict"]["residual_actor"])
+
             if load_critic:
-                self.alg.policy.critic.load_state_dict(loaded_dict["model_state_dict"]["critic"])
+                if "critic" in loaded_dict["model_state_dict"]:
+                    self.alg.policy.critic.load_state_dict(loaded_dict["model_state_dict"]["critic"])
+                else:
+                    print("[Runner] No critic weights found. Critic will be initialized from scratch.")
             # Load noise std parameter
             if "std" in loaded_dict["model_state_dict"]:
                 self.alg.policy.std.data = loaded_dict["model_state_dict"]["std"].data
@@ -729,7 +757,7 @@ class OnPolicyRunner:
                 resumed_training = self.alg.policy.load_state_dict(actor_only_state_dict, strict=False)
 
         # Load RND model if used
-        if self.alg.rnd:
+        if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
 
         # Load observation normalizers if used
@@ -789,7 +817,7 @@ class OnPolicyRunner:
                     print("[Runner] This is expected when transitioning between training stages with different frozen parameters.")
 
                 # -- RND optimizer if used
-                if self.alg.rnd:
+                if hasattr(self.alg, "rnd") and self.alg.rnd:
                     self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         # -- load current learning iteration
         if resumed_training:
@@ -846,7 +874,7 @@ class OnPolicyRunner:
         # -- PPO
         self.alg.policy.train()
         # -- RND
-        if self.alg.rnd:
+        if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.train()
         # -- Normalization
         if self.empirical_normalization:
@@ -861,7 +889,7 @@ class OnPolicyRunner:
         # -- PPO
         self.alg.policy.eval()
         # -- RND
-        if self.alg.rnd:
+        if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.eval()
         # -- Normalization
         if self.empirical_normalization:

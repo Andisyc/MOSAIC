@@ -108,6 +108,7 @@ class FronEndResidualActorCritic(nn.Module):
         residual_hidden_dims=[512, 256, 128],
         residual_last_layer_gain=0.01,
         # GMT configuration
+        q_ref_start_idx=0, # Added: Index where q_ref begins in the observation vector
         gmt_checkpoint_path=None,
         gmt_policy_cfg=None,  # Optional: specify GMT architecture (auto-inferred if None)
         # Ref vel estimator configuration
@@ -136,6 +137,7 @@ class FronEndResidualActorCritic(nn.Module):
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
         self.num_actions = num_actions
+        self.q_ref_start_idx = q_ref_start_idx
         self.noise_std_type = noise_std_type
 
         activation_fn = resolve_nn_activation(activation)
@@ -295,23 +297,16 @@ class FronEndResidualActorCritic(nn.Module):
             print("[ResidualActorCritic] WARNING: No ref_vel estimator provided, will use zero padding for GMT policy")
         
         # ========== Build Fron-End Residual Network ==========
-
-
         
-
-        """
-        # ========== Build Residual Network ==========
-
-        # RES实例化
+        # 这就是我们在第一阶段使用监督学习训练的 FrontRES (student)
+        # 它输出的是 Δq
         self.residual_actor = self._build_residual_actor(
-            input_dim=num_actor_obs,
+            input_dim=num_actor_obs, 
             output_dim=num_actions,
             hidden_dims=residual_hidden_dims,
             activation=activation_fn,
             last_layer_gain=residual_last_layer_gain)
-        print(f"[ResidualActorCritic] Residual network: {self.residual_actor}")
-
-        """
+        print(f"[FrontEndResidualActorCritic] FrontRES network: {self.residual_actor}")
 
         # ========== Build Critic ==========
 
