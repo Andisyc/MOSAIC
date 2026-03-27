@@ -1,7 +1,7 @@
 """Script to play a checkpoint if an RL agent from RSL-RL."""
 
 """Launch Isaac Sim Simulator first."""
-
+import torch
 import argparse
 import sys
 
@@ -300,7 +300,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise ValueError(f"Found None Normalizer!")
 
         print(f"\n[INFO] Exporting TorchScript JIT model to: {export_model_dir}")
-        import torch
         
         # 兼容不同版本的 rsl_rl 获取 Actor 的方式
         if hasattr(ppo_runner.alg, "actor_critic"):
