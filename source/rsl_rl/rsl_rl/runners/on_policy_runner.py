@@ -463,11 +463,14 @@ class OnPolicyRunner:
                         env_actions = actions
 
                     # Step the environment 仿真环境更新观测量/动作评分/序列结束与否/监控数据
+                    # NOTE: This is where the environment computes the *next* observation internally.
+                    # The result is returned here and then used in the next loop iteration.
                     obs, rewards, dones, infos = self.env.step(env_actions.to(self.env.device))
 
                     # Move to device
                     rewards, dones = rewards.to(self.device), dones.to(self.device)
                     obs_dict = infos.get("observations", {})
+
                     if self.policy_obs_type is not None and self.policy_obs_type in obs_dict:
                         obs = obs_dict[self.policy_obs_type].to(self.device)
                     else:
