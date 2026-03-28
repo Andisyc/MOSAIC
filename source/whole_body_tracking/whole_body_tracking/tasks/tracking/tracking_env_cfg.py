@@ -161,21 +161,36 @@ class ObservationsCfg: # 学生模型观测量
     @configclass
     class PolicyCfg(ObsGroup): # 学生模型的Actor的观测量
         """Observations for policy group."""
+        # 参考动作: 29 dim关节角 + 29 dim关节速度
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
+
+        # 局部坐标系 (base frame) 锚点姿态误差 6 dim
         motion_anchor_pos_b = ObsTerm(
             func=mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.25, n_max=0.25))
+
+        # 局部坐标系 (base frame) 锚点位置误差 (特权信息)
         motion_anchor_ori_b = ObsTerm(
             func=mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05))
+
+        # 机身线速度 (特权信息)
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.5, n_max=0.5))
+
+        # 机身角速度 3 dim
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
+
+        # 关节角位置误差 29 dim
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+
+        # 关节角速度误差 29 dim
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5))
+
+        # 前帧动作指令 29 dim
         actions = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
-            self.history_length = 5
+            self.history_length = 5 # 储存过去4帧+当前1帧
 
     @configclass
     class PrivilegedCfg(ObsGroup): # 学生模型的Critic的特权信息
@@ -717,7 +732,6 @@ class OneStageTrackingEnvCfg(GeneralTrackingEnvCfg): # 消融实验配置, 不�
             command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
             motion_anchor_ori_b = ObsTerm(
                 func=mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05))
-            
             base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
             joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
             joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5))

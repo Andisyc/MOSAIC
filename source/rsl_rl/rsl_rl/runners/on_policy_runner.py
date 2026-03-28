@@ -350,9 +350,11 @@ class OnPolicyRunner:
                 self.env.episode_length_buf, high=int(self.env.max_episode_length))
 
         # start learning
-        obs, extras = self.env.get_observations() # 获取观测
+        obs, extras = self.env.get_observations() # 获取观测, obs.shape=[num_env, 770], 770=[t, t-1, t-2, t-3, t-4]
 
         print(f"\n obs.shape = {obs.shape} \n")
+
+        print(f"\n self.env = {self.env} \n")
 
         obs_dict = extras.get("observations", {})
         if self.policy_obs_type is not None and self.policy_obs_type in obs_dict:
