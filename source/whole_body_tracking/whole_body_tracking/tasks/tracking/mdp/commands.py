@@ -26,6 +26,9 @@ from isaaclab.utils.math import (
     yaw_quat,
 )
 
+from .motion_perturbations import MotionPerturber
+
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -962,6 +965,10 @@ class MultiMotionCommand(CommandTerm):
         self.body_indexes = body_index_tensor.to(self.device)
         body_index_list = body_index_tensor.cpu().tolist()
 
+        # get foot indices for perturbation
+        self.left_foot_idx = self.cfg.body_names.index("left_ankle_roll_link")
+        self.right_foot_idx = self.cfg.body_names.index("right_ankle_roll_link")
+
         preload_device = (
             torch.device(self.cfg.motion_preload_device)
             if self.cfg.motion_preload_device is not None
@@ -1107,6 +1114,9 @@ class MultiMotionCommand(CommandTerm):
         self.motion_fail_counts = torch.zeros(
             self.num_motions_total, dtype=torch.float32, device=self.device
         )
+
+        # instantiate motion perturber
+        self.perturber = MotionPerturber(env.cfg.motion_perturbations, self.num_envs, self.device)
 
         # Initial assignment of motions to envs and initial resample of time
         all_envs = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
@@ -1302,7 +1312,21 @@ class MultiMotionCommand(CommandTerm):
     def anchor_pos_w(self) -> torch.Tensor:
         # Use body_pos_w then index anchor across bodies
         pos = self._gather_by_motion("body_pos_w")
-        return pos[:, self.motion_anchor_body_index] + self._env.scene.env_origins
+        
+        # apply perturbation
+        root_pos_ref = pos[:, self.motion_anchor_body_index]
+        root_vel_ref = self.anchor_lin_vel_w
+        left_foot_pos_ref = pos[:, self.left_foot_idx]
+        right_foot_pos_ref = pos[:, self.right_foot_idx]
+        
+        perturbed_pos = self.perturber.apply_perturbations(
+            root_pos_ref,
+            root_vel_ref,
+            left_foot_pos_ref,
+            right_foot_pos_ref
+        )
+        
+        return perturbed_pos + self._env.scene.env_origins
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:

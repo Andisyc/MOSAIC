@@ -91,3 +91,86 @@ def randomize_rigid_body_com(
 
     # Set the new coms
     asset.root_physx_view.set_coms(coms, env_ids)
+
+
+def randomize_gravity(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    z_range: tuple[float, float],
+):
+    """Randomize the gravity vector."""
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+
+    # sample random gravity values
+    gravity = torch.zeros(len(env_ids), 3, device=env.device)
+    gravity[:, 0] = math_utils.sample_uniform(x_range[0], x_range[1], (len(env_ids),), device=env.device)
+    gravity[:, 1] = math_utils.sample_uniform(y_range[0], y_range[1], (len(env_ids),), device=env.device)
+    gravity[:, 2] = math_utils.sample_uniform(z_range[0], z_range[1], (len(env_ids),), device=env.device)
+
+    # set the new gravity values
+    env.scene.physics_sim_view.set_gravity(gravity, env_ids=env_ids)
+
+
+def randomize_actuator_properties(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    stiffness_range: tuple[float, float],
+    damping_range: tuple[float, float],
+):
+    """Randomize the stiffness and damping of the actuators."""
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_ids = asset_cfg.joint_ids
+
+    # Get original actuator properties
+    actuator_props = asset.actuator_props_cfg.to_dict()
+    original_stiffness = torch.tensor([prop.stiffness for prop in actuator_props["control_cfg"]], device=env.device)
+    original_damping = torch.tensor([prop.damping for prop in actuator_props["control_cfg"]], device=env.device)
+
+    # sample random stiffness and damping multipliers
+    stiffness_multipliers = math_utils.sample_uniform(
+        stiffness_range[0], stiffness_range[1], (len(env_ids), len(joint_ids)), device=env.device
+    )
+    damping_multipliers = math_utils.sample_uniform(
+        damping_range[0], damping_range[1], (len(env_ids), len(joint_ids)), device=env.device
+    )
+
+    # apply the multipliers to the original values
+    new_stiffness = original_stiffness[joint_ids] * stiffness_multipliers
+    new_damping = original_damping[joint_ids] * damping_multipliers
+
+    # set the new actuator properties
+    asset.write_actuator_stiffness_to_sim(new_stiffness, joint_ids=joint_ids, env_ids=env_ids)
+    asset.write_actuator_damping_to_sim(new_damping, joint_ids=joint_ids, env_ids=env_ids)
+
+
+def add_payload_mass(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    mass_range: tuple[float, float],
+):
+    """Add a random payload mass to a specified body."""
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    body_ids = asset_cfg.body_ids
+
+    # sample random mass values
+    masses = math_utils.sample_uniform(mass_range[0], mass_range[1], (len(env_ids),), device=env.device)
+
+    # get the current mass of the bodies
+    body_masses = asset.root_physx_view.get_masses(clone=True)
+
+    # add the payload mass
+    body_masses[env_ids[:, None], body_ids] += masses.unsqueeze(1)
+
+    # set the new masses
+    asset.root_physx_view.set_masses(body_masses, env_ids=env_ids)
