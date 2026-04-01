@@ -24,9 +24,10 @@ from whole_body_tracking.utils.rsl_rl_cfg import (
     RslRlPpoActorCriticVQCfg,
     RslRlPpoActorCriticAttentionCfg,
     RslRlDistillationCfg,
-    RslRlSuperviseJointPosCfg,        # FrontRES Stage 1 policy
-    RslRlSuperviseAlgorithmCfg,       # FrontRES Stage 1 algorithm
-    RslRlFrontResidualActorCriticCfg, # FrontRES Stage 2 policy
+    RslRlSuperviseJointPosCfg,           # FrontRES Stage 1 policy
+    RslRlSuperviseAlgorithmCfg,          # FrontRES Stage 1 algorithm
+    RslRlFrontResidualActorCriticCfg,    # FrontRES Stage 2 policy
+    RslRlPpoFrontRESAlgorithmCfg,        # FrontRES Stage 2 algorithm (with reg + PCGrad)
 )
 
 
@@ -188,7 +189,7 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
         q_ref_start_idx=0,
     )
 
-    algorithm = RslRlPpoAlgorithmCfg(
+    algorithm = RslRlPpoFrontRESAlgorithmCfg(
         # --- 基础运行参数 ---
         num_learning_epochs=5,       # 每次拿 buffer 里的数据训练几次
         num_mini_batches=4,          # 切分 batch
@@ -204,6 +205,16 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
         schedule="adaptive",
         desired_kl=0.008,            # 要求策略更新比标准 PPO 更平滑
         max_grad_norm=1.0,
+
+        # --- FrontRES 正则化：防止修正量过大 ---
+        # L_reg = λ_reg * ||Δq_mean||^2 = ||q' - q_ref||^2 的等价形式
+        lambda_reg_init=0.01,        # 初始权重，约为 PPO loss 量级的 1/10
+        lambda_reg_decay=1.0,        # 不衰减（正则化是持续的安全约束）
+        lambda_reg_min=0.0,
+
+        # --- PCGrad：自适应协调 PPO 梯度与正则化梯度 ---
+        # True = 启用投影；False = 简单加权（先用 False 调稳定后再开）
+        use_pcgrad=False,
     )
 
 # ========== FrontRES Stage 2: RL Finetune ==========

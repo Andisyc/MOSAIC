@@ -5,12 +5,13 @@
 
 from __future__ import annotations
 
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from rsl_rl.modules import ActorCritic, ActorCriticVQ
+from rsl_rl.modules import ActorCritic, ActorCriticVQ, FrontRESActorCritic
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -45,6 +46,13 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # FrontRES Stage-2 正则化：惩罚过大的 Δq，防止修正幅度失控
+        # L_reg = lambda_reg * ||Δq_mean||^2，与 PPO loss 通过 PCGrad 协调梯度方向
+        lambda_reg_init: float = 0.0,
+        lambda_reg_decay: float = 1.0,
+        lambda_reg_min: float = 0.0,
+        # PCGrad：检测 PPO 梯度与正则化梯度的冲突并投影消解
+        use_pcgrad: bool = False,
     ):
         # device-related parameters
         self.device = device
@@ -92,8 +100,33 @@ class PPO:
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
-        # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        # Create optimizer — for FrontRESActorCritic only train residual_actor + critic + std;
+        # GMT parameters have requires_grad=False so policy.parameters() already excludes them,
+        # but we make it explicit here to match the MOSAIC optimizer pattern.
+        if isinstance(policy, FrontRESActorCritic):
+            trainable = list(policy.residual_actor.parameters()) + list(policy.critic.parameters())
+            if hasattr(policy, "std"):
+                trainable.append(policy.std)
+            elif hasattr(policy, "log_std"):
+                trainable.append(policy.log_std)
+            self.optimizer = optim.Adam(trainable, lr=learning_rate)
+            print("[PPO] FrontRESActorCritic detected: optimizer restricted to residual_actor + critic")
+        else:
+            self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+
+        # FrontRES 正则化参数
+        self.lambda_reg_init    = lambda_reg_init
+        self.lambda_reg_current = lambda_reg_init
+        self.lambda_reg_decay   = lambda_reg_decay
+        self.lambda_reg_min     = lambda_reg_min
+        self.use_pcgrad         = use_pcgrad
+        self.use_frontres_reg   = (lambda_reg_init > 0.0) and isinstance(policy, FrontRESActorCritic)
+
+        if self.use_frontres_reg:
+            print(f"[PPO] FrontRES regularization enabled: λ_reg={lambda_reg_init} "
+                  f"(decay={lambda_reg_decay}, min={lambda_reg_min})")
+        if self.use_pcgrad:
+            print("[PPO] PCGrad enabled for FrontRES Stage-2 training")
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
@@ -187,6 +220,7 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_reg_loss = 0
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -324,9 +358,23 @@ class PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            ppo_loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-            # VQ loss
+            # ====== FrontRES Stage-2 正则化 ======
+            # mu_batch 此时是 Δq_mean（FrontRESActorCritic 的 distribution.mean），
+            # 用其 L2 范数作为正则化项，拉近修正量与零（即拉近 q' 与 q_ref 的距离）。
+            reg_loss = torch.tensor(0.0, device=self.device)
+            if self.use_frontres_reg and self.lambda_reg_current > 0.0:
+                reg_loss = mu_batch.pow(2).mean()
+
+            # ====== 组合 loss（或 PCGrad）======
+            if self.use_pcgrad and self.use_frontres_reg and self.lambda_reg_current > 0.0:
+                # PCGrad：分别求各任务梯度，投影消解冲突后合并
+                loss = None  # 不直接 backward，由 _pcgrad_step 处理
+            else:
+                loss = ppo_loss + self.lambda_reg_current * reg_loss
+
+            # VQ loss（加到 ppo_loss 统一路径，PCGrad 暂不支持 VQ）
             if isinstance(self.policy, ActorCriticVQ):
                 vq_loss = self.policy.vq_loss
                 loss += vq_loss
@@ -373,22 +421,24 @@ class PPO:
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
             # Compute the gradients
-            # -- For PPO
-            self.optimizer.zero_grad()
-            loss.backward()
+            if self.use_pcgrad and self.use_frontres_reg and self.lambda_reg_current > 0.0:
+                # PCGrad 路径：不调用 loss.backward()，由 _pcgrad_step 接管
+                self._pcgrad_step({
+                    "ppo": ppo_loss,
+                    "reg": self.lambda_reg_current * reg_loss,
+                })
+            else:
+                # 标准路径
+                self.optimizer.zero_grad()
+                loss.backward()
+                if self.is_multi_gpu:
+                    self.reduce_parameters()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.optimizer.step()
             # -- For RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()  # type: ignore
                 rnd_loss.backward()
-
-            # Collect gradients from all GPUs
-            if self.is_multi_gpu:
-                self.reduce_parameters()
-
-            # Apply the gradients
-            # -- For PPO
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.optimizer.step()
             # -- For RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
@@ -397,6 +447,8 @@ class PPO:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            if self.use_frontres_reg:
+                mean_reg_loss += reg_loss.item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -422,6 +474,13 @@ class PPO:
         if isinstance(self.policy, ActorCriticVQ):
             mean_vq_loss /= num_updates
             mean_vq_perplexity /= num_updates
+        # -- lambda_reg 衰减
+        if self.use_frontres_reg:
+            self.lambda_reg_current = max(
+                self.lambda_reg_min,
+                self.lambda_reg_current * self.lambda_reg_decay)
+            mean_reg_loss /= num_updates
+
         # -- Clear the storage
         self.storage.clear()
 
@@ -431,6 +490,9 @@ class PPO:
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if self.use_frontres_reg:
+            loss_dict["reg"] = mean_reg_loss
+            loss_dict["lambda_reg"] = self.lambda_reg_current
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
@@ -443,6 +505,79 @@ class PPO:
     """
     Helper functions
     """
+
+    def _pcgrad_step(self, task_losses: dict) -> None:
+        """
+        PCGrad (Project Conflicting Gradients) 优化步骤。
+
+        对每对任务 (i, j)：若 ∇Li · ∇Lj < 0（梯度冲突），
+        则将 ∇Li 投影到 ∇Lj 的法平面，消除冲突分量。
+        最终梯度 = 各任务投影后梯度之和。
+
+        参考：Yu et al., "Gradient Surgery for Multi-Task Learning", NeurIPS 2020.
+
+        Args:
+            task_losses: {task_name: loss_tensor}，每个 loss 必须共享同一计算图
+                         （本方法内部通过 retain_graph=True 多次反向传播）。
+        """
+        params = [p for p in self.policy.parameters() if p.requires_grad]
+        names  = list(task_losses.keys())
+        n      = len(names)
+
+        if n == 0:
+            return
+
+        # ── Step 1: 分别计算每个任务的梯度 ──────────────────────────────────
+        task_grads: dict[str, list[torch.Tensor]] = {}
+        for idx, (name, loss) in enumerate(task_losses.items()):
+            for p in params:
+                if p.grad is not None:
+                    p.grad.zero_()
+            # 除最后一次外保留计算图，以便后续任务也能 backward
+            loss.backward(retain_graph=(idx < n - 1))
+            task_grads[name] = [
+                p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+                for p in params
+            ]
+
+        # ── Step 2: PCGrad 投影 ────────────────────────────────────────────
+        # proj_grads[i] 是任务 i 经过投影后的梯度列表（从原始梯度出发逐步修正）
+        proj_grads: dict[str, list[torch.Tensor]] = {
+            name: [g.clone() for g in grads]
+            for name, grads in task_grads.items()
+        }
+
+        # 随机化任务顺序，减少系统性偏差
+        perm = list(names)
+        random.shuffle(perm)
+
+        for i_name in perm:
+            for j_name in perm:
+                if i_name == j_name:
+                    continue
+                # 展平梯度向量用于点积计算
+                g_i = torch.cat([g.reshape(-1) for g in proj_grads[i_name]])
+                g_j = torch.cat([g.reshape(-1) for g in task_grads[j_name]])
+
+                dot = torch.dot(g_i, g_j)
+                if dot < 0:  # 梯度冲突：投影消除
+                    norm_gj_sq = torch.dot(g_j, g_j).clamp(min=1e-8)
+                    scale = dot / norm_gj_sq
+                    for k in range(len(params)):
+                        proj_grads[i_name][k] = proj_grads[i_name][k] - scale * task_grads[j_name][k]
+
+        # ── Step 3: 合并投影后梯度并更新 ─────────────────────────────────
+        for p in params:
+            if p.grad is not None:
+                p.grad.zero_()
+        for k, p in enumerate(params):
+            p.grad = sum(proj_grads[name][k] for name in names)
+
+        if self.is_multi_gpu:
+            self.reduce_parameters()
+
+        nn.utils.clip_grad_norm_(params, self.max_grad_norm)
+        self.optimizer.step()
 
     def broadcast_parameters(self):
         """Broadcast model parameters to all GPUs."""

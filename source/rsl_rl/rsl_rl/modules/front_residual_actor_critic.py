@@ -529,104 +529,172 @@ class FrontRESActorCritic(nn.Module):
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
 
-    def _frontres_forward(self, observations):
+    def _parse_observations(self, observations):
         """
-        Shared FrontRES pre-GMT pipeline used by both update_distribution and act_inference.
-
-        Pipeline:
-            1. Parse observations → policy_obs, ref_vel (or estimator obs)
-            2. FrontRES computes Δq from policy_obs
-            3. q_ref inside policy_obs is corrected: q_ref += Δq
-            4. Build gmt_obs from corrected policy_obs (+ ref_vel if available)
-            5. GMT forward (frozen) → actions
+        Parse raw observation tensor (or dict) into (policy_obs, ref_vel).
 
         Returns:
-            actions (torch.Tensor): final actions from GMT after q_ref correction
-            delta_q (torch.Tensor): the Δq output by FrontRES (for logging)
+            policy_obs (Tensor): observations for residual_actor  [N, num_actor_obs]
+            ref_vel    (Tensor | None): reference velocity suffix  [N, ref_vel_dim] or None
+            ref_vel_estimator_obs (Tensor | None): observations for vel estimator
         """
-        # --- Step 1: parse observations ---
         if isinstance(observations, dict):
-            policy_obs = observations["policy"]
+            policy_obs            = observations["policy"]
+            ref_vel               = None
             ref_vel_estimator_obs = observations.get("ref_vel_estimator", None)
-            ref_vel = None
         elif isinstance(observations, torch.Tensor):
             obs_dim = observations.shape[-1]
             if obs_dim == self.num_actor_obs:
-                policy_obs = observations
-                ref_vel = None
+                policy_obs            = observations
+                ref_vel               = None
                 ref_vel_estimator_obs = None
             elif obs_dim == self.gmt_actor_input_dim:
-                ref_vel_dim = self.gmt_actor_input_dim - self.num_actor_obs
-                policy_obs = observations[:, :-ref_vel_dim]
-                ref_vel = observations[:, -ref_vel_dim:]
+                ref_vel_dim           = self.gmt_actor_input_dim - self.num_actor_obs
+                policy_obs            = observations[:, :-ref_vel_dim]
+                ref_vel               = observations[:, -ref_vel_dim:]
                 ref_vel_estimator_obs = None
             else:
                 raise ValueError(
                     f"Unexpected observation dimension: {obs_dim}. "
-                    f"Expected {self.num_actor_obs} (policy_obs) or {self.gmt_actor_input_dim} (policy_obs+ref_vel)"
+                    f"Expected {self.num_actor_obs} (policy_obs) or "
+                    f"{self.gmt_actor_input_dim} (policy_obs+ref_vel)"
                 )
         else:
             raise TypeError(f"Unexpected observation type: {type(observations)}")
+        return policy_obs, ref_vel, ref_vel_estimator_obs
 
-        # --- Step 2: FrontRES computes Δq (trainable, gradients flow here) ---
-        delta_q = self.residual_actor(policy_obs)
+    def _apply_delta_q_and_run_gmt(self, policy_obs, delta_q, ref_vel, ref_vel_estimator_obs):
+        """
+        Apply Δq to q_ref, build GMT observation, run frozen GMT.
 
-        # --- Step 3: correct q_ref inside the observation vector ---
+        Always called inside torch.no_grad() – no gradient needed here because
+        FrontRES distributes over Δq directly (see update_distribution).
+
+        Returns:
+            robot_actions (Tensor): motor commands output by GMT  [N, num_actions]
+        """
+        # Correct q_ref inside the observation vector
         obs_modified = policy_obs.clone()
         q_ref_end_idx = self.q_ref_start_idx + self.num_actions
         obs_modified[:, self.q_ref_start_idx:q_ref_end_idx] = (
             obs_modified[:, self.q_ref_start_idx:q_ref_end_idx] + delta_q
         )
 
-        # --- Step 4: build gmt_obs from corrected obs ---
+        # Build GMT observation (add ref_vel suffix if available)
+        if ref_vel is not None:
+            gmt_obs = torch.cat([obs_modified, ref_vel], dim=-1)
+        elif self.ref_vel_estimator is not None and ref_vel_estimator_obs is not None:
+            ref_vel = self.ref_vel_estimator(ref_vel_estimator_obs)
+            gmt_obs = torch.cat([obs_modified, ref_vel], dim=-1)
+        else:
+            gmt_obs = self._pad_observations_for_gmt(obs_modified)
+
+        return self.gmt_policy.act_inference(gmt_obs)
+
+    def _frontres_forward(self, observations):
+        """
+        Full FrontRES → GMT pipeline used only by act_inference (deployment / evaluation).
+
+        For RL training, update_distribution + get_env_action is used instead, so that
+        the policy distribution is defined over Δq-space and gradient never needs to
+        flow through the frozen GMT network.
+
+        Returns:
+            robot_actions (Tensor): final motor commands from GMT after q_ref correction
+            delta_q       (Tensor): Δq output by FrontRES (for diagnostic logging)
+        """
+        policy_obs, ref_vel, ref_vel_estimator_obs = self._parse_observations(observations)
+
+        delta_q = self.residual_actor(policy_obs)
+
         with torch.no_grad():
-            if ref_vel is not None:
-                gmt_obs = torch.cat([obs_modified, ref_vel], dim=-1)
-            elif self.ref_vel_estimator is not None and ref_vel_estimator_obs is not None:
-                ref_vel = self.ref_vel_estimator(ref_vel_estimator_obs)
-                gmt_obs = torch.cat([obs_modified, ref_vel], dim=-1)
-            else:
-                gmt_obs = self._pad_observations_for_gmt(obs_modified)
+            robot_actions = self._apply_delta_q_and_run_gmt(
+                policy_obs, delta_q, ref_vel, ref_vel_estimator_obs)
 
-            # --- Step 5: GMT forward (frozen) ---
-            actions = self.gmt_policy.act_inference(gmt_obs)
-
-        return actions, delta_q
+        return robot_actions, delta_q
 
     def update_distribution(self, observations):
         """
-        Update action distribution for PPO training.
+        Define FrontRES action distribution over Δq-space for PPO training.
 
-        FrontRES corrects q_ref in observations, then GMT produces actions.
-        Gradients flow through FrontRES (delta_q) but not through GMT.
+        Design rationale
+        ----------------
+        Treating Δq as the "action" of FrontRES (with frozen GMT + robot as the
+        black-box environment) is the correct policy-gradient formulation:
+
+            ∇J ∝ E[ A · ∇_θ log π_θ(Δq | obs) ]
+
+        The gradient ∂ log π / ∂θ flows only through residual_actor(obs) → Δq_mean,
+        with NO need to backpropagate through the frozen GMT network.
+
+        The runner calls get_env_action() separately to map Δq_sample → robot_actions
+        for env.step(). The rollout buffer stores Δq_sample for log_prob computation.
         """
-        actions, delta_q = self._frontres_forward(observations)
+        policy_obs, _, _ = self._parse_observations(observations)
 
-        # Store for diagnostic logging
-        self.last_gmt_actions = actions.detach()
-        self.last_residual_actions = delta_q.detach()
+        # Cache full observations so get_env_action can access ref_vel if present
+        self._cached_observations = observations
 
-        # Compute standard deviation
+        # FrontRES computes Δq mean (gradient flows through here during PPO update)
+        delta_q_mean = self.residual_actor(policy_obs)
+
+        # Store for logging / regularization access by MOSAIC algorithm
+        self.last_residual_actions = delta_q_mean.detach()
+
+        # Build distribution over Δq-space
         if self.noise_std_type == "scalar":
-            std = self.std.expand_as(actions)
+            std = self.std.expand_as(delta_q_mean)
         elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).expand_as(actions)
+            std = torch.exp(self.log_std).expand_as(delta_q_mean)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
 
-        self.distribution = Normal(actions, std)
+        self.distribution = Normal(delta_q_mean, std)
 
     def act(self, observations, **kwargs):
-        """Sample actions from distribution (for training with exploration)"""
+        """
+        Sample Δq from FrontRES distribution (for rollout data collection).
+
+        Returns Δq_sample – NOT robot motor actions.
+        The runner converts Δq_sample → robot_actions via get_env_action().
+        The rollout buffer stores Δq_sample so that PPO can compute log π(Δq|obs).
+        """
         self.update_distribution(observations)
         return self.distribution.sample()
 
+    def get_env_action(self, observations, delta_q_sample: torch.Tensor) -> torch.Tensor:
+        """
+        Convert FrontRES Δq sample to robot motor actions for env.step().
+
+        Called by the runner immediately after policy.act():
+            delta_q_sample = policy.act(obs)           # stored in rollout buffer
+            robot_actions  = policy.get_env_action(obs, delta_q_sample)
+            env.step(robot_actions)
+
+        Uses cached observations from the preceding act() call so that ref_vel
+        (possibly appended by the velocity estimator inside MOSAIC.act()) is
+        correctly forwarded to GMT even when the runner only passes raw obs here.
+        """
+        # Prefer the cached obs from act() which may include ref_vel suffix
+        obs = getattr(self, '_cached_observations', observations)
+        policy_obs, ref_vel, ref_vel_estimator_obs = self._parse_observations(obs)
+
+        with torch.no_grad():
+            robot_actions = self._apply_delta_q_and_run_gmt(
+                policy_obs, delta_q_sample, ref_vel, ref_vel_estimator_obs)
+
+        return robot_actions
+
     def get_actions_log_prob(self, actions):
-        """Compute log probability of actions under current distribution"""
+        """
+        Log-probability of Δq samples under the current distribution.
+
+        `actions` here are Δq_sample values stored during rollout (NOT robot actions).
+        """
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations):
-        """Deterministic action for evaluation/deployment."""
+        """Deterministic robot actions for evaluation / deployment (uses mean Δq)."""
         actions, _ = self._frontres_forward(observations)
         return actions
 
