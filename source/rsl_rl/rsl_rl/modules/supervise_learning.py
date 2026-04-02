@@ -65,6 +65,7 @@ class SuperviseLearning(nn.Module):
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()
+        activation_name = activation          # keep original string for ActorCritic
         activation = resolve_nn_activation(activation)
 
         # ========== GMT Tracker (专家模型, .pt checkpoint) ==========
@@ -118,7 +119,7 @@ class SuperviseLearning(nn.Module):
             init_noise_std = (sd["std"][0].item() if "std" in sd
                               else torch.exp(sd["log_std"][0]).item())
 
-            act_fn = resolve_nn_activation(activation)
+            act_fn = resolve_nn_activation(activation_name)
             self.gmt_policy = ActorCritic(
                 num_actor_obs=gmt_actor_in,
                 num_critic_obs=gmt_critic_in,
