@@ -119,7 +119,6 @@ class SuperviseLearning(nn.Module):
             init_noise_std = (sd["std"][0].item() if "std" in sd
                               else torch.exp(sd["log_std"][0]).item())
 
-
             self.gmt_policy = ActorCritic(
                 num_actor_obs=gmt_actor_in,
                 num_critic_obs=gmt_critic_in,
