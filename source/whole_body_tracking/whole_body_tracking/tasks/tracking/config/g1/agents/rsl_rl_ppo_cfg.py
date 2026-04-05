@@ -139,7 +139,8 @@ class G1FlatSupervisedRunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=1.0,
         student_hidden_dims=[1024, 1024, 512, 256],
         activation="elu",
-        gmt_path=_gmt_pt_path,)
+        gmt_path=_gmt_pt_path,
+    )
 
     algorithm = RslRlSuperviseAlgorithmCfg(
         loss_type="huber",
