@@ -165,14 +165,12 @@ class SuperviseTrainer:
         cnt = 0
 
         # Accumulators for diagnostic metrics
-        sum_pred_norm = 0.0
-        sum_gt_norm = 0.0
-        sum_cos_sim = 0.0
-        sum_rel_err = 0.0
-        sum_valid_ratio = 0.0
-        sum_joint_gate_ratio   = 0.0  # fraction of joints passing temporal gate (upper-limb only)
-        sum_cascade_gate_ratio = 0.0  # fraction of live samples surviving lower-limb cascade
-        sum_joint_mae = None  # will be (num_actions,) tensor
+        sum_pred_norm          = 0.0
+        sum_gt_norm            = 0.0
+        sum_cos_sim            = 0.0
+        sum_valid_ratio        = 0.0
+        sum_cascade_gate_ratio = 0.0
+        sum_joint_mae          = None  # (num_actions,) tensor, accumulated then averaged
 
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
@@ -237,43 +235,24 @@ class SuperviseTrainer:
 
                 # --- Diagnostic metrics (no grad needed) ---
                 with torch.no_grad():
-                    # Fraction of valid (non-terminal) samples in this batch
+                    # 1. valid_ratio: fraction of non-terminal steps (fall rate proxy)
                     sum_valid_ratio += valid.mean().item()
 
-                    # Fraction of upper-limb joints passing temporal gate among live samples
-                    # (↓ means more individual upper-limb joint failures)
-                    upper_indices = [j for j in range(target_actions.shape[-1])
-                                     if j not in self.lower_limb_indices]
-                    if upper_indices and valid.sum() > 0:
-                        upper_jv = joint_valid[:, upper_indices]                # (B, |J_upper|)
-                        sum_joint_gate_ratio += (upper_jv * valid).sum() / (
-                            valid.expand_as(upper_jv).sum()).clamp(min=1.0)
-                    else:
-                        sum_joint_gate_ratio += 1.0
-
-                    # Fraction of live samples surviving lower-limb cascade gate
-                    # (↓ means more pre-fall episodes — useful for tuning jump_threshold)
+                    # 2. cascade_gate_ratio: fraction of live samples passing lower-limb
+                    #    cascade gate (↓ = more pre-fall failures; useful to tune jump_threshold)
                     n_live = valid.sum().clamp(min=1.0)
                     sum_cascade_gate_ratio += m_cascade.sum() / n_live
 
-                    pred_norm = predicted_actions.norm(dim=-1)   # (B,)
-                    gt_norm   = target_actions.norm(dim=-1)       # (B,)
+                    # 3 & 4. pred/gt norms — used to compute delta_q_norm_ratio
+                    sum_pred_norm += predicted_actions.norm(dim=-1).mean().item()
+                    sum_gt_norm   += target_actions.norm(dim=-1).mean().item()
 
-                    # L2 norm of predicted and ground-truth Δq (batch mean)
-                    sum_pred_norm += pred_norm.mean().item()
-                    sum_gt_norm   += gt_norm.mean().item()
+                    # 5. cosine_similarity: direction alignment ∈ [-1, 1], target → 1.0
+                    sum_cos_sim += nn.functional.cosine_similarity(
+                        predicted_actions, target_actions, dim=-1).mean().item()
 
-                    # Cosine similarity between predicted and GT Δq (direction alignment)
-                    cos_sim = nn.functional.cosine_similarity(predicted_actions, target_actions, dim=-1)
-                    sum_cos_sim += cos_sim.mean().item()
-
-                    # Relative error: ||pred - gt|| / ||gt||  (normalized accuracy)
-                    err_norm = (predicted_actions - target_actions).norm(dim=-1)
-                    rel_err  = err_norm / (gt_norm + 1e-8)
-                    sum_rel_err += rel_err.mean().item()
-
-                    # Per-joint absolute error, accumulated for mean across all batches
-                    joint_mae = (predicted_actions - target_actions).abs().mean(dim=0)  # (num_actions,)
+                    # 6 & 7. Per-joint MAE for joint_mae_mean and joint_mae_max
+                    joint_mae = (predicted_actions - target_actions).abs().mean(dim=0)  # (A,)
                     if sum_joint_mae is None:
                         sum_joint_mae = joint_mae
                     else:
@@ -306,23 +285,18 @@ class SuperviseTrainer:
         mean_gt_norm   = sum_gt_norm   / cnt
         mean_joint_mae = sum_joint_mae / cnt  # (num_actions,)
         loss_dict = {
-            # --- Primary convergence signal ---
-            "behavior":            mean_behavior_loss,           # Huber/MSE loss (main signal, should ↓)
-            # --- Amplitude calibration ---
-            "delta_q_pred_norm":   mean_pred_norm,               # predicted Δq L2 norm
-            "delta_q_gt_norm":     mean_gt_norm,                 # GT Δq L2 norm (reference)
-            "delta_q_norm_ratio":  mean_pred_norm / (mean_gt_norm + 1e-8),  # pred/gt ≈ 1.0 when calibrated
-            # --- Direction alignment ---
-            "cosine_similarity":   sum_cos_sim / cnt,            # cos(pred, gt) ∈ [-1,1], target → 1.0
-            # --- Normalized accuracy ---
-            "relative_error":      sum_rel_err / cnt,            # ||pred-gt||/||gt||, target < 0.1
-            # --- Data quality ---
-            "valid_ratio":          sum_valid_ratio / cnt,         # fraction of non-terminal steps (done mask)
-            "cascade_gate_ratio":   sum_cascade_gate_ratio / cnt,  # fraction of live samples passing lower-limb cascade (↓ = more pre-fall failures)
-            "upper_joint_gate_ratio": sum_joint_gate_ratio / cnt,  # fraction of upper-limb joints passing temporal gate
-            # --- Per-joint breakdown ---
-            "joint_mae_mean":      mean_joint_mae.mean().item(), # mean absolute error across joints
-            "joint_mae_max":       mean_joint_mae.max().item(),  # worst joint (upper bound on error)
+            # Primary convergence signal
+            "behavior":           mean_behavior_loss,
+            # Trivial-solution guard: pred/gt ≈ 1.0 when calibrated; → 0 means network collapsed
+            "delta_q_norm_ratio": mean_pred_norm / (mean_gt_norm + 1e-8),
+            # Direction alignment ∈ [-1, 1], target → 1.0
+            "cosine_similarity":  sum_cos_sim / cnt,
+            # Data quality
+            "valid_ratio":        sum_valid_ratio / cnt,         # fraction of non-terminal steps
+            "cascade_gate_ratio": sum_cascade_gate_ratio / cnt, # fraction of live samples passing lower-limb cascade
+            # Per-joint error
+            "joint_mae_mean":     mean_joint_mae.mean().item(),
+            "joint_mae_max":      mean_joint_mae.max().item(),
         }
 
         return loss_dict

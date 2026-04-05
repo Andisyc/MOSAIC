@@ -770,3 +770,78 @@ API Error: Unable to connect to API (UNKNOWN_CERTIFICATE_VERIFICATION_ERROR)
 Failed to authenticate. API Error: 403 {"error":{"type":"forbidden","message":"Request not allowed"}}
 
 ---
+
+
+**User**
+
+现在我们可以开始讨论Diagnostics Metrics了，我们已经确定的有主损失值，Max Amplitude，Cosine Similarity，还需要哪些Diagnostics Metrics？
+
+---
+
+
+**Claude**
+
+Failed to authenticate. API Error: 403 {"error":{"type":"forbidden","message":"Request not allowed"}}
+
+---
+
+
+**User**
+
+现在我们可以开始讨论Diagnostics Metrics了，我们已经确定的有主损失值，Max Amplitude，Cosine Similarity，还需要哪些Diagnostics Metrics？
+
+---
+
+
+**Claude**
+
+基于 FrontRES Stage 1 的训练目标和主要失效模式，以下是需要额外关注的指标：
+
+---
+
+**1. 预测幅度比 (Amplitude Ratio)**
+
+    pred_norm / gt_norm
+
+Stage 1 最大的失效风险是**平凡解**：网络学会输出 Δq ≈ 0，Loss 也能收敛但毫无意义。这个比值应趋近 1.0；如果持续下降趋近 0，说明网络在坍缩。单看 Loss 下降无法区分"学会了"和"输出全零"。
+
+---
+
+**2. 数据质量指标（两个）**
+
+    valid_ratio          — done mask 生效比例，反映跌倒频率
+    cascade_gate_ratio   — 存活样本中通过下肢级联门控的比例
+
+这两个指标共同描述"实际参与训练的有效数据量"。如果 cascade_gate_ratio 很低（比如 < 0.5），说明 tau 设置太严或当前策略跌倒太频繁，损失函数本身已经失去意义。在 headless 模式下这是唯一能看到训练环境健康状况的窗口。
+
+---
+
+**3. 均值误差 (Mean MAE)**
+
+    joint_mae_mean
+
+你已确认 Max Amplitude（joint_mae_max）。但 max 对单个最差关节敏感，均值反映整体收敛程度，两者配合才完整：max 持续大但 mean 小，说明是个别关节问题；两者都大，说明整体未收敛。
+
+---
+
+**不建议加的指标**
+
+- **Relative Error**：有了 Amplitude Ratio 和 MAE，相对误差提供的信息基本重叠
+- **Upper Joint Gate Ratio**：上肢门控失效不影响平衡，优先级低，会稀释注意力
+- **delta_q_gt_norm**：GT 幅度由参考动作决定，训练过程中不会变化，没有监控意义
+
+---
+
+**最终推荐的完整 Metrics 列表**
+
+    behavior              ← 主损失（已确认）
+    joint_mae_max         ← Max Amplitude（已确认）
+    cosine_similarity     ← 方向对齐（已确认）
+    delta_q_norm_ratio    ← 预测幅度比，平凡解检测
+    valid_ratio           ← 跌倒频率代理
+    cascade_gate_ratio    ← 有效训练数据比例
+    joint_mae_mean        ← 均值误差，配合 max 使用
+
+七个指标，每个各司其职，没有冗余。确认后我来对照代码检查是否需要补充或删减。
+
+---
