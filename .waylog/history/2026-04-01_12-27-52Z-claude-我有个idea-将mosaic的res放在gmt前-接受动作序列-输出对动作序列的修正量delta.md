@@ -546,3 +546,227 @@ behavior ↓？
 最值得关注的**潜在问题**：diagnostics 指标（cosine_similarity、joint_mae_mean、relative_error）没有 valid 掩码，而 loss 有掩码，导致高摔倒率时两者曲线不一致，需要在解读 Wandb 曲线时结合 `valid_ratio` 一起看。
 
 ---
+
+
+**Claude**
+
+Let me do a final review of the changed file to make sure everything is consistent:
+
+---
+
+
+**Claude**
+
+文件整体一致。全部修改完成，汇总如下：
+
+---
+
+## 修改总结
+
+### [supervise.py](source/whole_body_tracking/whole_body_tracking/utils/supervise.py)
+
+**1. Huber Loss**
+- `SuperviseTrainer.__init__` 默认 `loss_type="huber"`
+- `update()` 里用 `nn.functional.huber_loss(..., reduction="none")` 替换原来的 `self.loss_fn`
+
+**2. 静态下肢加权**
+- `__init__` 新增 `lower_limb_indices`、`lower_limb_weight` 参数
+- `init_storage()` 里构建 `self.static_weights`（shape `(A,)`），下肢关节赋值 `lower_limb_weight`，其余为 1.0
+- 损失计算：`eff_w = static_weights × joint_valid × valid`
+
+**3. 时序门控**
+- `SuperviseStorage.generator()` 额外 yield `prev_target_actions`（上一步的 Δq_gt，首帧用自身）
+- `update()` 计算帧间跳变：`jump = |Δq_gt(t) - Δq_gt(t-1)|`，超过 `jump_threshold` 的关节权重归零
+- 新增诊断指标 `joint_gate_ratio`（时序门通过率，↓ = 更多预摔失效关节）
+
+**4. 计算 Δq 时的掩码机制**
+- 原有 `valid = 1 - dones.float()`（样本级终止掩码）保留
+- 新增 `joint_valid`（关节级时序门掩码）
+- 两者与静态权重统一在 `eff_w` 里，归一化分母为 `eff_w.sum()`，确保损失尺度在不同门控比例下保持稳定
+
+### [rsl_rl_cfg.py](source/whole_body_tracking/whole_body_tracking/utils/rsl_rl_cfg.py)
+
+`RslRlSuperviseAlgorithmCfg` 新增三个字段：`lower_limb_indices`、`lower_limb_weight`、`jump_threshold`；`loss_type` 默认改为 `"huber"`
+
+### [rsl_rl_ppo_cfg.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py)
+
+`G1FlatSupervisedRunnerCfg.algorithm` 显式传入 `lower_limb_indices=list(range(12))`（假设前 12 个关节为髋/膝/踝）——**请在启动训练前根据实际 G1 joint_pos 切片顺序核实这个索引列表是否正确**。
+
+---
+
+
+**Claude**
+
+以下是四个组件的完整数学表达式。
+
+---
+
+## 符号定义
+
+| 符号 | 含义 |
+|------|------|
+| $T, B, J$ | 时间步数、并行环境数、关节数 |
+| $\hat{\Delta q}_{t,b,j}$ | FrontRES 对第 $t$ 步、第 $b$ 个环境、第 $j$ 个关节的预测残差 |
+| $\Delta q^*_{t,b,j}$ | 监督目标：$q^{\text{ref}}_{t,b,j} - q^{\text{sim}}_{t,b,j}$ |
+| $d_{t,b} \in \{0,1\}$ | 终止标志（机器人跌倒/重置时为 1） |
+
+---
+
+## 1. Huber Loss（逐元素）
+
+$$
+\ell_\delta(e) =
+\begin{cases}
+\dfrac{1}{2}\,e^2 & |e| \leq \delta \\[6pt]
+\delta\!\left(|e| - \dfrac{\delta}{2}\right) & |e| > \delta
+\end{cases}
+$$
+
+其中 $e = \hat{\Delta q}_{t,b,j} - \Delta q^*_{t,b,j}$，$\delta$ 为 Huber 阈值（PyTorch 默认 $\delta = 1.0$）。
+
+---
+
+## 2. 静态下肢加权
+
+$$
+w^{\text{s}}_j =
+\begin{cases}
+\alpha & j \in \mathcal{J}_{\text{lower}} \\
+1 & j \notin \mathcal{J}_{\text{lower}}
+\end{cases}
+$$
+
+其中 $\mathcal{J}_{\text{lower}}$ 为髋/膝/踝关节的索引集合，$\alpha > 1$ 为下肢权重系数（实验中取 $\alpha = 2$）。
+
+---
+
+## 3. 时序门控（关节级）
+
+$$
+m^{\text{gate}}_{t,b,j} = \mathbf{1}\!\left[\;\left|\Delta q^*_{t,b,j} - \Delta q^*_{t-1,b,j}\right| < \tau\;\right]
+$$
+
+当 $|\Delta q^*|$ 在相邻步之间发生突变（超过阈值 $\tau$）时，该关节被判定为跟踪失效（穿模/漂浮），从本步的损失计算中排除。首步令 $\Delta q^*_{0,b,j} := \Delta q^*_{1,b,j}$，使首步门控恒为开。
+
+---
+
+## 4. $\Delta q$ 掩码机制（样本级）
+
+$$
+m^{\text{done}}_{t,b} = 1 - d_{t,b}
+$$
+
+机器人跌倒或重置后，$q^{\text{sim}}$ 退化为物理无效状态，对应的 $\Delta q^*$ 不可作为训练信号，整个样本被屏蔽。
+
+---
+
+## 综合损失函数
+
+定义有效权重：
+
+$$
+w_{t,b,j} = w^{\text{s}}_j \cdot m^{\text{gate}}_{t,b,j} \cdot m^{\text{done}}_{t,b}
+$$
+
+Stage 1 监督损失为：
+
+$$
+\boxed{
+\mathcal{L}_{\text{sup}} =
+\frac{\displaystyle\sum_{t=1}^{T}\sum_{b=1}^{B}\sum_{j=1}^{J}
+      \ell_\delta\!\left(\hat{\Delta q}_{t,b,j} - \Delta q^*_{t,b,j}\right) \cdot w_{t,b,j}}
+     {\displaystyle\sum_{t=1}^{T}\sum_{b=1}^{B}\sum_{j=1}^{J} w_{t,b,j} + \epsilon}
+}
+$$
+
+其中 $\epsilon$ 为数值稳定常数，防止分母为零（所有关节同时失效的极端情况）。
+
+---
+
+**各 mask 的语义层次**
+
+$$
+w_{t,b,j} = \underbrace{w^{\text{s}}_j}_{\text{下肢侧重}} \cdot \underbrace{m^{\text{gate}}_{t,b,j}}_{\text{关节级：时序门控}} \cdot \underbrace{m^{\text{done}}_{t,b}}_{\text{样本级：终止掩码}}
+$$
+
+---
+
+
+**User**
+
+使用Latex似乎无法渲染，请直接使用text就行
+
+---
+
+
+**User**
+
+我对m_done有点疑惑：某段动作序列在仿真中某个时间步后才开始摔倒，但在这个时间步前完全可以用来计算Δq_gt，现在的方式是否直接抛弃整段q_sim？
+
+---
+
+
+**Claude**
+
+不会抛弃整段序列，`m_done` 是**逐时间步、逐环境**施加的掩码，不是逐 episode 的。
+
+当前 buffer 的存储结构是 `(T, B, A)`，generator 按时间步 `i` 迭代，每步计算：
+
+    valid(t, b) = 1 - done(t, b)
+
+如果 env b 在第 `t_fall` 步摔倒：
+
+    t=1  到 t=t_fall-1:  done=0, valid=1 → 正常参与 Loss
+    t=t_fall:            done=1, valid=0 → 仅屏蔽这一步
+
+所以之前的所有步骤都会被正常使用，`m_done` 只排除摔倒那一帧的 Δq_gt。
+
+---
+
+不过你的问题引出了一个真实的边界问题：时序门控在 **episode 交界处**会出错。
+
+    t_fall:    done=1,  target_actions[t_fall]  = Δq_gt（失效/重置状态，不可信）
+    t_fall+1:  done=0,  target_actions[t_fall+1] = Δq_gt（新 episode 第一步，可信）
+
+    jump = |target_actions[t_fall+1] - target_actions[t_fall]|
+
+由于 `t_fall` 的 Δq_gt 来自失效状态，这个 jump 可能很大，导致新 episode 第一步被时序门控误杀——而那一步的数据实际上是完全干净的。
+
+修复方法：当 `done(t-1, b) = 1` 时，将 `prev_target` 重置为当前步自身（jump = 0，门控恒开）：
+
+---
+
+
+**Claude**
+
+修复在 generator 层做最干净——把上一步的 `dones` 也一起 yield，让调用方在 episode 边界处将 `prev_target` 重置：
+
+---
+
+
+**User**
+
+现在我们可以开始讨论Diagnostics Metrics了，我们已经确定的有主损失值，Max Amplitude，Cosine Similarity，还需要哪些Diagnostics Metrics？
+
+---
+
+
+**Claude**
+
+API Error: Unable to connect to API (UNKNOWN_CERTIFICATE_VERIFICATION_ERROR)
+
+---
+
+
+**User**
+
+现在我们可以开始讨论Diagnostics Metrics了，我们已经确定的有主损失值，Max Amplitude，Cosine Similarity，还需要哪些Diagnostics Metrics？
+
+---
+
+
+**Claude**
+
+Failed to authenticate. API Error: 403 {"error":{"type":"forbidden","message":"Request not allowed"}}
+
+---

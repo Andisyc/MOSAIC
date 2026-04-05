@@ -232,7 +232,13 @@ class RslRlSuperviseAlgorithmCfg:
     learning_rate: float = 1.0e-3
     gradient_length: int = 15
     max_grad_norm: float = 1.0
-    loss_type: str = "mse"
+    loss_type: str = "huber"
+    # Static lower-limb joint weighting: set joint indices for hip/knee/ankle
+    lower_limb_indices: list | None = None
+    lower_limb_weight: float = 2.0
+    # Temporal gate: joints whose Δq_gt changes by more than this (rad) in one
+    # step are excluded from the loss (pre-fall tracking failure detection)
+    jump_threshold: float = 0.2
 
 # ====== FrontRES Stage 1: Supervised Learning ======
 

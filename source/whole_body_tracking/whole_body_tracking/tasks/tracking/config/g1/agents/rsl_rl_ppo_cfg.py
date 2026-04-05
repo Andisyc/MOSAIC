@@ -141,7 +141,14 @@ class G1FlatSupervisedRunnerCfg(RslRlOnPolicyRunnerCfg):
         activation="elu",
         gmt_path=_gmt_pt_path,)
 
-    algorithm = RslRlSuperviseAlgorithmCfg()
+    algorithm = RslRlSuperviseAlgorithmCfg(
+        loss_type="huber",
+        # G1 29-DOF lower-limb joint indices (hip × 6, knee × 2, ankle × 4 = 12 joints).
+        # Adjust if your joint ordering differs — cross-check with the obs joint_pos slice.
+        lower_limb_indices=list(range(12)),
+        lower_limb_weight=2.0,
+        jump_threshold=0.2,
+    )
 
 # ====== FrontRES Stage 1: Supervised Learning ======
 

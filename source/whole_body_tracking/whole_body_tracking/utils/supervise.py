@@ -46,7 +46,14 @@ class SuperviseStorage:
 
     def generator(self):
         for i in range(self.num_transitions_per_env):
-            yield self.observations[i], self.target_actions[i], self.dones[i]
+            prev_i = max(0, i - 1)
+            yield (
+                self.observations[i],
+                self.target_actions[i],
+                self.dones[i],
+                self.target_actions[prev_i],  # previous step's Δq_gt for temporal gate
+                self.dones[prev_i],           # previous step's done flag for boundary reset
+            )
 
 class SuperviseTrainer:
     """Supervised learning algorithm for training FrontRES to output delta_q."""
@@ -58,9 +65,13 @@ class SuperviseTrainer:
         gradient_length: int = 15,
         learning_rate: float = 1e-3,
         max_grad_norm: float = 1.0,
-        loss_type: str = "mse",
+        loss_type: str = "huber",
         device: str = "cpu",
-        multi_gpu_cfg: dict | None = None, # Distributed training parameters
+        multi_gpu_cfg: dict | None = None,  # Distributed training parameters
+        lower_limb_indices: list | None = None,  # Joint indices of lower limbs (hip/knee/ankle)
+        lower_limb_weight: float = 2.0,          # Static weight multiplier for lower limb joints
+        jump_threshold: float = 0.2,             # rad — temporal gate: joints whose Δq_gt jumps
+                                                 # more than this between steps are gated out
     ):
         # Device-related parameters
         self.device = device
@@ -92,13 +103,18 @@ class SuperviseTrainer:
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
 
-        # Initialize the loss function
-        if loss_type == "mse":
-            self.loss_fn = nn.functional.mse_loss
-        elif loss_type == "huber":
-            self.loss_fn = nn.functional.huber_loss
-        else:
+        # Loss type
+        if loss_type not in ("mse", "huber"):
             raise ValueError(f"Unknown loss type: {loss_type}")
+        self.loss_type = loss_type
+
+        # Static lower-limb joint weights (built in init_storage once num_actions is known)
+        self.lower_limb_indices = lower_limb_indices or []
+        self.lower_limb_weight  = lower_limb_weight
+        self.static_weights: torch.Tensor | None = None
+
+        # Temporal gate threshold (radians)
+        self.jump_threshold = jump_threshold
 
         self.num_updates = 0
 
@@ -111,6 +127,14 @@ class SuperviseTrainer:
             action_shape=action_shape,
             device=self.device
         )
+
+        # Build static lower-limb weight tensor now that num_actions is known
+        num_actions = action_shape[0]
+        self.static_weights = torch.ones(num_actions, device=self.device)
+        if self.lower_limb_indices:
+            self.static_weights[self.lower_limb_indices] = self.lower_limb_weight
+            print(f"[SuperviseTrainer] Lower-limb static weight {self.lower_limb_weight}× "
+                  f"applied to {len(self.lower_limb_indices)} joints: {self.lower_limb_indices}")
 
     def act(self, obs: torch.Tensor, target_delta_q: torch.Tensor) -> torch.Tensor:
         """record delta_q_gt"""
@@ -146,6 +170,8 @@ class SuperviseTrainer:
         sum_cos_sim = 0.0
         sum_rel_err = 0.0
         sum_valid_ratio = 0.0
+        sum_joint_gate_ratio   = 0.0  # fraction of joints passing temporal gate (upper-limb only)
+        sum_cascade_gate_ratio = 0.0  # fraction of live samples surviving lower-limb cascade
         sum_joint_mae = None  # will be (num_actions,) tensor
 
         for epoch in range(self.num_learning_epochs):
@@ -153,20 +179,56 @@ class SuperviseTrainer:
             self.policy.detach_hidden_states()
 
             # 直接按时间步迭代我们内置的 Buffer
-            for obs, target_actions, dones in self.storage.generator():
+            for obs, target_actions, dones, prev_target_actions, prev_dones in self.storage.generator():
                 # Inference of the FrontRES student
                 predicted_actions = self.policy.forward(obs)
 
-                # Mask out terminal transitions: when done=True the robot has fallen.
-                # q_sim is from a fallen/reset state → Δq_gt = q_ref - q_sim_fallen is
-                # anomalously large and noisy.  Training on it would corrupt FrontRES.
-                # valid: (B, 1) float, 1 = valid transition, 0 = terminal (fallen)
-                valid = 1.0 - dones.float()         # (B, 1)
-                n_valid = valid.sum().clamp(min=1.0) # avoid divide-by-zero
+                # ── Mask 1: sample-level terminal mask ────────────────────────────
+                # When done=True the robot has fallen/reset; Δq_gt from that state
+                # is unreliable (the reset joint positions are arbitrary).
+                # valid: (B, 1) float — 1 = live transition, 0 = terminal
+                valid = 1.0 - dones.float()   # (B, 1)
 
-                # Per-sample loss then weighted mean over valid samples only
-                per_sample_loss = self.loss_fn(predicted_actions, target_actions, reduction="none")  # (B, A)
-                behavior_loss = (per_sample_loss.mean(dim=-1, keepdim=True) * valid).sum() / n_valid
+                # ── Mask 2: joint-level temporal gate ─────────────────────────────
+                # A sudden jump in Δq_gt between consecutive steps indicates a
+                # tracking failure (penetration / floating) that hasn't triggered
+                # done=True yet.  Gate out those joints to avoid polluting training.
+                #
+                # Episode-boundary fix: if the previous step was terminal (done=True),
+                # the env was reset and prev_target_actions comes from a fallen/reset
+                # state.  Setting prev = current makes jump = 0 so the gate stays open
+                # for the first valid step of the new episode.
+                prev_done_mask = prev_dones.float()                             # (B, 1) 1=prev was terminal
+                safe_prev = (prev_target_actions * (1.0 - prev_done_mask)
+                             + target_actions    *          prev_done_mask)     # (B, A)
+                jump = (target_actions - safe_prev).abs()                       # (B, A)
+                joint_valid = (jump < self.jump_threshold).float()              # (B, A)
+
+                # ── Mask 3: lower-limb cascade mask (sample-level) ────────────────
+                # Balance in a humanoid is a global property: if ANY lower-limb
+                # joint fails the temporal gate, the entire sample is discarded.
+                # Upper-limb joint failures only gate that specific joint.
+                if self.lower_limb_indices:
+                    lower_stable = joint_valid[:, self.lower_limb_indices]      # (B, |J_lower|)
+                    any_lower_fail = lower_stable.min(dim=-1, keepdim=True).values < 0.5  # (B, 1)
+                    m_cascade = (~any_lower_fail).float() * valid               # (B, 1)
+                else:
+                    m_cascade = valid                                            # (B, 1)
+
+                # ── Effective weight: static lower-limb bias × joint gate × cascade mask ──
+                # static_weights: (A,), joint_valid: (B, A), m_cascade: (B, 1)
+                eff_w = self.static_weights.unsqueeze(0) * joint_valid * m_cascade  # (B, A)
+                n_eff = eff_w.sum().clamp(min=1.0)
+
+                # ── Per-joint Huber / MSE loss, then weighted mean ─────────────────
+                if self.loss_type == "huber":
+                    per_joint_loss = nn.functional.huber_loss(
+                        predicted_actions, target_actions, reduction="none")      # (B, A)
+                else:
+                    per_joint_loss = nn.functional.mse_loss(
+                        predicted_actions, target_actions, reduction="none")      # (B, A)
+
+                behavior_loss = (per_joint_loss * eff_w).sum() / n_eff
 
                 # Total loss
                 loss = loss + behavior_loss
@@ -177,6 +239,22 @@ class SuperviseTrainer:
                 with torch.no_grad():
                     # Fraction of valid (non-terminal) samples in this batch
                     sum_valid_ratio += valid.mean().item()
+
+                    # Fraction of upper-limb joints passing temporal gate among live samples
+                    # (↓ means more individual upper-limb joint failures)
+                    upper_indices = [j for j in range(target_actions.shape[-1])
+                                     if j not in self.lower_limb_indices]
+                    if upper_indices and valid.sum() > 0:
+                        upper_jv = joint_valid[:, upper_indices]                # (B, |J_upper|)
+                        sum_joint_gate_ratio += (upper_jv * valid).sum() / (
+                            valid.expand_as(upper_jv).sum()).clamp(min=1.0)
+                    else:
+                        sum_joint_gate_ratio += 1.0
+
+                    # Fraction of live samples surviving lower-limb cascade gate
+                    # (↓ means more pre-fall episodes — useful for tuning jump_threshold)
+                    n_live = valid.sum().clamp(min=1.0)
+                    sum_cascade_gate_ratio += m_cascade.sum() / n_live
 
                     pred_norm = predicted_actions.norm(dim=-1)   # (B,)
                     gt_norm   = target_actions.norm(dim=-1)       # (B,)
@@ -229,7 +307,7 @@ class SuperviseTrainer:
         mean_joint_mae = sum_joint_mae / cnt  # (num_actions,)
         loss_dict = {
             # --- Primary convergence signal ---
-            "behavior":            mean_behavior_loss,           # MSE/Huber loss (main signal, should ↓)
+            "behavior":            mean_behavior_loss,           # Huber/MSE loss (main signal, should ↓)
             # --- Amplitude calibration ---
             "delta_q_pred_norm":   mean_pred_norm,               # predicted Δq L2 norm
             "delta_q_gt_norm":     mean_gt_norm,                 # GT Δq L2 norm (reference)
@@ -239,7 +317,9 @@ class SuperviseTrainer:
             # --- Normalized accuracy ---
             "relative_error":      sum_rel_err / cnt,            # ||pred-gt||/||gt||, target < 0.1
             # --- Data quality ---
-            "valid_ratio":         sum_valid_ratio / cnt,         # fraction of non-terminal steps (fall rate proxy)
+            "valid_ratio":          sum_valid_ratio / cnt,         # fraction of non-terminal steps (done mask)
+            "cascade_gate_ratio":   sum_cascade_gate_ratio / cnt,  # fraction of live samples passing lower-limb cascade (↓ = more pre-fall failures)
+            "upper_joint_gate_ratio": sum_joint_gate_ratio / cnt,  # fraction of upper-limb joints passing temporal gate
             # --- Per-joint breakdown ---
             "joint_mae_mean":      mean_joint_mae.mean().item(), # mean absolute error across joints
             "joint_mae_max":       mean_joint_mae.max().item(),  # worst joint (upper bound on error)
