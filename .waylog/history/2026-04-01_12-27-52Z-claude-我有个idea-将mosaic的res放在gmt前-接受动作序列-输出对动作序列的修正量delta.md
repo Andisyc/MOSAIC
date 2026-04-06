@@ -870,3 +870,372 @@ algorithm = RslRlSuperviseAlgorithmCfg(
 `list(range(12))` = indices 0-11、robot_registry.py の joint 順と完全一致しており、追加変更は不要です。
 
 ---
+
+
+**User**
+
+现在我已经将FrontRES的Stage 1推送到服务器上开始训练了，我们必须尽快写完Stage 2的强化学习微调，我们已经写好了Stage 2强化学习微调的基础架构和权重调整与PCGrad，现在我们必须开始写域随机化项、奖励函数项和Diagnosis Terms，请先阅读整个仓库，检查我们写的Stage 2 RL基础架构、权重调整、PCGrad代码是否正确
+
+---
+
+
+**Claude**
+
+Failed to authenticate. API Error: 403 {"error":{"type":"forbidden","message":"Request not allowed"}}
+
+---
+
+
+**User**
+
+现在我已经将FrontRES的Stage 1推送到服务器上开始训练了，我们必须尽快写完Stage 2的强化学习微调，我们已经写好了Stage 2强化学习微调的基础架构和权重调整与PCGrad，现在我们必须开始写域随机化项、奖励函数项和Diagnosis Terms，请先阅读整个仓库，检查我们写的Stage 2 RL基础架构、权重调整、PCGrad代码是否正确
+
+---
+
+
+**Claude**
+
+Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"},"request_id":"req_011CZnXPNMiPDXMEL5Pg76A2"}
+
+---
+
+
+**User**
+
+现在我已经将FrontRES的Stage 1推送到服务器上开始训练了，我们必须尽快写完Stage 2的强化学习微调，我们已经写好了Stage 2强化学习微调的基础架构和权重调整与PCGrad，现在我们必须开始写域随机化项、奖励函数项和Diagnosis Terms，请先阅读整个仓库，检查我们写的Stage 2 RL基础架构、权重调整、PCGrad代码是否正确
+
+---
+
+
+**Claude**
+
+基础架构验证全部通过，所有关键组件均正确。现在直接读关键文件，为写域随机化、奖励函数和 Diagnosis Terms 做准备：
+
+---
+
+
+**Claude**
+
+现在我有完整的视图。以下是验证结果和需要补充的内容。
+
+---
+
+## 已有代码验证：全部正确
+
+**Stage 2 基础架构**：Distribution 是 `Normal(delta_q_mean, std)` ✓，`get_env_action()` 存在且 runner 正确调用 ✓，优化器只训练 `residual_actor + critic + std` ✓，GMT 冻结 ✓
+
+**域随机化 (`RLFinetuneEventCfg`)**：已有 7 项，比 Stage 1 更强（摩擦力更大、关节偏差±0.02、重力范围更宽、执行器 ±30%、载荷 0-7 kg、推力频率更高），加上 motion-level 扰动（浮空/下陷/脚滑/体拖）。**无需补充**。
+
+**PCGrad**：投影逻辑正确，`mu_batch` 确实来自 `distribution.mean`（即 Δq_mean）✓
+
+---
+
+## 需要补充的三项
+
+### 1. 奖励函数 — 缺少 3 个关键项
+
+`RLFinetuneRewardsCfg` 现有 8 项，但遗漏了：
+
+**a) 全局锚点追踪**（anchor pos/ori）— `RewardsExpertCfg` 有但 `RLFinetuneRewardsCfg` 没有，机器人整体位置/朝向漂移无约束
+
+**b) 脚部接触状态匹配**（`contact_feet`）— 这是 FrontRES 最核心的目标：修正浮空/穿模使脚部接触状态与参考运动一致，缺失这个奖励等于没有直接信号
+
+**c) `joint_acc`** — 基础配置有但 Stage 2 遗漏，关节加速度无约束
+
+### 2. Diagnosis Terms — 完全缺失
+
+当前 `FrontRESFinetuneTrackingEnvCfg` 没有任何诊断项，headless 训练时完全看不到关键状态。
+
+### 3. `q_ref_start_idx` 与 history 的潜在问题
+
+配置注释已标注了这个不确定性：`history_length=5` 时 obs 被拼接为 `163×5=815` 维，`q_ref_start_idx=0` 假设 q_ref 在最新帧切片的开头，但如果 history 是 oldest-first 堆叠，实际 q_ref 位置应该是 `(5-1)×163 = 652`。这需要 debug 一步验证，不影响现在写其余代码。
+
+---
+
+要我现在开始实现补充的奖励项和诊断项吗？奖励项的修改位置在 [tracking_env_cfg.py:974](source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py#L974) 的 `RLFinetuneRewardsCfg`，诊断项需要在同文件里新增一个 `FrontRESDiagnosticsCfg` 并接入 `FrontRESFinetuneTrackingEnvCfg`。
+
+---
+
+
+**Claude**
+
+这个研究框架非常清晰：**DR 注入结构化噪声，奖励函数是去噪目标，每种噪声类型必须有对应的检测信号，否则 FrontRES 无法学会修正它**。
+
+---
+
+## DR 项与奖励项的一一对应关系
+
+**接触类（3 项对应同一组奖励）**
+
+    穿模 → q_ref 脚部低于地面，机器人实际上感受到地面推力
+    漂浮 → q_ref 脚部高于地面，机器人失去应有的支撑
+    接触错误 → q_ref 的接触相位与实际不符
+
+    对应奖励：
+    ├── contact_feet      — 二值信号：脚部接触状态 vs 参考，直接检测三种接触错误
+    └── feet_z tracking   — 连续信号：脚部高度精确值，对穿模/漂浮提供梯度方向
+
+**关节类（2 项对应同一组奖励）**
+
+    关节偏置  → q_ref 某些关节加了系统性偏移
+    关节解耦  → q_ref 关节间的运动学约束被破坏
+
+    两类噪声的效果都体现在身体末端段的位置/姿态偏差上
+
+    对应奖励：
+    ├── motion_body_pos   — 肢体位置：关节误差积分后的空间表现
+    ├── motion_body_ori   — 肢体朝向：姿态偏差，对解耦更敏感
+    ├── motion_body_lin_vel — 速度：关节偏差的时间导数
+    └── motion_body_ang_vel — 角速度：姿态偏差的时间导数
+
+**根节点类（1 项，需要单独奖励）**
+
+    根节点错误 → q_ref 的盆骨位置/朝向有偏移
+
+    这是我之前分析失误的地方：当 DR 显式注入根节点误差时
+    全局锚点追踪就不再是"间接信号"，而是最直接的检测信号
+
+    对应奖励：
+    ├── motion_global_anchor_pos — 盆骨世界坐标位置
+    └── motion_global_anchor_ori — 盆骨世界坐标朝向
+
+**质心类（1 项，用组合代理）**
+
+    质心越界 → CoM 超出支撑多边形
+
+    理想的奖励是直接计算 CoM 在支撑多边形中的位置，
+    但仿真中无现成 API。以下三个信号的组合等价：
+
+    ├── motion_global_anchor_pos — 盆骨位置正确 → CoM 大概率在支撑域内
+    ├── contact_feet             — 接触状态正确 → 支撑多边形正确
+    └── 自然 Episode 截断        — 机器人摔倒则 Episode 提前结束，累积奖励降低
+
+---
+
+## 完整奖励结构
+
+    ─── 接触去噪信号 ──────────────────────────────────
+    contact_feet               (新增)  脚部接触状态匹配，覆盖：穿模/漂浮/接触错误
+    teleop_body_position_feet  (新增)  脚部位置精确追踪，对穿模/漂浮提供连续梯度
+
+    ─── 关节去噪信号 ──────────────────────────────────
+    motion_body_pos            (已有)  肢体位置，覆盖：关节偏置/关节解耦
+    motion_body_ori            (已有)  肢体朝向
+    motion_body_lin_vel        (已有)  线速度
+    motion_body_ang_vel        (已有)  角速度
+
+    ─── 根节点去噪信号 ─────────────────────────────────
+    motion_global_anchor_pos   (新增)  盆骨位置，覆盖：根节点错误/质心越界(代理)
+    motion_global_anchor_ori   (新增)  盆骨朝向，覆盖：根节点错误
+
+    ─── 物理安全约束（所有噪声类型通用）───────────────
+    undesired_contacts         (已有)  非期望接触惩罚
+    joint_limit                (已有)  关节超限惩罚
+    joint_torque               (已有)  扭矩约束
+    action_rate_l2             (已有)  平滑性
+
+这样每一类 DR 噪声都有至少一个对应的直接奖励信号，去噪映射的学习目标是完备的。确认后开始实现。
+
+---
+
+
+**User**
+
+注意这篇文章并不针对遥操任务，而是针对Tracking任务，似乎不应该涉及遥操奖励项，请修改
+
+---
+
+
+**Claude**
+
+正确，`teleop_*` 系列奖励函数是为遥操任务设计的（世界坐标系手部/头部追踪），不适合 Tracking 任务。
+
+替换方案：用已有的 Tracking 风格奖励函数，加 `body_names` 过滤参数限定到脚部：
+
+    teleop_body_position_feet   →   motion_relative_body_position_error_exp
+                                        body_names=["left_ankle_roll_link",
+                                                    "right_ankle_roll_link"]
+
+`motion_relative_body_position_error_exp` 本来就支持 `body_names` 过滤，加了这个参数后它只对踝关节计算位置误差，等价于脚部位置精确追踪，且完全是 Tracking 任务语义（相对锚点的身体段位置）。
+
+`contact_feet` 不涉及遥操概念，保留。
+
+---
+
+**修正后的新增奖励项（全部为 Tracking 风格）：**
+
+    contact_feet
+        → func=mdp.contact_feet
+        → 覆盖：穿模/漂浮/滑步（接触状态）
+
+    motion_feet_pos（新命名）
+        → func=mdp.motion_relative_body_position_error_exp
+        → body_names=["left_ankle_roll_link", "right_ankle_roll_link"]
+        → 覆盖：穿模/漂浮/滑步（连续位置）
+
+    motion_global_anchor_pos
+        → func=mdp.motion_global_anchor_position_error_exp
+        → 覆盖：根节点错误/质心越界
+
+    motion_global_anchor_ori
+        → func=mdp.motion_global_anchor_orientation_error_exp
+        → 覆盖：根节点错误
+
+现在可以开始实现，修改 [tracking_env_cfg.py:974](source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py#L974) 的 `RLFinetuneRewardsCfg` 吗？
+
+---
+
+
+**Claude**
+
+## 域随机化项与奖励项的对应关系
+
+---
+
+**所有追踪类奖励的统一形式**
+
+    R = exp(-E / sigma^2)
+
+    E 是某种误差度量，sigma 是容差标准差（越小要求越精确）
+    R 的范围 [0, 1]，误差为 0 时 R = 1，误差越大 R 越小
+
+---
+
+### 穿模 / 漂浮 / 滑步 → contact_feet + motion_feet_pos
+
+**三种噪声的共同机制**
+
+    穿模：q_ref 的脚部低于地面 → GMT 试图将脚驱动到地面以下 → 物理引擎将脚推回 → 脚无法到达参考位置
+    漂浮：q_ref 的脚部高于地面（应接触时） → GMT 将脚驱动至悬空高度 → 脚失去接触
+    滑步：q_ref 在接触相中脚部有横向位移 → GMT 跟随滑动参考 → 脚在地面上滑动
+
+**奖励 1: contact_feet**
+
+    对每只脚 f in {左踝, 右踝}:
+        c_actual(f) = 1  if  z_actual(f) < h_threshold  else  0
+        c_ref(f)    = 1  if  z_ref(f)    < h_threshold  else  0
+
+    R_contact = 0.5 * sum_f( 1[ c_actual(f) == c_ref(f) ] )
+
+    范围 [0, 1]，两脚接触状态均与参考一致时取 1
+    直接检测：穿模（实际在地面，参考也应接触，一致）、漂浮（实际悬空，参考应接触，不一致）
+    对滑步：滑步严重到脚离地时也能检测
+
+**奖励 2: motion_feet_pos（motion_relative_body_position_error_exp，仅脚部）**
+
+    J_feet = {left_ankle_roll_link, right_ankle_roll_link}
+
+    E_feet = mean_{j in J_feet} ( ||p_ref(j) - p_robot(j)||^2 )
+
+    R_feet = exp( -E_feet / sigma_feet^2 )
+
+    sigma_feet 建议设为 0.05 m（比全身 body_pos 更严格，反映脚部精度要求高）
+    连续检测：穿模/漂浮的高度误差 + 滑步的横向位移误差
+
+---
+
+### 关节偏置 → motion_body_pos + undesired_contacts
+
+**噪声机制**
+
+    关节偏置在运动学链上累积：
+    delta_q_bias(j) → 末端效应器位移 = J(j) * delta_q_bias   （J 为雅可比矩阵）
+    
+    拓扑约束问题（如手在头后时施加偏置）：
+    偏置导致手臂进入头部区域 → 自碰撞 → 物理引擎施加碰撞力
+
+**奖励 3: motion_body_pos（已有）**
+
+    J_all = 所有被追踪的身体段
+
+    E_body_pos = mean_{j in J_all} ( ||p_ref(j) - p_robot(j)||^2 )
+
+    R_body_pos = exp( -E_body_pos / sigma_body_pos^2 )
+
+    捕捉链式积累误差：关节偏置 → 末端段位置偏移 → E_body_pos 增大
+
+**奖励 4: undesired_contacts（已有）**
+
+    对所有非期望接触点（非踝关节、非腕关节的所有 link）:
+    R_contact_penalty = -1  if  contact_force > F_threshold
+
+    捕捉拓扑碰撞：手-头碰撞 → 接触力 > 1 N → 惩罚
+
+---
+
+### 关节解耦 → motion_body_pos + motion_body_ori
+
+**噪声机制**
+
+    关节角命令发出，但身体段未产生对应运动（机械解耦）
+    关键：body tracking 测量的是身体段实际位置，而非关节角命令
+    → 即使关节角正确，身体段未动，误差依然被检测到
+
+**奖励 3: motion_body_pos（同上）**
+**奖励 5: motion_body_ori（已有）**
+
+    E_body_ori = mean_{j in J_all} ( quat_err(q_ref(j), q_robot(j))^2 )
+
+    R_body_ori = exp( -E_body_ori / sigma_body_ori^2 )
+
+    body_pos 和 body_ori 组合完整覆盖解耦效果：
+    位置不动 → E_body_pos 增大；姿态不转 → E_body_ori 增大
+
+---
+
+### 根节点错误 → motion_global_anchor_pos + motion_global_anchor_ori
+
+**噪声机制**
+
+    q_ref 的盆骨（根节点）位置或朝向注入误差
+    → 全身参考轨迹整体偏移 → GMT 将整个机器人驱动到错误位置
+
+**奖励 6: motion_global_anchor_pos（新增）**
+
+    E_anchor_pos = ||p_anchor_ref - p_anchor_robot||^2     （世界坐标系 L2 距离的平方）
+
+    R_anchor_pos = exp( -E_anchor_pos / sigma_anchor_pos^2 )
+
+**奖励 7: motion_global_anchor_ori（新增）**
+
+    E_anchor_ori = quat_err(q_anchor_ref, q_anchor_robot)^2
+
+    R_anchor_ori = exp( -E_anchor_ori / sigma_anchor_ori^2 )
+
+    这两项是根节点误差的最直接检测信号
+    注：相比 motion_body_pos 对全身平均，anchor 奖励专门针对根节点
+
+---
+
+### 质心越界 → motion_global_anchor_pos + contact_feet（组合代理）
+
+**噪声机制**
+
+    质心超出支撑多边形 → 机器人失去稳定性趋向摔倒
+
+**无直接对应奖励函数**，通过两个代理信号覆盖：
+
+    motion_global_anchor_pos：盆骨位置正确 → CoM 大概率在支撑域内
+    contact_feet：接触状态正确 → 支撑多边形正确
+    Episode 自然截断：机器人摔倒 → 后续奖励清零 → 累积奖励降低
+
+---
+
+## 完整奖励项汇总
+
+    奖励项                    公式形式                     覆盖 DR 噪声
+    ─────────────────────────────────────────────────────────────────────
+    contact_feet             0.5 * sum_f(1[c==c_ref])    穿模/漂浮/滑步(离散)
+    motion_feet_pos          exp(-E_feet / s^2)           穿模/漂浮/滑步(连续)
+    motion_body_pos          exp(-E_body_pos / s^2)       关节偏置/关节解耦
+    motion_body_ori          exp(-E_body_ori / s^2)       关节偏置/关节解耦
+    motion_body_lin_vel      exp(-E_vel / s^2)            关节偏置/解耦/速度
+    motion_body_ang_vel      exp(-E_angvel / s^2)         关节偏置/解耦/旋转速度
+    motion_global_anchor_pos exp(-E_anchor_pos / s^2)    根节点错误/质心越界
+    motion_global_anchor_ori exp(-E_anchor_ori / s^2)    根节点错误
+    undesired_contacts       -1 if contact > threshold    关节偏置(自碰撞)/摔倒
+    joint_limit              -1 if q > q_max              所有噪声类型的安全约束
+    joint_torque             -||tau||^2                   所有噪声类型的安全约束
+    action_rate_l2           -||a_t - a_{t-1}||^2        平滑性约束
+
+---
