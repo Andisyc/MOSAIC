@@ -1239,3 +1239,67 @@ Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authenti
     action_rate_l2           -||a_t - a_{t-1}||^2        平滑性约束
 
 ---
+
+
+**Claude**
+
+这是个很好的观察，两个约束项确实存在概念对齐问题。
+
+---
+
+## action_rate_l2 的问题
+
+当前 `mdp.action_rate_l2` 计算的是：
+
+    ||robot_actions_t - robot_actions_{t-1}||^2
+
+其中 `robot_actions` 是 GMT 的输出，经过了一整个黑盒转换链：
+
+    Δq → q_dot → GMT → robot_actions
+
+FrontRES 只控制 Δq，而 robot_actions 的平滑性不仅取决于 Δq 的平滑性，还取决于 GMT 的内部动力学。用 GMT 输出的平滑性来约束 FrontRES，等于给了一个间接且有噪声的梯度信号。
+
+**正确的平滑约束应该直接作用于 Δq：**
+
+    smooth_loss = ||Δq_t - Δq_{t-1}||^2
+
+这个量在 rollout buffer 里是现成的（`storage.actions` 就是存储的 Δq），可以在 PPO 更新前用完整 rollout 计算，不需要打乱时序的 mini-batch：
+
+    delta_q_diff = storage.actions[1:] - storage.actions[:-1]   # (T-1, B, A)
+    smooth_loss = delta_q_diff.pow(2).mean()
+
+然后加入 PPO loss：
+
+    loss = ppo_loss + lambda_reg * reg_loss + lambda_smooth * smooth_loss
+
+---
+
+## L_reg 的评估
+
+`L_reg = lambda_reg * ||Δq_mean||^2` 已经正确地直接作用于 Δq，**无需修改**。
+
+但这里有个微妙的互补关系：
+
+    L_reg（幅度）：限制 Δq 不能太大，最小干预原则
+    smooth_loss（时序）：限制 Δq 不能在相邻帧间剧变
+
+两者不能互相替代：L_reg 允许每帧都有大 Δq 只要幅度一致；smooth_loss 允许 Δq 很大只要变化缓慢。对于去噪映射的物理意义：
+
+    L_reg     → 修正量要小（FrontRES 是微调器，不是替代 GMT）
+    smooth_loss → 修正量要稳定（相邻帧的物理状态相近，修正应连续）
+
+---
+
+## 修改建议
+
+    移除：RLFinetuneRewardsCfg 中的 action_rate_l2（针对 robot_actions，概念错误）
+
+    保留：L_reg = lambda_reg * ||Δq_mean||^2（已在 PPO loss 中，正确）
+
+    新增：smooth_loss = lambda_smooth * ||Δq_t - Δq_{t-1}||^2（在 PPO loss 中，针对 Δq）
+
+在 `ppo.py` 的 `update()` 中，smooth_loss 与 reg_loss 同级，可选择加入 PCGrad（三任务梯度投影）或简单加权合并。
+
+是否立即实现这两处修改？
+
+---
