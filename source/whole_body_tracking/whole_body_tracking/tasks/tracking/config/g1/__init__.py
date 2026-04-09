@@ -11,7 +11,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1FlatEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1FlatEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -21,7 +21,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1FlatWoStateEstimationEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1FlatWoStateEstimationEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -32,7 +32,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1FlatLowFreqEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1FlatLowFreqEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatLowFreqPPORunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -43,7 +43,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1FlatGeneralEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1FlatGeneralEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -53,7 +53,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1FlatWoStateEstimationGeneralEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1FlatWoStateEstimationGeneralEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -63,7 +63,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1FlatLowFreqGeneralEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1FlatLowFreqGeneralEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatLowFreqPPORunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -73,7 +73,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1FlatExpertGeneralEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1FlatExpertGeneralEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -83,7 +83,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1FlatExpertGeneralEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1FlatExpertGeneralEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_mosaic_cfg:G1FlatMOSAICRunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -94,7 +94,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1DistillationTrackingEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1DistillationTrackingEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatDistillationRunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -104,7 +104,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1DistillationTrackingEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1DistillationTrackingEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_mosaic_cfg:G1FlatMOSAICHybridRunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -114,7 +114,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1DistillationTrackingEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1DistillationTrackingEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_mosaic_cfg:G1FlatMOSAICPureDistillationRunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -124,7 +124,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1FLDDistillationTrackingEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1FLDDistillationTrackingEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_mosaic_cfg:G1FlatMOSAICPureDistillationRunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -135,7 +135,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1DistillationTrackingEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1DistillationTrackingEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_mosaic_cfg:G1FlatMOSAICRLContinueRunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -145,7 +145,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1DistillationTrackingEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1DistillationTrackingEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_mosaic_cfg:G1FlatMOSAICRLContinueResidualRunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -155,7 +155,7 @@ gym.register( # RES训练
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1MultiDistillationTrackingEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1MultiDistillationTrackingEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_mosaic_cfg:G1FlatMOSAICMultiTeacherResidualRunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -165,7 +165,7 @@ gym.register( # GMT & Adapt训练
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1OneStageTrackingEnvCfg, # 仿真环境 & 观测量
+        "env_cfg_entry_point": flat_env_cfg.G1OneStageTrackingEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatPPORunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -175,7 +175,7 @@ gym.register( # FrontRES训练 (阶段1)
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1SupervisedTrackingEnvCfg, # 仿真环境 & 观测量 (阶段一需要 target 监督信号)
+        "env_cfg_entry_point": flat_env_cfg.G1SupervisedTrackingEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化 (阶段一需要 target 监督信号)
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatSupervisedRunnerCfg", # 网络结构 & 训练算法
     },
 )
@@ -185,7 +185,7 @@ gym.register( # FrontRES训练 (阶段2)
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1FlatFrontRESFinetuneEnvCfg, # 仿真环境 & 观测量 (阶段二RL需要 Critic)
+        "env_cfg_entry_point": flat_env_cfg.G1FlatFrontRESFinetuneEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化 (阶段二RL需要 Critic)
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatFrontRESFinetuneRunnerCfg", # 网络结构 & 训练算法 (supervise_learning.py & supervise.py)
     },
 )

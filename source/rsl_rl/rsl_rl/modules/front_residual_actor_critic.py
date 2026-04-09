@@ -385,6 +385,15 @@ class FrontRESActorCritic(nn.Module):
         self.gmt_actor_input_dim = gmt_actor_input_dim
         self.num_actor_obs = num_actor_obs
 
+        # ========== Curriculum: Δq injection weight ==========
+        # alpha ∈ [0, 1]: effective q_dot = q_ref + alpha * Δq
+        # Set externally by the runner each iteration according to the schedule:
+        #   Phase 0 (Critic warmup):  alpha = alpha_init (fixed, non-zero)
+        #   Phase 1 (Ramp):           alpha_init → 1.0 (linear)
+        #   Phase 2 (Full training):  alpha = 1.0
+        # Default 1.0 so that evaluation / non-curriculum training is unaffected.
+        self.delta_q_alpha: float = 1.0
+
         if gmt_actor_input_dim != num_actor_obs:
             print(f"[ResidualActorCritic] WARNING: GMT expects {gmt_actor_input_dim} observations, "
                   f"but environment provides {num_actor_obs}. Will pad with zeros during inference.")
@@ -574,10 +583,14 @@ class FrontRESActorCritic(nn.Module):
             robot_actions (Tensor): motor commands output by GMT  [N, num_actions]
         """
         # Correct q_ref inside the observation vector
+        # delta_q_alpha ∈ [0,1] is set by the runner curriculum scheduler.
+        # During critic warmup: small fixed value (e.g. 0.1) so FrontRES has a
+        # limited but non-zero effect, letting the critic learn the right V(s).
+        # After warmup: linearly ramps to 1.0 over alpha_ramp_iterations.
         obs_modified = policy_obs.clone()
         q_ref_end_idx = self.q_ref_start_idx + self.num_actions
         obs_modified[:, self.q_ref_start_idx:q_ref_end_idx] = (
-            obs_modified[:, self.q_ref_start_idx:q_ref_end_idx] + delta_q
+            obs_modified[:, self.q_ref_start_idx:q_ref_end_idx] + self.delta_q_alpha * delta_q
         )
 
         # Build GMT observation (add ref_vel suffix if available)

@@ -972,31 +972,91 @@ class FrontRESFinetuneTrackingEnvCfg(GeneralTrackingEnvCfg):
 
     @configclass
     class RLFinetuneRewardsCfg:
-        """Reward terms, FrontRES Stage 2 RL Finetune, Physics-level DR"""
+        """Reward terms for FrontRES Stage 2 RL Finetune.
 
-        # --- Tracking Rewards (lower weight than expert) ---
+        Each reward term corresponds to one or more DR noise types:
+          contact_feet            — 脚-地面穿模 / 漂浮 / 滑步 (接触状态)
+          motion_feet_pos         — 脚-地面穿模 / 漂浮 / 滑步 (连续位置)
+          motion_body_pos         — 关节偏置 / 关节解耦 / 身体自穿模
+          motion_body_ori         — 关节偏置 / 关节解耦
+          motion_body_lin_vel     — 关节偏置 / 关节解耦 (速度)
+          motion_body_ang_vel     — 关节偏置 / 关节解耦 (角速度)
+          motion_global_anchor_pos — 根节点错误 / 质心越界 / 漂浮
+          motion_global_anchor_ori — 根节点错误
+          undesired_contacts      — 身体自穿模 / 关节偏置自碰撞
+          joint_limit             — 所有 DR 噪声类型的安全边界
+          joint_torque            — 执行器过载保护
+
+        Note: action_rate_l2 is removed — it penalises GMT output (robot_actions),
+        not Δq directly.  Smoothness over Δq is handled by smooth_loss in ppo.py.
+        """
+
+        # --- 接触去噪: 脚-地面穿模 / 漂浮 / 滑步 ---
+        # R = 0.5 * sum_f( 1[c_actual(f) == c_ref(f)] ), range [0, 1]
+        contact_feet = RewTerm(
+            func=mdp.contact_feet,
+            weight=1.0,
+            params={"command_name": "motion", "threshold": 0.05},
+        )
+
+        # R = exp(-E / sigma^2), E = mean_{j in J_feet}(||p_ref(j) - p_robot(j)||^2)
+        # sigma = 0.05 m (stricter than full-body, reflects foot precision requirement)
+        motion_feet_pos = RewTerm(
+            func=mdp.motion_relative_body_position_error_exp,
+            weight=1.0,
+            params={
+                "command_name": "motion",
+                "std": 0.05,
+                "body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
+            },
+        )
+
+        # --- 关节去噪: 关节偏置 / 关节解耦 / 身体自穿模 ---
+        # R = exp(-E / sigma^2), E = mean_{j in J_all}(||p_ref(j) - p_robot(j)||^2)
         motion_body_pos = RewTerm(
             func=mdp.motion_relative_body_position_error_exp,
             weight=0.5,
             params={"command_name": "motion", "std": 0.3},
         )
+
+        # R = exp(-E / sigma^2), E = mean_{j in J_all}(quat_err(quat_ref(j), quat_robot(j))^2)
         motion_body_ori = RewTerm(
             func=mdp.motion_relative_body_orientation_error_exp,
             weight=0.5,
             params={"command_name": "motion", "std": 0.4},
         )
+
+        # R = exp(-E / sigma^2), E = mean_{j in J_all}(||v_ref(j) - v_robot(j)||^2)
         motion_body_lin_vel = RewTerm(
             func=mdp.motion_global_body_linear_velocity_error_exp,
             weight=0.75,
             params={"command_name": "motion", "std": 1.0},
         )
+
+        # R = exp(-E / sigma^2), E = mean_{j in J_all}(||w_ref(j) - w_robot(j)||^2)
         motion_body_ang_vel = RewTerm(
             func=mdp.motion_global_body_angular_velocity_error_exp,
             weight=0.75,
             params={"command_name": "motion", "std": 3.14},
         )
 
-        # --- Physical Realism Penalties (higher weight) ---
+        # --- 根节点去噪: 根节点错误 / 质心越界 ---
+        # R = exp(-E / sigma^2), E = ||p_anchor_ref - p_anchor_robot||^2
+        motion_global_anchor_pos = RewTerm(
+            func=mdp.motion_global_anchor_position_error_exp,
+            weight=0.5,
+            params={"command_name": "motion", "std": 0.3},
+        )
+
+        # R = exp(-E / sigma^2), E = quat_err(quat_anchor_ref, quat_anchor_robot)^2
+        motion_global_anchor_ori = RewTerm(
+            func=mdp.motion_global_anchor_orientation_error_exp,
+            weight=0.5,
+            params={"command_name": "motion", "std": 0.4},
+        )
+
+        # --- 物理安全约束 ---
+        # 身体自穿模 / 关节偏置自碰撞: R = -1 if F(link) > 1.0 N
         undesired_contacts = RewTerm(
             func=mdp.undesired_contacts,
             weight=-2.0,
@@ -1010,13 +1070,16 @@ class FrontRESFinetuneTrackingEnvCfg(GeneralTrackingEnvCfg):
                 "threshold": 1.0,
             },
         )
+
+        # 所有 DR 噪声类型的关节安全边界
         joint_limit = RewTerm(
             func=mdp.joint_pos_limits,
             weight=-20.0,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
         )
+
+        # 执行器过载保护: R = -sum_j(tau_j^2)
         joint_torque = RewTerm(func=mdp.joint_torques_l2, weight=-2e-4)
-        action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.5)
 
     rewards: RLFinetuneRewardsCfg = RLFinetuneRewardsCfg()
     events: RLFinetuneEventCfg = RLFinetuneEventCfg()

@@ -60,3 +60,5 @@ ZERO_IMPACT_GUARANTEE.md
 MEMORY_OPTIMIZATION_SUMMARY.md
 results/
 *.pt
+results/
+*.pt

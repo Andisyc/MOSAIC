@@ -74,9 +74,6 @@ class RslRlDistillationCfg(RslRlPpoActorCriticCfg):
     teacher_hidden_dims: list[int] = [256, 256, 256]
 
 
-
-
-
 @configclass
 class RslRlResidualActorCriticCfg(RslRlPpoActorCriticCfg):
     """
@@ -301,3 +298,5 @@ class RslRlPpoFrontRESAlgorithmCfg(RslRlPpoAlgorithmCfg):
 
     # 梯度冲突协调, True启用PCGrad, False直接加权相加
     use_pcgrad: bool = False
+
+# ========== FrontRES Stage 2: RL Finetune ==========
