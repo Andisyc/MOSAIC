@@ -432,6 +432,16 @@ class OnPolicyRunner:
         critic_warmup_iters = self.cfg.get("critic_warmup_iterations", 0)
         _warmup_actor_frozen = False  # internal state flag
 
+        # Δq curriculum scheduler — only for FrontRESActorCritic
+        # alpha_init: fixed α during critic warmup (non-zero so critic learns correct V(s))
+        # alpha_ramp_iterations: after warmup, linearly ramp alpha_init → 1.0
+        _is_frontres = isinstance(self.alg.policy, FrontRESActorCritic)
+        _alpha_init  = float(self.cfg.get("delta_q_alpha_init", 1.0))
+        _alpha_ramp  = int(self.cfg.get("delta_q_alpha_ramp_iterations", 0))
+        if _is_frontres and (_alpha_ramp > 0 or _alpha_init < 1.0):
+            print(f"[Runner] Δq curriculum enabled: alpha_init={_alpha_init}, "
+                  f"ramp_iterations={_alpha_ramp} (starts after warmup={critic_warmup_iters})")
+
         for it in range(start_iter, tot_iter):
             start = time.time()
 
@@ -448,6 +458,21 @@ class OnPolicyRunner:
                         param.requires_grad = True
                     _warmup_actor_frozen = False
                     print(f"[Runner] Critic warmup complete at iteration {it}: Actor unfrozen")
+
+            # --- Δq alpha curriculum update ---
+            if _is_frontres:
+                local_it = it - start_iter
+                if local_it < critic_warmup_iters:
+                    # Phase 0: critic warmup — fixed alpha_init
+                    new_alpha = _alpha_init
+                elif _alpha_ramp > 0:
+                    # Phase 1: linear ramp from alpha_init to 1.0
+                    ramp_progress = min(1.0, (local_it - critic_warmup_iters) / _alpha_ramp)
+                    new_alpha = _alpha_init + ramp_progress * (1.0 - _alpha_init)
+                else:
+                    # No ramp configured: jump to 1.0 immediately after warmup
+                    new_alpha = 1.0
+                self.alg.policy.delta_q_alpha = new_alpha
 
             # Rollout: 训练首先需要积攒数据, 等数据攒够才能调用self.alg.update()更新权重
             with torch.inference_mode(): # 关闭计算图的梯度追踪, 只进行推理
@@ -608,6 +633,10 @@ class OnPolicyRunner:
             learn_time = stop - start
             self.current_learning_iteration = it
 
+            # expose curriculum state to log() via locals()
+            frontres_alpha         = self.alg.policy.delta_q_alpha if _is_frontres else None
+            frontres_warmup_active = int(_warmup_actor_frozen) if _is_frontres else None
+
             # log info
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
@@ -695,6 +724,14 @@ class OnPolicyRunner:
         if self.training_type != "supervise":
             self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
 
+        # -- FrontRES Δq curriculum diagnostics (wandb)
+        if isinstance(self.alg.policy, FrontRESActorCritic):
+            self.writer.add_scalar("Curriculum/delta_q_alpha",
+                                   locs.get("frontres_alpha", self.alg.policy.delta_q_alpha), locs["it"])
+            if locs.get("frontres_warmup_active") is not None:
+                self.writer.add_scalar("Curriculum/critic_warmup_active",
+                                       locs["frontres_warmup_active"], locs["it"])
+
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
@@ -738,6 +775,10 @@ class OnPolicyRunner:
             # -- Velocity estimator error (if available)
             if 'vel_est_error_buffer' in locs and len(locs['vel_est_error_buffer']) > 0:
                 log_string += f"""{'Mean vel_estimator error:':>{pad}} {statistics.mean(locs['vel_est_error_buffer']):.4f}\n"""
+            # -- FrontRES curriculum state
+            if locs.get("frontres_alpha") is not None:
+                warmup_str = " [WARMUP]" if locs.get("frontres_warmup_active") else ""
+                log_string += f"""{'Δq alpha:':>{pad}} {locs['frontres_alpha']:.4f}{warmup_str}\n"""
             # -- episode info
             log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
         else:

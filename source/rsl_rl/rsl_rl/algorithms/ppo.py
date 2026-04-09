@@ -121,6 +121,10 @@ class PPO:
         self.lambda_reg_min     = lambda_reg_min
         self.use_pcgrad         = use_pcgrad
         self.use_frontres_reg   = (lambda_reg_init > 0.0) and isinstance(policy, FrontRESActorCritic)
+        # smooth_loss: 时序平滑约束，对 rollout buffer 中相邻帧 Δq 的差分做 L2 惩罚
+        # L_smooth = lambda_smooth * mean_t(||Δq_t - Δq_{t-1}||^2)
+        # 默认 0.0（禁用），待 Stage 2 超参调优后启用
+        self.lambda_smooth = 0.0
 
         if self.use_frontres_reg:
             print(f"[PPO] FrontRES regularization enabled: λ_reg={lambda_reg_init} "
@@ -221,6 +225,23 @@ class PPO:
         mean_surrogate_loss = 0
         mean_entropy = 0
         mean_reg_loss = 0
+        mean_smooth_loss = 0
+        mean_kl_divergence = 0
+
+        # ── smooth_loss + delta_q diagnostics: 在 rollout buffer 全局计算 ──────
+        # 必须在循环前计算：mini-batch 会打乱时序顺序，无法正确计算相邻帧差分。
+        # storage.actions shape: (T, B, A)，T = num_transitions_per_env，存储的是 Δq 采样值
+        smooth_loss = torch.tensor(0.0, device=self.device)
+        delta_q_norm_mean = torch.tensor(0.0, device=self.device)
+        delta_q_norm_std  = torch.tensor(0.0, device=self.device)
+        if self.use_frontres_reg:
+            delta_q = self.storage.actions                  # (T, B, A)
+            per_step_norm = delta_q.norm(dim=-1)            # (T, B)
+            delta_q_norm_mean = per_step_norm.mean()
+            delta_q_norm_std  = per_step_norm.std()
+            if self.lambda_smooth > 0.0:
+                diff = delta_q[1:] - delta_q[:-1]          # (T-1, B, A)
+                smooth_loss = diff.pow(2).mean()
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -339,6 +360,8 @@ class PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
+                    mean_kl_divergence += kl_mean.item()
+
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
@@ -372,7 +395,7 @@ class PPO:
                 # PCGrad：分别求各任务梯度，投影消解冲突后合并
                 loss = None  # 不直接 backward，由 _pcgrad_step 处理
             else:
-                loss = ppo_loss + self.lambda_reg_current * reg_loss
+                loss = ppo_loss + self.lambda_reg_current * reg_loss + self.lambda_smooth * smooth_loss
 
             # VQ loss（加到 ppo_loss 统一路径，PCGrad 暂不支持 VQ）
             if isinstance(self.policy, ActorCriticVQ):
@@ -423,10 +446,12 @@ class PPO:
             # Compute the gradients
             if self.use_pcgrad and self.use_frontres_reg and self.lambda_reg_current > 0.0:
                 # PCGrad 路径：不调用 loss.backward()，由 _pcgrad_step 接管
-                self._pcgrad_step({
+                # smooth_loss 与 reg_loss 目标一致（均约束 Δq 幅度），合并为一个任务
+                task_losses = {
                     "ppo": ppo_loss,
-                    "reg": self.lambda_reg_current * reg_loss,
-                })
+                    "reg": self.lambda_reg_current * reg_loss + self.lambda_smooth * smooth_loss,
+                }
+                self._pcgrad_step(task_losses)
             else:
                 # 标准路径
                 self.optimizer.zero_grad()
@@ -449,6 +474,7 @@ class PPO:
             mean_entropy += entropy_batch.mean().item()
             if self.use_frontres_reg:
                 mean_reg_loss += reg_loss.item()
+                mean_smooth_loss += smooth_loss.item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -479,20 +505,29 @@ class PPO:
             self.lambda_reg_current = max(
                 self.lambda_reg_min,
                 self.lambda_reg_current * self.lambda_reg_decay)
-            mean_reg_loss /= num_updates
+            mean_reg_loss    /= num_updates
+            mean_smooth_loss /= num_updates
 
         # -- Clear the storage
         self.storage.clear()
+
+        # kl_divergence is only accumulated when schedule="adaptive"; guard against div-by-zero
+        if self.schedule == "adaptive" and self.desired_kl is not None:
+            mean_kl_divergence /= num_updates
 
         # construct the loss dictionary
         loss_dict = {
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "kl_divergence": mean_kl_divergence,
         }
         if self.use_frontres_reg:
-            loss_dict["reg"] = mean_reg_loss
-            loss_dict["lambda_reg"] = self.lambda_reg_current
+            loss_dict["reg"]              = mean_reg_loss
+            loss_dict["smooth"]           = mean_smooth_loss
+            loss_dict["lambda_reg"]       = self.lambda_reg_current
+            loss_dict["delta_q_norm_mean"] = delta_q_norm_mean.item()
+            loss_dict["delta_q_norm_std"]  = delta_q_norm_std.item()
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
