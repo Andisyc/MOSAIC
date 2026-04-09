@@ -130,8 +130,8 @@ class G1FlatSupervisedRunnerCfg(RslRlOnPolicyRunnerCfg):
     empirical_normalization = True
 
     # GMT .pt checkpoint 路径（与 Stage 2 共用同一个 checkpoint，支持双服务器路径选择）
-    _p1 = Path("/home/yuxuancheng/MOSAIC/model/model_27000.pt")
-    _p2 = Path("/home/chengyuxuan/MOSAIC/model/model_27000.pt")
+    _p1 = Path("/home/yuxuancheng/MOSAIC/model/model_27000.pt") # SUST_Main
+    _p2 = Path("/home/chengyuxuan/MOSAIC/model/model_27000.pt") # Wujie_4090
     _gmt_pt_path = _p1 if _p1.exists() else (_p2 if _p2.exists() else None)
 
     policy = RslRlSuperviseJointPosCfg(
