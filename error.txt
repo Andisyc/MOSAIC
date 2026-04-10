@@ -51,6 +51,6 @@ Traceback (most recent call last):
     self.event_manager.apply(mode="startup")
   File "/home/chengyuxuan/IsaacLab_mosaic/source/isaaclab/isaaclab/managers/event_manager.py", line 273, in apply
     term_cfg.func(self._env, env_ids, **term_cfg.params)
-  File "/home/chengyuxuan/MOSAIC/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/events.py", line 133, in randomize_actuator_properties
-    actuator_props = asset.actuator_props_cfg.to_dict()
-AttributeError: 'Articulation' object has no attribute 'actuator_props_cfg'
+  File "/home/chengyuxuan/MOSAIC/source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/events.py", line 150, in randomize_actuator_properties
+    asset.write_actuator_stiffness_to_sim(new_stiffness, joint_ids=joint_ids, env_ids=env_ids)
+AttributeError: 'Articulation' object has no attribute 'write_actuator_stiffness_to_sim'. Did you mean: 'write_joint_stiffness_to_sim'?
