@@ -167,11 +167,13 @@ def add_payload_mass(
     # sample random mass values
     masses = math_utils.sample_uniform(mass_range[0], mass_range[1], (len(env_ids),), device=env.device)
 
-    # get the current mass of the bodies
-    body_masses = asset.root_physx_view.get_masses().clone()
+    # get_masses() returns a CPU tensor — keep everything on CPU for indexing
+    body_masses = asset.root_physx_view.get_masses().clone()  # (num_envs, num_bodies) on CPU
+    env_ids_cpu = env_ids.cpu()
+    masses_cpu  = masses.cpu()
 
     # add the payload mass
-    body_masses[env_ids[:, None], body_ids] += masses.unsqueeze(1)
+    body_masses[env_ids_cpu[:, None], body_ids] += masses_cpu.unsqueeze(1)
 
-    # set the new masses
-    asset.root_physx_view.set_masses(body_masses, env_ids=env_ids)
+    # set the new masses (PhysX view expects CPU tensor)
+    asset.root_physx_view.set_masses(body_masses, env_ids=env_ids_cpu)
