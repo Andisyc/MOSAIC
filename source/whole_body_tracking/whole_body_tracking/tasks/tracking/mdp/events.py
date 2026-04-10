@@ -127,7 +127,14 @@ def randomize_actuator_properties(
         env_ids = torch.arange(env.num_envs, device=env.device)
 
     asset: Articulation = env.scene[asset_cfg.name]
-    joint_ids = asset_cfg.joint_ids
+
+    # Resolve joint_ids — asset_cfg.joint_ids may be slice(None) which does not
+    # support len(); convert to an explicit list so we can measure its length and
+    # use it as a tensor index.
+    if asset_cfg.joint_ids == slice(None):
+        joint_ids = list(range(asset.num_joints))
+    else:
+        joint_ids = list(asset_cfg.joint_ids)
 
     # Get nominal stiffness/damping from asset.data (shape: [num_envs, num_joints]).
     # Use env 0 as the reference — all envs share the same defaults at startup.
@@ -146,7 +153,7 @@ def randomize_actuator_properties(
     new_stiffness = nominal_stiffness.unsqueeze(0) * stiffness_multipliers  # (num_env_ids, num_joints)
     new_damping   = nominal_damping.unsqueeze(0)   * damping_multipliers
 
-    # write back to simulation
+    # write back to simulation (IsaacLab methods accept keyword args)
     asset.write_joint_stiffness_to_sim(new_stiffness, joint_ids=joint_ids, env_ids=env_ids)
     asset.write_joint_damping_to_sim(new_damping, joint_ids=joint_ids, env_ids=env_ids)
 
@@ -162,7 +169,13 @@ def add_payload_mass(
         env_ids = torch.arange(env.num_envs, device=env.device)
 
     asset: Articulation = env.scene[asset_cfg.name]
-    body_ids = asset_cfg.body_ids
+
+    # Resolve body_ids — asset_cfg.body_ids may be slice(None); convert to a list
+    # so that fancy-indexing with env_ids[:, None] works correctly.
+    if asset_cfg.body_ids == slice(None):
+        body_ids = list(range(asset.num_bodies))
+    else:
+        body_ids = list(asset_cfg.body_ids)
 
     # sample random mass values
     masses = math_utils.sample_uniform(mass_range[0], mass_range[1], (len(env_ids),), device=env.device)
@@ -175,5 +188,5 @@ def add_payload_mass(
     # add the payload mass
     body_masses[env_ids_cpu[:, None], body_ids] += masses_cpu.unsqueeze(1)
 
-    # set the new masses (PhysX view expects CPU tensor)
-    asset.root_physx_view.set_masses(body_masses, env_ids=env_ids_cpu)
+    # set_masses() takes env_ids as a positional argument (same convention as set_coms)
+    asset.root_physx_view.set_masses(body_masses, env_ids_cpu)
