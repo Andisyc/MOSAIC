@@ -267,7 +267,7 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
 
         # --- FrontRES 正则化：防止修正量过大 ---
         # L_reg = λ_reg * ||Δq_mean||^2 = ||q' - q_ref||^2 的等价形式
-        lambda_reg_init=0.01,        # 初始权重，约为 PPO loss 量级的 1/10
+        lambda_reg_init=0.1,        # 初始权重，约为 PPO loss 量级的 1/10
         lambda_reg_decay=1.0,        # 不衰减（正则化是持续的安全约束）
         lambda_reg_min=0.0,
 

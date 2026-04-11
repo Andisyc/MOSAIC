@@ -138,8 +138,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.commands.motion.motion = args_cli.motion
 
     # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    log_root_path = os.path.abspath(log_root_path)
+    # log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
+    # log_root_path = os.path.abspath(log_root_path)
+    # log_root_path = '/home/yuxuancheng/MOSAIC/logs/rsl_rl/g1_flat_supervised'
+    log_root_path = "/hdd0/yuxuancheng/g1_flat_supervised"
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
 
     # specify directory for logging runs: {time-stamp}_{run_name}

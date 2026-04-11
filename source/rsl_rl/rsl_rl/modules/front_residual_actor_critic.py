@@ -650,6 +650,20 @@ class FrontRESActorCritic(nn.Module):
         """
         policy_obs, _, _ = self._parse_observations(observations)
 
+        # ── DEBUG: 验证 q_ref_start_idx 是否指向当前帧 ──────────────────
+        if not getattr(self, '_q_ref_debug_done', False):
+            import torch
+            q_ref_slice = policy_obs[0, self.q_ref_start_idx : self.q_ref_start_idx + self.num_actions]
+            oldest_slice = policy_obs[0, 0 : self.num_actions]
+            print(f"\n[DEBUG q_ref_start_idx={self.q_ref_start_idx}]")
+            print(f"  obs[{self.q_ref_start_idx}:{self.q_ref_start_idx+self.num_actions}] (应为当前帧 q_ref_pos): "
+                f"mean={q_ref_slice.mean().item():.4f}, std={q_ref_slice.std().item():.4f}")
+            print(f"  obs[0:{self.num_actions}] (最旧帧 t-4 q_ref_pos): "
+                f"mean={oldest_slice.mean().item():.4f}, std={oldest_slice.std().item():.4f}")
+            print(f"  全 obs 均值={policy_obs[0].mean().item():.4f}, obs_dim={policy_obs.shape[-1]}")
+            self._q_ref_debug_done = True
+        # ── END DEBUG ───────────────────────────────────
+
         # Cache full observations so get_env_action can access ref_vel if present
         self._cached_observations = observations
 
