@@ -474,6 +474,10 @@ class OnPolicyRunner:
                     new_alpha = 1.0
                 self.alg.policy.delta_q_alpha = new_alpha
 
+            # FrontRES reward-shaping state: track prev Δq across steps for smoothness penalty.
+            # Reset at the start of each rollout (process_env_step clears storage afterward).
+            _frontres_prev_delta_q: torch.Tensor | None = None  # [N, A], None = first step
+
             # Rollout: 训练首先需要积攒数据, 等数据攒够才能调用self.alg.update()更新权重
             with torch.inference_mode(): # 关闭计算图的梯度追踪, 只进行推理
                 for _ in range(self.num_steps_per_env):
@@ -548,6 +552,50 @@ class OnPolicyRunner:
 
                     # Move to device
                     rewards, dones = rewards.to(self.device), dones.to(self.device)
+
+                    # ── FrontRES reward shaping ─────────────────────────────────────────
+                    # 正则化与平滑约束以 reward shaping（惩罚项）形式施加，而非 loss 项。
+                    # 数学依据：约束通过 Bellman 方程融入单目标 PPO，避免多目标梯度冲突。
+                    #
+                    # 设计原则（方案B）：惩罚的是实际施加给机器人的修正量 alpha×Δq，而非原始
+                    # 网络输出 Δq。理由：
+                    #   1. 物理正确性：alpha=0.1 时机器人只接受 10% 修正，惩罚也应只有 1%（α²）。
+                    #   2. Warmup 期（alpha 小）惩罚极弱 → 学习聚焦于跟踪目标。
+                    #   3. Ramp-up 期（alpha→1）惩罚自然增强 → 同步约束修正量缩小。
+                    if _is_frontres and self.alg.use_frontres_reg and self.training_type == "mosaic":
+                        # `actions` 在 mosaic 路径已赋值为 delta_q（rollout buffer 中存储的值）
+                        _delta_q = actions  # [N, A]，残差网络输出（未乘 alpha）
+
+                        # 获取当前 warmup 倍率 alpha ∈ [0, 1]
+                        _alpha = float(self.alg.policy.delta_q_alpha)  # 由 runner 课程调度器维护
+
+                        # L2 惩罚：对实际施加修正量 alpha×Δq 取平方均值
+                        # 等价于 -lambda_reg * alpha² * mean(Δq²)，alpha 小时惩罚随之缩小
+                        _lambda_reg = self.alg.lambda_reg_current
+                        if _lambda_reg > 0.0:
+                            _scaled_dq = _alpha * _delta_q                          # [N, A]
+                            _reg_penalty = -_lambda_reg * _scaled_dq.pow(2).mean(dim=-1)  # [N]
+                            rewards = rewards + _reg_penalty.unsqueeze(-1) if rewards.dim() == 2 \
+                                      else rewards + _reg_penalty
+
+                        # 时序平滑惩罚：对实际施加的相邻帧差分 alpha×(Δq_t - Δq_{t-1}) 取平方均值
+                        _lambda_smooth = self.alg.lambda_smooth
+                        if _lambda_smooth > 0.0 and _frontres_prev_delta_q is not None:
+                            _diff = _alpha * (_delta_q - _frontres_prev_delta_q)    # [N, A]
+                            _smooth_penalty = -_lambda_smooth * _diff.pow(2).mean(dim=-1)  # [N]
+                            rewards = rewards + _smooth_penalty.unsqueeze(-1) if rewards.dim() == 2 \
+                                      else rewards + _smooth_penalty
+
+                        # 更新 prev_delta_q：episode 结束的环境重置为零（消除跨 episode 平滑惩罚）
+                        if _frontres_prev_delta_q is None:
+                            _frontres_prev_delta_q = _delta_q.clone()
+                        else:
+                            # dones 可能是 [N] 或 [N,1]，统一处理
+                            _done_mask = dones.bool().view(-1)           # [N]
+                            _frontres_prev_delta_q = _delta_q.clone()
+                            _frontres_prev_delta_q[_done_mask] = 0.0    # 新 episode 从零开始
+                    # ── END FrontRES reward shaping ─────────────────────────────────────
+
                     obs_dict = infos.get("observations", {})
                     if self.policy_obs_type is not None and self.policy_obs_type in obs_dict:
                         obs = obs_dict[self.policy_obs_type].to(self.device)

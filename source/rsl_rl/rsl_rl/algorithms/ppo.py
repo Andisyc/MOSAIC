@@ -224,8 +224,6 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
-        mean_reg_loss = 0
-        mean_smooth_loss = 0
         mean_kl_divergence = 0
 
         # ── smooth_loss + delta_q diagnostics: 在 rollout buffer 全局计算 ──────
@@ -383,19 +381,12 @@ class PPO:
 
             ppo_loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-            # ====== FrontRES Stage-2 正则化 ======
-            # mu_batch 此时是 Δq_mean（FrontRESActorCritic 的 distribution.mean），
-            # 用其 L2 范数作为正则化项，拉近修正量与零（即拉近 q' 与 q_ref 的距离）。
-            reg_loss = torch.tensor(0.0, device=self.device)
-            if self.use_frontres_reg and self.lambda_reg_current > 0.0:
-                reg_loss = mu_batch.pow(2).mean()
-
-            # ====== 组合 loss（或 PCGrad）======
-            if self.use_pcgrad and self.use_frontres_reg and self.lambda_reg_current > 0.0:
-                # PCGrad：分别求各任务梯度，投影消解冲突后合并
-                loss = None  # 不直接 backward，由 _pcgrad_step 处理
-            else:
-                loss = ppo_loss + self.lambda_reg_current * reg_loss + self.lambda_smooth * smooth_loss
+            # FrontRES 正则化与平滑约束已移至 runner 侧作为 reward shaping（奖励惩罚项）。
+            # 原因：将其作为 loss 项进行梯度反传在数学上不正确：
+            #   1. smooth_loss 从 storage.actions（detached）计算，实际提供零梯度，是无效操作；
+            #   2. reg_loss 作为独立任务参与 PCGrad 会在梯度量级失衡时产生 Inf/NaN（Inf×0=NaN）；
+            #   3. 正确做法是 reward shaping：将约束并入奖励，通过 Bellman 方程自然融入 PPO 目标。
+            loss = ppo_loss
 
             # VQ loss（加到 ppo_loss 统一路径，PCGrad 暂不支持 VQ）
             if isinstance(self.policy, ActorCriticVQ):
@@ -444,34 +435,29 @@ class PPO:
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
             # Compute the gradients
-            if self.use_pcgrad and self.use_frontres_reg and self.lambda_reg_current > 0.0:
-                # PCGrad 路径：不调用 loss.backward()，由 _pcgrad_step 接管
-                # smooth_loss 与 reg_loss 目标一致（均约束 Δq 幅度），合并为一个任务
-                task_losses = {
-                    "ppo": ppo_loss,
-                    "reg": self.lambda_reg_current * reg_loss + self.lambda_smooth * smooth_loss,
-                }
-                self._pcgrad_step(task_losses)
-            else:
-                # 标准路径
-                self.optimizer.zero_grad()
-                loss.backward()
-                if self.is_multi_gpu:
-                    self.reduce_parameters()
-                # Guard against NaN gradients corrupting policy.std / policy.log_std.
-                # If any trainable parameter has a NaN gradient, skip this optimizer step
-                # to prevent NaN from propagating into the parameter values.
-                _has_nan_grad = any(
-                    p.grad is not None and torch.isnan(p.grad).any()
-                    for group in self.optimizer.param_groups
-                    for p in group["params"]
+            self.optimizer.zero_grad()
+            loss.backward()
+            if self.is_multi_gpu:
+                self.reduce_parameters()
+            # Guard against Inf/NaN gradients corrupting policy.std / policy.log_std.
+            # Must check BOTH isinf AND isnan BEFORE clip_grad_norm_, because:
+            #   clip_grad_norm_ computes clip_coef = max_norm / (total_norm + 1e-6).
+            #   If total_norm = Inf → clip_coef = 0 → Inf × 0 = NaN (IEEE 754).
+            # An Inf gradient that passes isnan-only check is silently converted
+            # to NaN by clipping, then propagates into self.std via optimizer.step().
+            _has_bad_grad = any(
+                p.grad is not None and (
+                    torch.isnan(p.grad).any() or torch.isinf(p.grad).any()
                 )
-                if _has_nan_grad:
-                    print("[PPO] WARNING: NaN gradient detected — skipping optimizer step")
-                    self.optimizer.zero_grad()
-                else:
-                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
+                for group in self.optimizer.param_groups
+                for p in group["params"]
+            )
+            if _has_bad_grad:
+                print("[PPO] WARNING: Inf/NaN gradient detected — skipping optimizer step")
+                self.optimizer.zero_grad()
+            else:
+                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.optimizer.step()
             # -- For RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()  # type: ignore
@@ -484,9 +470,6 @@ class PPO:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
-            if self.use_frontres_reg:
-                mean_reg_loss += reg_loss.item()
-                mean_smooth_loss += smooth_loss.item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -512,13 +495,11 @@ class PPO:
         if isinstance(self.policy, ActorCriticVQ):
             mean_vq_loss /= num_updates
             mean_vq_perplexity /= num_updates
-        # -- lambda_reg 衰减
+        # -- lambda_reg 衰减（仍在 ppo.py 管理，runner 通过 self.alg.lambda_reg_current 读取）
         if self.use_frontres_reg:
             self.lambda_reg_current = max(
                 self.lambda_reg_min,
                 self.lambda_reg_current * self.lambda_reg_decay)
-            mean_reg_loss    /= num_updates
-            mean_smooth_loss /= num_updates
 
         # -- Clear the storage
         self.storage.clear()
@@ -535,11 +516,13 @@ class PPO:
             "kl_divergence": mean_kl_divergence,
         }
         if self.use_frontres_reg:
-            loss_dict["reg"]              = mean_reg_loss
-            loss_dict["smooth"]           = mean_smooth_loss
-            loss_dict["lambda_reg"]       = self.lambda_reg_current
+            # reg / smooth 现在是 reward shaping 惩罚项，在 runner 侧应用。
+            # 这里只记录从 rollout buffer 计算的 Δq 诊断指标（供 wandb 监控）。
+            loss_dict["lambda_reg"]        = self.lambda_reg_current
             loss_dict["delta_q_norm_mean"] = delta_q_norm_mean.item()
             loss_dict["delta_q_norm_std"]  = delta_q_norm_std.item()
+            if self.lambda_smooth > 0.0:
+                loss_dict["smooth_metric"] = smooth_loss.item()   # 存储 Δq 平滑度诊断
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
@@ -623,13 +606,15 @@ class PPO:
         if self.is_multi_gpu:
             self.reduce_parameters()
 
-        # Guard against NaN gradients (same as standard path)
-        _has_nan_grad = any(
-            p.grad is not None and torch.isnan(p.grad).any()
+        # Guard against Inf/NaN gradients (same as standard path; isinf required — see above)
+        _has_bad_grad = any(
+            p.grad is not None and (
+                torch.isnan(p.grad).any() or torch.isinf(p.grad).any()
+            )
             for p in params
         )
-        if _has_nan_grad:
-            print("[PPO/PCGrad] WARNING: NaN gradient detected — skipping optimizer step")
+        if _has_bad_grad:
+            print("[PPO/PCGrad] WARNING: Inf/NaN gradient detected — skipping optimizer step")
             for p in params:
                 if p.grad is not None:
                     p.grad.zero_()
