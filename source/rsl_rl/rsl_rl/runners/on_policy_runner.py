@@ -477,6 +477,10 @@ class OnPolicyRunner:
             # FrontRES reward-shaping state: track prev Δq across steps for smoothness penalty.
             # Reset at the start of each rollout (process_env_step clears storage afterward).
             _frontres_prev_delta_q: torch.Tensor | None = None  # [N, A], None = first step
+            # Accumulators for wandb logging of per-step penalty magnitudes
+            _frontres_reg_penalty_sum: float = 0.0
+            _frontres_smooth_penalty_sum: float = 0.0
+            _frontres_shaping_steps: int = 0
 
             # Rollout: 训练首先需要积攒数据, 等数据攒够才能调用self.alg.update()更新权重
             with torch.inference_mode(): # 关闭计算图的梯度追踪, 只进行推理
@@ -557,34 +561,32 @@ class OnPolicyRunner:
                     # 正则化与平滑约束以 reward shaping（惩罚项）形式施加，而非 loss 项。
                     # 数学依据：约束通过 Bellman 方程融入单目标 PPO，避免多目标梯度冲突。
                     #
-                    # 设计原则（方案B）：惩罚的是实际施加给机器人的修正量 alpha×Δq，而非原始
-                    # 网络输出 Δq。理由：
-                    #   1. 物理正确性：alpha=0.1 时机器人只接受 10% 修正，惩罚也应只有 1%（α²）。
-                    #   2. Warmup 期（alpha 小）惩罚极弱 → 学习聚焦于跟踪目标。
-                    #   3. Ramp-up 期（alpha→1）惩罚自然增强 → 同步约束修正量缩小。
+                    # 设计原则（方案A）：直接惩罚网络原始输出 Δq（已经过 tanh 截断）。
+                    # 不按 alpha 缩放——warmup 期同样施加完整惩罚，从第一轮起就约束 Δq 量级，
+                    # 防止 action explosion 在 alpha 较小时无约束地累积。
                     if _is_frontres and self.alg.use_frontres_reg and self.training_type == "mosaic":
                         # `actions` 在 mosaic 路径已赋值为 delta_q（rollout buffer 中存储的值）
-                        _delta_q = actions  # [N, A]，残差网络输出（未乘 alpha）
+                        # 注意：actions 此时已经过 tanh*max_delta_q 截断，量级有界
+                        _delta_q = actions  # [N, A]
 
-                        # 获取当前 warmup 倍率 alpha ∈ [0, 1]
-                        _alpha = float(self.alg.policy.delta_q_alpha)  # 由 runner 课程调度器维护
-
-                        # L2 惩罚：对实际施加修正量 alpha×Δq 取平方均值
-                        # 等价于 -lambda_reg * alpha² * mean(Δq²)，alpha 小时惩罚随之缩小
+                        # L2 惩罚：对 Δq 取平方均值，强制网络倾向于输出小修正量
                         _lambda_reg = self.alg.lambda_reg_current
                         if _lambda_reg > 0.0:
-                            _scaled_dq = _alpha * _delta_q                          # [N, A]
-                            _reg_penalty = -_lambda_reg * _scaled_dq.pow(2).mean(dim=-1)  # [N]
+                            _reg_penalty = -_lambda_reg * _delta_q.pow(2).mean(dim=-1)  # [N]
                             rewards = rewards + _reg_penalty.unsqueeze(-1) if rewards.dim() == 2 \
                                       else rewards + _reg_penalty
+                            _frontres_reg_penalty_sum += _reg_penalty.mean().item()
 
-                        # 时序平滑惩罚：对实际施加的相邻帧差分 alpha×(Δq_t - Δq_{t-1}) 取平方均值
+                        # 时序平滑惩罚：惩罚相邻帧 Δq 的差分
                         _lambda_smooth = self.alg.lambda_smooth
                         if _lambda_smooth > 0.0 and _frontres_prev_delta_q is not None:
-                            _diff = _alpha * (_delta_q - _frontres_prev_delta_q)    # [N, A]
+                            _diff = _delta_q - _frontres_prev_delta_q               # [N, A]
                             _smooth_penalty = -_lambda_smooth * _diff.pow(2).mean(dim=-1)  # [N]
                             rewards = rewards + _smooth_penalty.unsqueeze(-1) if rewards.dim() == 2 \
                                       else rewards + _smooth_penalty
+                            _frontres_smooth_penalty_sum += _smooth_penalty.mean().item()
+
+                        _frontres_shaping_steps += 1
 
                         # 更新 prev_delta_q：episode 结束的环境重置为零（消除跨 episode 平滑惩罚）
                         if _frontres_prev_delta_q is None:
@@ -681,9 +683,13 @@ class OnPolicyRunner:
             learn_time = stop - start
             self.current_learning_iteration = it
 
-            # expose curriculum state to log() via locals()
+            # expose curriculum state and penalty metrics to log() via locals()
             frontres_alpha         = self.alg.policy.delta_q_alpha if _is_frontres else None
             frontres_warmup_active = int(_warmup_actor_frozen) if _is_frontres else None
+            frontres_reg_penalty_mean   = (_frontres_reg_penalty_sum / _frontres_shaping_steps
+                                           if _frontres_shaping_steps > 0 else None)
+            frontres_smooth_penalty_mean = (_frontres_smooth_penalty_sum / _frontres_shaping_steps
+                                            if _frontres_shaping_steps > 0 else None)
 
             # log info
             if self.log_dir is not None and not self.disable_logs:
@@ -779,6 +785,13 @@ class OnPolicyRunner:
             if locs.get("frontres_warmup_active") is not None:
                 self.writer.add_scalar("Curriculum/critic_warmup_active",
                                        locs["frontres_warmup_active"], locs["it"])
+            # -- FrontRES reward shaping penalty magnitudes
+            if locs.get("frontres_reg_penalty_mean") is not None:
+                self.writer.add_scalar("FrontRES/reg_penalty_per_step",
+                                       locs["frontres_reg_penalty_mean"], locs["it"])
+            if locs.get("frontres_smooth_penalty_mean") is not None:
+                self.writer.add_scalar("FrontRES/smooth_penalty_per_step",
+                                       locs["frontres_smooth_penalty_mean"], locs["it"])
 
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])

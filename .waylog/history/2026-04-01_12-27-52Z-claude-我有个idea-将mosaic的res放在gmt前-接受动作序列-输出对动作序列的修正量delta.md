@@ -5812,3 +5812,157 @@ r_t = sum_k( w_k * r_k_track )      # 跟踪奖励
 注：Stage 1 使用更宽的物理级 DR 范围以提升 GMT 的泛化能力；Stage 2 收窄物理 DR 范围（降低训练难度），同时引入运动级 DR 来模拟参考运动本身的噪声来源（漂浮、穿模、滑步等 sim-to-real artifact）。
 
 ---
+
+
+**Claude**
+
+현재 상황 파악 완료. 4개 파일을 수정합니다:
+
+1. **`front_residual_actor_critic.py`** — tanh 하드 클리핑 추가
+2. **`rsl_rl_cfg.py`** — `max_delta_q` 파라미터 추가
+3. **`on_policy_runner.py`** — Plan A 복원 + wandb 로깅
+4. **`rsl_rl_ppo_cfg.py`** — `max_delta_q=0.5` 설정
+
+---
+
+
+**Claude**
+
+需要三处修改：存储参数、在 `update_distribution` 和 `_frontres_forward` 中应用 tanh 截断。
+
+---
+
+
+**Claude**
+
+Now apply tanh clipping in `update_distribution` and `_frontres_forward`:
+
+---
+
+
+**Claude**
+
+这些是已有的类型推断警告，与本次修改无关。继续完成剩余三个文件。
+
+---
+
+
+**Claude**
+
+Now add `max_delta_q` to the cfg class:
+
+---
+
+
+**Claude**
+
+Now revert the runner reward shaping to Plan A and add wandb logging. First locate the accumulators setup point:
+
+---
+
+
+**Claude**
+
+Now revert Plan B → Plan A and accumulate penalty values:
+
+---
+
+
+**Claude**
+
+Now expose the accumulators to `log()` and add wandb logging. First find where `frontres_alpha` is set before `log()`:
+
+---
+
+
+**Claude**
+
+Now add wandb logging in `log()` after the existing FrontRES curriculum block:
+
+---
+
+
+**Claude**
+
+Finally add `max_delta_q=0.5` to the ppo config:
+
+---
+
+
+**Claude**
+
+这些诊断都是已有问题，与本次修改无关。但需要确认 `max_delta_q` 加到了正确的 cfg 类里：
+
+---
+
+
+**Claude**
+
+真正使用的类在另一个文件。先读它：
+
+---
+
+
+**Claude**
+
+现在也可以从 `rsl_rl_cfg.py`（rsl_rl 包内那个）移除之前错误加入的字段，因为那个类不是实际使用的：
+
+---
+
+
+**Claude**
+
+最后验证所有修改完整性：
+
+---
+
+
+**Claude**
+
+所有修改完整。总结如下：
+
+---
+
+## 修改汇总
+
+### 1. tanh 输出截断（action explosion 根治）
+
+**`front_residual_actor_critic.py`**
+
+```
+训练路径 update_distribution():
+    delta_q_mean = tanh(residual_actor(policy_obs)) * max_delta_q
+
+推理路径 _frontres_forward():
+    delta_q = tanh(residual_actor(policy_obs)) * max_delta_q
+
+初始化时打印:
+    [ResidualActorCritic] Δq output clipping: tanh * 0.500 rad (≈ ±28.6°) per joint
+```
+
+`max_delta_q=0.5` 意味着 delta_q_norm_max = `0.5 × sqrt(29) ≈ 2.69`，与训练初期正常的 2.93 量级一致，从根本上封死了爆炸空间。
+
+### 2. 奖励塑形还原为方案A
+
+**`on_policy_runner.py`**
+
+惩罚恢复为直接作用于原始 delta_q（已经过 tanh 截断，量级有界），不再乘 alpha²，warmup 期从第一轮起就有完整约束力。
+
+### 3. Wandb 新增监控指标
+
+**`on_policy_runner.py`**
+
+```
+FrontRES/reg_penalty_per_step      每轮 rollout 中正则化惩罚的平均每步量级
+FrontRES/smooth_penalty_per_step   平滑惩罚的平均每步量级（lambda_smooth>0 时才出现）
+```
+
+配合已有的 `Loss/delta_q_norm_mean`，可以直接在 wandb 上监控 delta_q 是否被控制在 tanh 饱和区以内。
+
+### 4. 配置文件
+
+**`whole_body_tracking/utils/rsl_rl_cfg.py`** — `RslRlFrontResidualActorCriticCfg` 新增 `max_delta_q: float = 0.5`
+
+**`rsl_rl_ppo_cfg.py`** — `policy = RslRlFrontResidualActorCriticCfg(max_delta_q=0.5, ...)`
+
+---

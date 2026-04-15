@@ -137,6 +137,12 @@ class FrontRESActorCritic(nn.Module):
         activation="elu",
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
+        # Output clipping: tanh(raw_output) * max_delta_q bounds Δq to [-max_delta_q, max_delta_q]
+        # per joint.  Prevents action explosion when the residual actor's gradient pushes
+        # Δq toward large values before the regularization penalty can counteract it.
+        # Default 0.5 rad ≈ ±28.6°; covers typical sim-to-real correction range without
+        # allowing pathological overshooting.  Set to float('inf') to disable.
+        max_delta_q: float = 0.5,
         **kwargs,
     ):
         if kwargs:
@@ -154,6 +160,8 @@ class FrontRESActorCritic(nn.Module):
         self.num_actions = num_actions
         self.q_ref_start_idx = q_ref_start_idx
         self.noise_std_type = noise_std_type
+        # tanh output clipping: Δq ∈ (-max_delta_q, max_delta_q) per joint
+        self.max_delta_q = max_delta_q
 
         activation_fn = resolve_nn_activation(activation)
 
@@ -399,6 +407,9 @@ class FrontRESActorCritic(nn.Module):
         # Default 1.0 so that evaluation / non-curriculum training is unaffected.
         self.delta_q_alpha: float = 1.0
 
+        print(f"[ResidualActorCritic] Δq output clipping: tanh * {self.max_delta_q:.3f} rad "
+              f"(≈ ±{self.max_delta_q * 57.3:.1f}°) per joint")
+
         if gmt_actor_input_dim != num_actor_obs:
             print(f"[ResidualActorCritic] WARNING: GMT expects {gmt_actor_input_dim} observations, "
                   f"but environment provides {num_actor_obs}. Will pad with zeros during inference.")
@@ -623,7 +634,7 @@ class FrontRESActorCritic(nn.Module):
         """
         policy_obs, ref_vel, ref_vel_estimator_obs = self._parse_observations(observations)
 
-        delta_q = self.residual_actor(policy_obs)
+        delta_q = torch.tanh(self.residual_actor(policy_obs)) * self.max_delta_q
 
         with torch.no_grad():
             robot_actions = self._apply_delta_q_and_run_gmt(
@@ -693,7 +704,9 @@ class FrontRESActorCritic(nn.Module):
         self._cached_observations = observations
 
         # FrontRES computes Δq mean (gradient flows through here during PPO update)
-        delta_q_mean = self.residual_actor(policy_obs)
+        # Apply tanh * max_delta_q to bound Δq per joint and prevent action explosion.
+        # tanh is differentiable everywhere → gradient flows cleanly through the clipping.
+        delta_q_mean = torch.tanh(self.residual_actor(policy_obs)) * self.max_delta_q
 
         # Store for logging / regularization access by MOSAIC algorithm
         self.last_residual_actions = delta_q_mean.detach()

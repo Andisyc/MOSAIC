@@ -246,6 +246,10 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
         #                   = (5 - 1) × 58 = 232
         # q_ref_pos 在当前帧的起始索引 = 232（q_ref_vel 在 261:290）
         q_ref_start_idx=232,
+
+        # Δq 输出截断：tanh(raw) * max_delta_q，防止 action explosion。
+        # 0.5 rad ≈ ±28.6°/关节，覆盖典型 sim-to-real 修正范围。
+        max_delta_q=0.5,
     )
 
     algorithm = RslRlPpoFrontRESAlgorithmCfg(

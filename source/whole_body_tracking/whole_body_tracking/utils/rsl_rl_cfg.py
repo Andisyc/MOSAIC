@@ -270,6 +270,10 @@ class RslRlFrontResidualActorCriticCfg(RslRlPpoActorCriticCfg):
     # Action noise type: "scalar" (shared std per action) or "log" (log-parameterized std)
     noise_std_type: str = "scalar"
 
+    # Output clipping: Δq ∈ (-max_delta_q, max_delta_q) per joint via tanh.
+    # Prevents action explosion during RL fine-tuning.  Default 0.5 rad (≈ ±28.6°).
+    max_delta_q: float = 0.5
+
 
 @configclass  # algorithm
 class RslRlPpoFrontRESAlgorithmCfg(RslRlPpoAlgorithmCfg):
