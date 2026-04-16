@@ -186,30 +186,33 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
     # 否则 runner 会沿用 checkpoint 里的旧值，忽略 init_noise_std=0.1 的设定。
     reset_noise_std_on_resume = True
 
-    # Critic 预热：训练开始后冻结 Actor（FrontRES residual_actor）前 N 个 iteration，
-    # 让 Critic 先在正确的奖励函数下收敛，再解冻 Actor 进行联合训练。
-    # 设为 0 则禁用预热，直接联合训练。
-    critic_warmup_iterations = 1000
+    # DR 课程：Stage 2 开始时 MotionPerturber 强度线性从 0 增长到 motion_perturbations 配置值。
+    # 防止 FrontRES 在 Stage 2 冷启动时面对完全 OOD 的 q_ref，导致全负 r_delta → Δq=0 捷径陷阱。
+    # 设为 0 禁用（直接使用全强度 DR，仅在 FrontRES 已对 Stage 2 DR 鲁棒时使用）。
+    dr_curriculum_iterations: int = 5000
+    # Stage 2 起始绝对迭代数，用于 DR 课程进度计算，支持断点续训时正确恢复 DR 强度。
+    stage2_start_iteration: int = _STAGE1_MAX_ITERATIONS
 
-    # Δq Curriculum：三阶段 alpha 调度
+    # Critic 预热：禁用（=0）。
     #
-    # Phase 0 [0, critic_warmup_iterations):
-    #   alpha 固定为 delta_q_alpha_init（非零），Actor 冻结。
-    #   Critic 学到的是 V(s | FrontRES @ alpha_init)，而非 V(s | alpha=0)，
-    #   避免 warmup 结束后出现 distribution shift。
-    #   alpha_init 设小（0.1）限制 FrontRES 早期误差对仿真的影响，
-    #   保证 Critic 能从质量较高的轨迹中学习。
+    # 禁用原因：actor-frozen warmup 会在 Critic 与训练阶段之间制造人为的分布错配。
+    #   - Warmup 期间 Critic 学 V(s | π_frozen, α_init)
+    #   - 训练开始后策略变为 π_trainable, α=1.0 → 完全不同的分布
+    #   - Critic 的 V 估计立刻过时 → 优势方差爆炸 → std 崩塌
     #
-    # Phase 1 [critic_warmup_iterations, critic_warmup_iterations + delta_q_alpha_ramp_iterations):
-    #   alpha 从 alpha_init 线性增长到 1.0，Actor 解冻。
-    #   Critic 和 Actor 协同适应，避免从 alpha_init 跳到 1.0 的冲击。
+    # OOD 担忧（Stage 1 → Stage 2 DR 分布偏移）不是 Critic warmup 要解决的问题：
+    #   - OOD 初始表现差 → r_delta 为负 → Critic 正确学到 V(s) < 0 → 有效梯度信号
+    #   - tanh × max_delta_q 限制 Δq 幅度，防止灾难性摔倒
+    #   - 这就是标准 RL 的"初始策略不佳"问题，PPO 自然处理
+    critic_warmup_iterations = 0
+
+    # Δq alpha 课程：禁用（直接 alpha=1.0 全量训练）。
     #
-    # Phase 2 [ramp 结束, end]:
-    #   alpha = 1.0，q_dot = q_ref + Δq，标准 PPO 全量训练。
-    #
-    # 设 delta_q_alpha_init=1.0 且 delta_q_alpha_ramp_iterations=0 可完全禁用课程。
-    delta_q_alpha_init = 0.1          # warmup 阶段固定的 alpha（非零）
-    delta_q_alpha_ramp_iterations = 9000  # ramp 阶段的迭代次数
+    # 禁用原因：alpha=0.1 导致 r_delta≈0，Critic 学到 V≈0，
+    # 与后续 alpha=1.0 时的真实价值函数完全不匹配，训练不稳定。
+    # alpha 直接设为 1.0 意味着 Critic 全程跟踪实际策略分布，收敛更稳定。
+    delta_q_alpha_init = 1.0          # 全程 alpha=1.0，无课程
+    delta_q_alpha_ramp_iterations = 0  # 无 ramp
 
     # GMT .pt 路径（FrontRESActorCritic 用 torch.load() 加载，必须是 .pt 而非 .onnx，支持双服务器路径选择）
     _p1 = Path("/home/yuxuancheng/MOSAIC/model/model_27000.pt")
@@ -263,7 +266,7 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,              # 限制策略更新幅度
-        entropy_coef=0.001,          # 微调阶段探索熵系数可以很小
+        entropy_coef=0.01,           # OOD 初始阶段需要足够探索：0.001 太小（梯度~0.001/σ），0.01 有效
         learning_rate=5.0e-4,        # 微调必须用比从零训练更小的学习率
         schedule="adaptive",
         desired_kl=0.008,            # 要求策略更新比标准 PPO 更平滑

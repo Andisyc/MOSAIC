@@ -458,6 +458,43 @@ class OnPolicyRunner:
             # GMT raw rewards must be tracked separately before they are zeroed.
             cur_reward_sum_gmt = torch.zeros(N_base, dtype=torch.float, device=self.device)
 
+        # DR curriculum: ramp MotionPerturber 0 → full over dr_curriculum_iterations Stage-2 iters.
+        # Prevents FrontRES facing fully OOD q_ref at Stage-2 cold start → all-negative V / no-op trap.
+        # stage2_start_iteration is the absolute iteration where Stage 2 began; handles resume correctly:
+        #   fresh start: stage2_start = start_iter = 25000 → progress=0 → scale=0 at first iter ✓
+        #   resume at 30000: stage2_start=25000 → progress=5000 → scale correctly reflects elapsed ✓
+        _dr_curriculum_iters = int(self.cfg.get("dr_curriculum_iterations", 0))
+        _stage2_start        = int(self.cfg.get("stage2_start_iteration", start_iter))
+        if _is_frontres and _dr_curriculum_iters > 0:
+            _env_raw = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+            if hasattr(_env_raw, 'cfg') and hasattr(_env_raw.cfg, 'motion_perturbations'):
+                # IMPORTANT: store a VALUE COPY (SimpleNamespace), NOT a reference.
+                # MotionPerturber stores cfg by reference (self.cfg = cfg in __init__), so
+                # _mcmd.perturber.cfg IS env.cfg.motion_perturbations — the same object.
+                # Writing _mcmd.perturber.cfg.float_prob would corrupt _perturb_target on
+                # the next iteration if we stored a reference instead of a copy.
+                from types import SimpleNamespace as _NS
+                _pt = _env_raw.cfg.motion_perturbations
+                _perturb_target = _NS(
+                    float_prob=float(_pt.float_prob),
+                    float_ratio=float(_pt.float_ratio),
+                    sink_prob=float(_pt.sink_prob),
+                    sink_ratio=float(_pt.sink_ratio),
+                    foot_slip_prob=float(_pt.foot_slip_prob),
+                    foot_slip_ratio=float(_pt.foot_slip_ratio),
+                    body_drag_prob=float(_pt.body_drag_prob),
+                    body_drag_ratio=float(_pt.body_drag_ratio),
+                )
+                print(f"[Runner] DR curriculum enabled: 0 → full over {_dr_curriculum_iters} Stage-2 iter "
+                      f"(stage2_start={_stage2_start}, "
+                      f"float_prob_max={_perturb_target.float_prob:.2f}, "
+                      f"slip_prob_max={_perturb_target.foot_slip_prob:.2f})")
+            else:
+                _perturb_target = None
+                print("[Runner] WARNING: dr_curriculum_iterations > 0 but env.cfg.motion_perturbations not found — DR curriculum disabled")
+        else:
+            _perturb_target = None
+
         for it in range(start_iter, tot_iter):
             start = time.time()
 
@@ -490,13 +527,40 @@ class OnPolicyRunner:
                     new_alpha = 1.0
                 self.alg.policy.delta_q_alpha = new_alpha
 
+            # --- DR curriculum: update MotionPerturber scale for this iteration ---
+            # Scale = (it - stage2_start) / dr_curriculum_iters, clamped to [0, 1].
+            # Runs every iteration so the perturber ramps smoothly without needing a reset hook.
+            if _is_frontres and _perturb_target is not None:
+                _stage2_progress = it - _stage2_start
+                _dr_scale = min(1.0, max(0.0, _stage2_progress / max(1, _dr_curriculum_iters)))
+                _env_raw = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+                if hasattr(_env_raw, 'command_manager') and 'motion' in _env_raw.command_manager._terms:
+                    _mcmd = _env_raw.command_manager._terms['motion']
+                    if hasattr(_mcmd, 'perturber'):
+                        _mcmd.perturber.cfg.float_prob      = _perturb_target.float_prob      * _dr_scale
+                        _mcmd.perturber.cfg.float_ratio     = _perturb_target.float_ratio     * _dr_scale
+                        _mcmd.perturber.cfg.sink_prob       = _perturb_target.sink_prob       * _dr_scale
+                        _mcmd.perturber.cfg.sink_ratio      = _perturb_target.sink_ratio      * _dr_scale
+                        _mcmd.perturber.cfg.foot_slip_prob  = _perturb_target.foot_slip_prob  * _dr_scale
+                        _mcmd.perturber.cfg.foot_slip_ratio = _perturb_target.foot_slip_ratio * _dr_scale
+                        _mcmd.perturber.cfg.body_drag_prob  = _perturb_target.body_drag_prob  * _dr_scale
+                        _mcmd.perturber.cfg.body_drag_ratio = _perturb_target.body_drag_ratio * _dr_scale
+
             # FrontRES reward-shaping state: reset at the start of each rollout.
             _frontres_prev_delta_q: torch.Tensor | None = None  # [N, A] for smoothness penalty
             # Accumulators for wandb logging (per iteration, divided by shaping steps)
-            _frontres_rdelta_sum:   float = 0.0   # mean r_delta across FrontRES envs per step
-            _frontres_baseline_sum: float = 0.0   # mean GMT baseline per step
+            _frontres_rdelta_sum:        float = 0.0   # mean r_delta across FrontRES envs per step
+            _frontres_baseline_sum:      float = 0.0   # mean GMT baseline per step
             _frontres_smooth_penalty_sum: float = 0.0
-            _frontres_shaping_steps: int = 0
+            _frontres_reg_penalty_sum:   float = 0.0   # mean lambda_reg penalty per step
+            _frontres_shaping_steps:     int   = 0
+            # lambda_reg shaping: only activate after DR curriculum completes.
+            # Rationale: during ramp-up, reg pushing Δq→0 would reinforce the no-op shortcut trap
+            # before the Actor has had any chance to discover effective corrections.
+            _lambda_reg = getattr(self.alg, 'lambda_reg_current', 0.0) if _is_frontres else 0.0
+            _dr_done    = _is_frontres and (
+                _dr_curriculum_iters == 0 or (it - _stage2_start) >= _dr_curriculum_iters
+            )
 
             # Rollout: 训练首先需要积攒数据, 等数据攒够才能调用self.alg.update()更新权重
             with torch.inference_mode(): # 关闭计算图的梯度追踪, 只进行推理
@@ -619,6 +683,19 @@ class OnPolicyRunner:
                             else:
                                 rewards[:N_train] = rewards[:N_train] + _smooth_penalty
                             _frontres_smooth_penalty_sum += _smooth_penalty.mean().item()
+
+                        # lambda_reg reward shaping: penalize ||Δq||² to discourage unbounded corrections.
+                        # Gated by _dr_done: do NOT apply during DR curriculum ramp-up, so Actor can
+                        # freely explore non-zero Δq without the penalty reinforcing the Δq=0 shortcut.
+                        # Uses sampled actions (unbiased estimator of mean penalty); mean over joints
+                        # so scale is per-joint and consistent with per-step reward magnitude.
+                        if _lambda_reg > 0.0 and _dr_done:
+                            _reg_penalty = -_lambda_reg * actions[:N_train].pow(2).mean(dim=-1)  # [N_train]
+                            if rewards.dim() == 2:
+                                rewards[:N_train] = rewards[:N_train] + _reg_penalty.unsqueeze(-1)
+                            else:
+                                rewards[:N_train] = rewards[:N_train] + _reg_penalty
+                            _frontres_reg_penalty_sum += _reg_penalty.mean().item()
 
                         # Logging accumulators
                         _frontres_rdelta_sum   += r_delta.mean().item()
@@ -745,6 +822,10 @@ class OnPolicyRunner:
                                       if _is_frontres and _frontres_shaping_steps > 0 else None)
             frontres_smooth_penalty_mean = (_frontres_smooth_penalty_sum / _frontres_shaping_steps
                                             if _is_frontres and _frontres_shaping_steps > 0 else None)
+            frontres_reg_penalty_mean    = (_frontres_reg_penalty_sum / _frontres_shaping_steps
+                                            if _is_frontres and _frontres_shaping_steps > 0 else None)
+            frontres_dr_scale            = (min(1.0, max(0.0, (it - _stage2_start) / max(1, _dr_curriculum_iters)))
+                                            if _is_frontres and _dr_curriculum_iters > 0 else None)
 
             # log info
             if self.log_dir is not None and not self.disable_logs:
@@ -854,6 +935,12 @@ class OnPolicyRunner:
             if locs.get("frontres_smooth_penalty_mean") is not None:
                 self.writer.add_scalar("FrontRES/smooth_penalty_per_step",
                                        locs["frontres_smooth_penalty_mean"], locs["it"])
+            if locs.get("frontres_reg_penalty_mean") is not None:
+                self.writer.add_scalar("FrontRES/reg_penalty_per_step",
+                                       locs["frontres_reg_penalty_mean"], locs["it"])
+            if locs.get("frontres_dr_scale") is not None:
+                self.writer.add_scalar("Curriculum/dr_scale",
+                                       locs["frontres_dr_scale"], locs["it"])
 
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
@@ -913,6 +1000,8 @@ class OnPolicyRunner:
             if locs.get("frontres_alpha") is not None:
                 warmup_str = " [WARMUP]" if locs.get("frontres_warmup_active") else ""
                 log_string += f"""{'Δq alpha:':>{pad}} {locs['frontres_alpha']:.4f}{warmup_str}\n"""
+            if locs.get("frontres_dr_scale") is not None:
+                log_string += f"""{'DR curriculum scale:':>{pad}} {locs['frontres_dr_scale']:.4f}\n"""
             # -- episode info
             log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
         else:

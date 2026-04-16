@@ -361,7 +361,13 @@ class PPO:
                     mean_kl_divergence += kl_mean.item()
 
             # Surrogate loss
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            # Clip log_ratio before exp() to prevent IS ratio overflow (float32 max = exp(88)).
+            # Root cause: if std collapses and action is near the new mean, log_prob_new → +∞
+            # (e.g., 29 dims × log(1/1e-6) ≈ 400), causing ratio=exp(400)=Inf → Inf gradient.
+            # Clamping log_ratio at ±10 caps ratio at exp(10)≈22000, which is already so far
+            # outside [1-ε, 1+ε] that surrogate_clipped dominates — no policy-update distortion.
+            log_ratio = (actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)).clamp(min=-10.0, max=10.0)
+            ratio = torch.exp(log_ratio)
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
@@ -453,7 +459,20 @@ class PPO:
                 for p in group["params"]
             )
             if _has_bad_grad:
-                print("[PPO] WARNING: Inf/NaN gradient detected — skipping optimizer step")
+                # Diagnostics: print distribution/ratio state for root-cause analysis.
+                # After the two fixes (std_min=0.01 + log_ratio clamp) this should never fire.
+                # If it still fires, the printed values will indicate the true cause.
+                _std_val = (
+                    torch.nn.functional.softplus(self.policy.std).mean().item()
+                    if hasattr(self.policy, "std") else
+                    torch.exp(self.policy.log_std).mean().item()
+                    if hasattr(self.policy, "log_std") else -1.0
+                )
+                print(f"[PPO] WARNING: Inf/NaN gradient — skipping step | "
+                      f"std_mean={_std_val:.5f} "
+                      f"adv=[{advantages_batch.min().item():.2f},{advantages_batch.max().item():.2f}] "
+                      f"log_ratio=[{log_ratio.min().item():.2f},{log_ratio.max().item():.2f}] "
+                      f"loss={loss.item():.4f}")
                 self.optimizer.zero_grad()
             else:
                 nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)

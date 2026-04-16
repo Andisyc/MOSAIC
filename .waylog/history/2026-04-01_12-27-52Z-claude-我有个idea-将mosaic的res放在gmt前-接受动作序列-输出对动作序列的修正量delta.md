@@ -7204,3 +7204,867 @@ Both fixes verified. The full pipeline review is complete. Here's the complete r
 **Ready to push to server.**
 
 ---
+
+
+**User**
+
+我在服务器上测试后才跑了3k轮就遇到频繁warning：
+[PPO] WARNING: Inf/NaN gradient detected — skipping optimizer step
+请深入检查到底是什么问题
+
+---
+
+
+**Claude**
+
+梯度 Inf/NaN 的根因需要从三条路径系统排查：log_prob 数值、IS ratio 计算、r_delta 尖峰。让我逐一读取关键代码。
+
+---
+
+
+**Claude**
+
+**根因找到了。** 这是一条精确的数值爆炸链：
+
+**链路：** `std` 参数坍缩 → `log_prob_new → +∞` → IS ratio `exp(log_ratio) → Inf` → 梯度 Inf
+
+**数学验证：**
+- `std` 初始 0.1，被训练推向更小
+- `softplus(self.std).clamp(min=1e-6)` — 允许 std 降至 `1e-6`
+- 在 PPO mini-batch 更新中，当 action ≈ μ_new 时：
+  `log_prob_new = -29 × log(1e-6) ≈ +400`（29 个动作维度）
+- `log_prob_old` 当初 std=0.05 时 ≈ +87
+- `log_ratio = 400 - 87 = 313` → `exp(313)` = **float32 溢出（Inf）**
+- `surrogate = -A × Inf` = Inf → 梯度 Inf
+
+两处需要修复：
+
+**修复 1：** `clamp(min=1e-6)` 太小 → 改为 `0.01`
+**修复 2：** IS ratio 在 exp 之前没有裁剪 → 裁剪 log_ratio
+
+---
+
+
+**Claude**
+
+现在给 Inf/NaN 警告加上诊断信息，方便以后追踪：
+
+---
+
+
+**Claude**
+
+现在验证两处修改都正确：
+
+---
+
+
+**Claude**
+
+两处修改正确。现在检查 KL 计算中是否有类似问题（用的也是 `sigma_batch`）：
+
+---
+
+
+**Claude**
+
+诊断代码太复杂可能出错，简化它：
+
+---
+
+
+**Claude**
+
+最终验证修改后的代码：
+
+---
+
+
+**Claude**
+
+---
+
+## 根因分析与修复报告
+
+### 根因：std 坍缩 → IS ratio 溢出
+
+精确的爆炸链路：
+
+```
+self.std 参数被梯度推向负方向
+  → softplus(std).clamp(min=1e-6)  ← 允许降至 1e-6
+  → PPO update: act(obs_batch) 重新计算分布
+  → 对近均值动作: log_prob_new = -29 × log(1e-6) ≈ +400
+  → log_prob_old (std=0.05时) ≈ +87
+  → log_ratio = 313  →  ratio = exp(313) = float32 Inf
+  → surrogate = -A × Inf = ±Inf
+  → loss.backward() → 梯度 Inf
+  → 跳过优化器步骤 → std 不更新 → 下一步同样问题 → 频繁警告
+```
+
+为什么在 3k 轮触发？Actor 在 warmup 结束（1k 轮）后才解冻，解冻后 2k 轮内 std 被梯度累积压低至危险区间。
+
+### 修复（共 3 处）
+
+| 文件 | 修改 | 作用 |
+|---|---|---|
+| [front_residual_actor_critic.py:726](source/rsl_rl/rsl_rl/modules/front_residual_actor_critic.py#L726) | `clamp(min=1e-6)` → `clamp(min=0.01)` | std 硬下界，保证 log_prob 有限 |
+| [ppo.py:369](source/rsl_rl/rsl_rl/algorithms/ppo.py#L369) | `ratio = exp(log_ratio.clamp(-10,10))` | IS ratio 最大 exp(10)≈22000，永不溢出 |
+| [ppo.py:471](source/rsl_rl/rsl_rl/algorithms/ppo.py#L471) | 警告加诊断打印 | 若仍触发，打印 std/adv/log_ratio 辅助排查 |
+
+### 为何两个修复都需要
+
+- **仅提高 std 下界**：std_min=0.01 时，`log_prob_max = -29×log(0.01) ≈ 133`，若旧分布 std 更大，log_ratio 仍可能超过 88（float32 上限）
+- **仅裁剪 log_ratio**：标准 PPO clip_param=0.2 已存在，但 log_ratio 裁剪至 ±10 后，ratio=exp(10) 虽然大，但被 `surrogate_clipped = -A × clamp(ratio, 0.8, 1.2)` 抑制，实际梯度为 0（clipped 分支主导）——不影响策略更新
+- **两个一起**：互为防线，在 std 收敛后两者都不起作用，对正常训练无影响
+
+---
+
+
+**Claude**
+
+我需要先看奖励配置和环境配置，才能从原理角度完整分析。
+
+---
+
+
+**Claude**
+
+现在我有完整信息，可以做深入的理论分析了。
+
+---
+
+## Stage 2 不收敛的深层原因：梯度景观问题
+
+### 一、std 坍缩的完整因果链
+
+**直接原因**（已修复）：
+
+```
+softplus(self.std).clamp(min=1e-6) 允许 std → 1e-6
+→ log_prob_new(a≈μ) = -29 × log(1e-6) ≈ +400
+→ log_ratio = 313  →  ratio = exp(313) = Inf
+→ 梯度 Inf，跳过 optimizer step
+→ std 仍为 1e-6，下一步同样问题
+```
+
+**但为什么 std 会坍缩？** 这才是根本问题。
+
+### 二、std 的梯度收支分析
+
+PPO loss 中 std 的梯度来自两项：
+
+**熵项（推动 std 增大）：**
+```
+entropy(Normal) = 0.5*(1 + log(2π)) + log(σ)
+∂L_entropy/∂σ = -entropy_coef × (1/σ)  [负号=推 σ 上升]
+```
+实际数值：`-0.001 × (1/0.1) = -0.01`，**极其微弱**。
+
+**Surrogate 项（方向不定）：**
+```
+∂L_surr/∂σ = -A × ratio × Σⱼ(εⱼ² - 1)/σ
+其中 εⱼ = (aⱼ - μⱼ)/σ 是标准化采样偏差
+```
+由于 `E[Σεⱼ² - 29] = 0`，且 A 与 ε 统计独立，**期望为零**。
+
+**结论：** 理论上 std 不应该坍缩。**真正的原因在下一节。**
+
+### 三、根本原因：奖励信号接近零
+
+这是最关键的洞察。看 B1 的奖励信号：
+
+```
+r_delta = r_total(Δq≠0) - r_base(Δq=0)
+```
+
+**FrontRES 什么时候能产生 r_delta > 0？**
+
+Stage 1 已经训练 FrontRES 学习 `Δq_gt = q_actual - q_ref`，即 GMT 的系统性偏差。训练完成后，Stage 2 RL 想要在此基础上继续提升。
+
+**但 Stage 1 的收敛记录：**
+```
+valid_ratio > 0.99，MAE ≈ 0，cosine_sim ≈ 1
+```
+
+这意味着 **Stage 1 已经近乎完美地学到了 Δq_correction**。Stage 2 的 RL 试图改善一个已经最优的 Stage 1 结果：
+
+```
+Stage 1 达到最优  →  r_total(Δq_S1) ≈ r_base_max
+                  →  r_delta = r_total - r_base ≈ 0
+                  →  Advantage A ≈ 0
+                  →  Surrogate gradient ≈ 0
+                  →  std 只剩熵梯度 (-0.01) 而几乎无其他驱动
+```
+
+**此时 std 的更新极其随机**：每次 optimizer step 对 std 的梯度几乎是纯噪声。在 2000 次 Actor 解冻的迭代中，噪声积累使 std 随机游走，最终落入低值区间 → 数值爆炸。
+
+### 四、Alpha 课程将问题放大 10 倍
+
+在 warmup（1000 iters）和 ramp 初期，`alpha = 0.1`：
+
+```
+q_ref_effective = q_ref + 0.1 × Δq
+
+→ FrontRES 的实际物理影响被衰减 90%
+→ ∂r/∂Δq 实际上是 ∂r/∂(alpha×Δq) = 0.1 × ∂r/∂Δq
+→ 原本就接近零的 r_delta，再缩小 10×
+→ Surrogate gradient ∝ 0.1 × (已经接近零的梯度) ≈ 0
+```
+
+Actor 解冻后的 2000 次迭代里（alpha 约 0.1→0.3），**有效策略梯度接近 entropy_coef × 10 的量级**。entropy_coef = 0.001，这根本不够。
+
+### 五、29 维共享 std 使问题放大
+
+FrontRES 用一个标量 std 参数控制 29 个动作维度。log_prob 是所有维度的**求和**：
+
+```
+log_prob = Σⱼ₌₁²⁹ log_prob_j
+         = Σⱼ [-0.5*(aⱼ-μⱼ)²/σ² - log(σ)] - C
+```
+
+当 std 微小下降时，所有 29 个维度同时贡献更大的 IS ratio。实际效果相当于把单维问题的爆炸阈值降低了 29×：
+
+| n_actions | std 需降至多少才导致 Inf | 正常 PPO 留给 std 的安全边界 |
+|---|---|---|
+| 12（典型四足）| 0.0015 | 很大 |
+| **29（FrontRES）** | **0.006** | **极窄** |
+
+### 六、核心矛盾总结
+
+```
+                    Stage 1 训练效果越好
+                           ↓
+                    r_delta → 0（RL无信号）
+                           ↓
+                  Surrogate gradient → 0
+                           ↓
+              std 只由 entropy_coef=0.001 维持
+                           ↓
+          entropy_coef 远小于数值噪声量级
+                           ↓
+               std 随机游走，最终坍缩
+                           ↓
+                    IS ratio Inf → Inf gradient
+```
+
+**"如果思路正确应该很轻易收敛"——这句话是对的，但前提条件没有满足：**
+RL 能轻易收敛的条件是有明确的正向奖励信号（r_delta >> 噪声），而当 Stage 1 已近乎完美时，Stage 2 的 RL 没有清晰的目标梯度。
+
+### 七、真正的修复
+
+数值修复（std_min + log_ratio clamp）只是止血。要让 Stage 2 实际收敛，需要解决梯度信号问题：
+
+**修复 1：entropy_coef 提高 10×**
+
+---
+
+
+**Claude**
+
+No response requested.
+
+---
+
+
+**User**
+
+我已经在Stage 2中施加了强力域随机化，我的思路正是依靠域随机化来构造Stage 2的训练数据，按理来说在这种针对q_ref的强力域随机化下，GMT的表现应当很差，FrontRES应当有很大学习空间才对
+
+---
+
+
+**Claude**
+
+那么前面的分析需要修正。你的设计意图是：**强力 DR 扰动 q_ref → GMT 表现显著变差 → r_delta 明显为正 → FrontRES 有真实学习空间**。这个设计在原理上完全正确。
+
+那问题出在哪里？让我重新定位。
+
+---
+
+## 真正的根因：Critic Warmup 与 Alpha 的耦合错误
+
+### 时序分析
+
+```
+local_it:  [0 ─────── 1000) ──────────── [1000 ───── 3000) ──────────
+Phase:     Phase 0 (Warmup)               Phase 1 (Ramp)
+alpha:     固定 0.1                        0.1 → 0.3 → ...
+Actor:     冻结                             解冻
+```
+
+**Phase 0 (Warmup) 里发生了什么：**
+
+```
+alpha = 0.1
+→ FrontRES 实际注入 q_ref 的修正量 = 0.1 × Δq  （缩小90%）
+→ 即使 DR 很强，0.1 × Δq 几乎无法改变 GMT 在强扰动下的表现
+→ r_total(alpha=0.1, FrontRES) ≈ r_total(alpha=0, GMT)
+→ r_delta = r_total - r_base ≈ 0
+→ Critic 学到的：V(s) ≈ 0  ← 这是关键错误
+```
+
+**Phase 1 (Ramp, 3k 轮时 alpha≈0.3) 里发生了什么：**
+
+```
+alpha = 0.3
+→ FrontRES 实际效果是原来的 3×
+→ DR 扰动强 → r_delta 突然变得显著（≠0）
+→ 但 Critic 仍然认为 V(s) ≈ 0（Warmup 期间学到的）
+→ Advantage = r_delta + γV(s') - V(s) ≈ r_delta + 0 - 0 = r_delta
+
+→ 等价于：Critic bootstrapping 完全失效
+→ Advantage 方差 = r_delta 的方差（无 baseline 降方差）
+```
+
+这是鸡生蛋问题：**Warmup 本想在 Actor 训练前校准 Critic，但 alpha=0.1 让 r_delta≈0，Critic 学到的是错误的 V(s)≈0。Actor 解冻后，Advantage 估计质量极差。**
+
+### std 坍缩的完整链路（修正后）
+
+```
+Phase 0 Warmup (alpha=0.1, actor冻结):
+  r_delta ≈ 0 → Critic 学到 V(s) ≈ 0
+
+Phase 1 Ramp (alpha=0.1→0.3, actor解冻):
+  r_delta 突然变大（强 DR 开始暴露）
+  Critic 仍输出 V ≈ 0
+  → advantage ≈ raw r_delta，方差极大（不同 env 的 DR 程度不同）
+  → 高方差 advantage → PPO 单次 update() 中：
+      mini-batch 1: 噪声梯度随机推动 std 下降一大步
+      mini-batch 2: std 已变小 → IS ratio 爆炸 → Inf gradient
+  → 3k 轮 = Warmup结束后2k轮，正好是这个爆炸的累积时间
+```
+
+### alpha_init = 0.1 的设计初衷与实际效果相反
+
+```
+设计意图：alpha=0.1 让 FrontRES 在 Warmup 期间输出小量修正
+          → 避免未训练的 Actor 造成仿真崩溃
+          → 让 Critic 在安全环境下先收敛
+
+实际效果：Actor 在 Warmup 期间被冻结（根本不会崩溃）
+          alpha=0.1 只影响 Critic 看到的奖励信号
+          Critic 在 r_delta≈0 的信号上收敛到 V≈0
+          → 这个 V≈0 在 Actor 解冻后是完全错误的
+
+结论：delta_q_alpha_init = 0.1 在 Warmup 阶段没有任何安全意义
+     因为 Actor 已经被冻结，只有 Critic 在训练
+     应该用 alpha = 1.0 让 Critic 看到真实的 r_delta 信号
+```
+
+---
+
+## 修复方案
+
+**核心修复：Warmup 阶段改用 alpha = 1.0**
+
+Actor 在 Warmup 期间冻结，Stage 1 的 Δq 预测质量已经很好（cosine_sim≈1），完全没有安全风险。让 Critic 在真实的 r_delta 信号上训练 1000 轮：
+
+---
+
+
+**User**
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Summary:
+1. Primary Request and Intent:
+
+This session continued from a prior conversation on FrontRES Stage 2 RL fine-tuning within MOSAIC. The user's requests were:
+
+**Part 1**: Full pipeline review of Stage 2 fine-tuning to ensure correctness before pushing to server for training.
+
+**Part 2**: After server training revealed frequent warnings `[PPO] WARNING: Inf/NaN gradient detected — skipping optimizer step` at 3k iterations, investigate the root cause deeply.
+
+**Part 3**: Deep theoretical analysis of why std collapses and why Stage 2 doesn't converge. User clarified: Stage 2 uses **strong domain randomization on q_ref** (float, sink, slip, body drag perturbations) specifically to degrade GMT performance and give FrontRES clear learning space. This contradicts an initial diagnosis of "near-zero reward signal due to Stage 1 being too good."
+
+**Final unresolved question**: User pointed out that Stage 1 only trained FrontRES on correct/near-correct q_ref data. Stage 2 DR introduces OOD scenarios. At alpha=1.0 during warmup, FrontRES Stage 1 weights may output wrong Δq → robot falls → Critic learns nothing. This makes the Critic Warmup design fundamentally broken in both directions (alpha=0.1: r_delta≈0 → V≈0; alpha=1.0: OOD falls → V still learns nothing).
+
+---
+
+2. Key Technical Concepts:
+
+- **FrontRES architecture**: `residual_actor` (trainable) outputs `tanh(raw) × max_delta_q` as Δq; GMT (frozen) takes `q_ref + alpha×Δq` → motor commands
+- **B1 split-env delta-reward**: Envs split [0:N_train] FrontRES, [N_train:] GMT-only baseline. `r_delta = r_total - r_base`; GMT rewards zeroed
+- **`_cached_observations`**: Set in `update_distribution(obs_full)` during `act()` — holds full [N, obs_dim] tensor. Critical bug: when `get_env_action` is called with sliced obs, shape mismatch
+- **IS ratio overflow**: `ratio = exp(log_ratio)`. With std=1e-6 and 29 action dims: `log_prob_new(a≈μ) = -29×log(1e-6) ≈ +400`, `log_ratio ≈ 313 → exp(313) = float32 Inf`
+- **Critic warmup + alpha curriculum coupling bug**: `alpha_init=0.1` during warmup → `r_delta ≈ 0` → Critic learns `V(s) ≈ 0` (wrong calibration). When actor unfreezes and r_delta grows, Critic bootstrap fails completely → high-variance advantages → std collapses
+- **OOD problem**: Stage 1 trained FrontRES on clean/near-clean q_ref. Stage 2 DR introduces large perturbations (float, sink, slip) → FrontRES outputs wrong Δq under OOD → potentially causes falls even at actor-frozen warmup with alpha=1.0
+- **`training_type`**: `class_name="PPO"` → `training_type="rl"` (not "mosaic")
+- **Scalar std parameterization**: `softplus(self.std)`, single parameter for all 29 action dims → 29× amplification of log_prob instability
+- **softplus + clamp**: `softplus(x).clamp(min=...)` — when clamped, gradient is zero through the clamp but forward computation still uses the clamped value
+- **entropy_coef=0.001**: Too small — entropy gradient on std is `-0.001/σ ≈ -0.01` (extremely weak)
+
+---
+
+3. Files and Code Sections:
+
+**`source/rsl_rl/rsl_rl/modules/front_residual_actor_critic.py`**
+
+*Bug 3 Fix — `get_env_action` dimension mismatch*: When B1 split calls `get_env_action(obs[:N_train], delta_q[:N_train])`, `_cached_observations` is full [N, obs_dim] → shape mismatch in `_apply_delta_q_and_run_gmt`.
+```python
+# Fixed version (lines ~750-757):
+cached = getattr(self, '_cached_observations', observations)
+if cached.shape[0] != delta_q_sample.shape[0]:
+    cached = observations
+policy_obs, ref_vel, ref_vel_estimator_obs = self._parse_observations(cached)
+```
+
+*std minimum clamp fix*: Changed from `1e-6` to `0.01` to prevent IS ratio overflow:
+```python
+# WHY clamp(min=0.01) instead of 1e-6:
+#   With 29 action dims and std=1e-6, log_prob(a≈μ) = -29*log(1e-6) ≈ +400.
+#   If old log_prob was computed with std=0.05 (≈+87), then log_ratio=313,
+#   ratio=exp(313) which overflows float32 → Inf surrogate → Inf gradient.
+_STD_MIN = 0.01
+if self.noise_std_type == "scalar":
+    std = torch.nn.functional.softplus(self.std).clamp(min=_STD_MIN).expand_as(delta_q_mean)
+elif self.noise_std_type == "log":
+    std = torch.exp(self.log_std).clamp(min=_STD_MIN).expand_as(delta_q_mean)
+```
+
+**`source/rsl_rl/rsl_rl/runners/on_policy_runner.py`**
+
+*Bug 4 Fix — `_std_gmt` not sliced*: `action_std` returns `[N, A]` but used with `_mean_gmt [N_base, A]`:
+```python
+_mean_gmt   = self.alg.policy.action_mean[N_train:].clone()
+_std_gmt    = self.alg.policy.action_std[N_train:]  # [N_base, A]  ← FIXED (was: self.alg.policy.action_std)
+_logp_zeros = torch.distributions.Normal(_mean_gmt, _std_gmt) \
+                  .log_prob(_zeros_gmt).sum(dim=-1)
+```
+
+**`source/rsl_rl/rsl_rl/algorithms/ppo.py`**
+
+*log_ratio clamp before exp()*: Prevents IS ratio overflow regardless of std value:
+```python
+# Clip log_ratio before exp() to prevent IS ratio overflow (float32 max = exp(88)).
+log_ratio = (actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)).clamp(min=-10.0, max=10.0)
+ratio = torch.exp(log_ratio)
+surrogate = -torch.squeeze(advantages_batch) * ratio
+```
+
+*Improved Inf/NaN diagnostic print*:
+```python
+if _has_bad_grad:
+    _std_val = (
+        torch.nn.functional.softplus(self.policy.std).mean().item()
+        if hasattr(self.policy, "std") else
+        torch.exp(self.policy.log_std).mean().item()
+        if hasattr(self.policy, "log_std") else -1.0
+    )
+    print(f"[PPO] WARNING: Inf/NaN gradient — skipping step | "
+          f"std_mean={_std_val:.5f} "
+          f"adv=[{advantages_batch.min().item():.2f},{advantages_batch.max().item():.2f}] "
+          f"log_ratio=[{log_ratio.min().item():.2f},{log_ratio.max().item():.2f}] "
+          f"loss={loss.item():.4f}")
+    self.optimizer.zero_grad()
+```
+
+**`source/whole_body_tracking/.../agents/rsl_rl_ppo_cfg.py`** (NOT modified — user rejected edit)
+
+Current config values:
+```python
+critic_warmup_iterations = 1000
+delta_q_alpha_init = 0.1
+delta_q_alpha_ramp_iterations = 9000
+entropy_coef = 0.001   # too small
+```
+
+---
+
+4. Errors and Fixes:
+
+**Bug 3 — `get_env_action` dimension mismatch (new this session)**:
+- `_cached_observations` is [N, obs_dim] from `act(obs_full)`. B1 split calls `get_env_action(obs[:N_train], actions[:N_train])`. Inside `get_env_action`, `_cached_observations` → `policy_obs=[N]`, but `delta_q=[N_train]` → shape mismatch in `_apply_delta_q_and_run_gmt`.
+- Fix: Check `cached.shape[0] != delta_q_sample.shape[0]`, fall back to passed `observations`.
+
+**Bug 4 — `_std_gmt` not sliced (new this session)**:
+- `self.alg.policy.action_std` returns `distribution.stddev = [N, A]` (full tensor expanded from `[A]` parameter). Used with `_mean_gmt=[N_base, A]` → `Normal(mean, std)` shape mismatch when `N != N_base`.
+- Fix: `_std_gmt = self.alg.policy.action_std[N_train:]`
+
+**Inf/NaN gradient (from server training)**:
+- Root cause: std collapses to `1e-6` clamp. With 29 dims: `log_prob_new(a≈μ) ≈ +400`, `log_prob_old ≈ +87`, `log_ratio=313`, `ratio=exp(313)=Inf`. Gradient Inf → skip step → std unchanged → cycle.
+- Fix 1: `clamp(min=1e-6)` → `clamp(min=0.01)` in `front_residual_actor_critic.py`
+- Fix 2: `log_ratio = (...).clamp(-10, 10)` before `exp()` in `ppo.py`
+- Note: These are defensive/numerical fixes. The root cause of WHY std collapses is the Critic miscalibration described below.
+
+**Critic miscalibration (analytical, not yet fixed)**:
+- `delta_q_alpha_init=0.1` during warmup → `r_delta≈0` → Critic learns `V(s)≈0`.
+- When actor unfreezes and alpha ramps, r_delta grows but Critic still says V≈0.
+- Advantages = raw r_delta (no bootstrap), high variance → volatile PPO → std collapses.
+- Proposed fix (alpha_init=1.0) was rejected by user due to OOD falls concern.
+
+---
+
+5. Problem Solving:
+
+**Solved**: 4 bugs fixed across 2 sessions. Numerical Inf/NaN gradient issue addressed with std_min=0.01 and log_ratio clamp.
+
+**Ongoing**: The fundamental Stage 2 convergence problem remains unresolved. The core issue is a bootstrap deadlock:
+
+```
+alpha=0.1 warmup → r_delta≈0 → Critic learns V≈0 (wrong)
+alpha=1.0 warmup → FrontRES OOD on Stage 2 DR → wrong Δq → possible falls → Critic still wrong
+```
+
+User's key insight (most recent message): Stage 1 only trained FrontRES on correct q_ref. Stage 2 introduces OOD DR perturbations. Even with alpha=1.0 and actor frozen, FrontRES outputs wrong Δq because it hasn't seen Stage 2's perturbation distribution. This means the Critic cannot learn correct V(s) in either alpha configuration. This is a fundamental design tension between Stage 1 and Stage 2 objectives.
+
+---
+
+6. All User Messages:
+
+- "先前的会话似乎中断，请再次从头到尾梳理整个Stage 2微调流程确保完全正确，我即将推送到服务器开始训练"
+- "我在服务器上测试后才跑了3k轮就遇到频繁warning：[PPO] WARNING: Inf/NaN gradient detected — skipping optimizer step 请深入检查到底是什么问题" (sent twice)
+- "请为我深入分析std坍缩原因，我想从原理角度理解为什么Stage 2微调总是无法收敛，如果思路正确，应当很轻易就能收敛"
+- "我已经在Stage 2中施加了强力域随机化，我的思路正是依靠域随机化来构造Stage 2的训练数据，按理来说在这种针对q_ref的强力域随机化下，GMT的表现应当很差，FrontRES应当有很大学习空间才对"
+- [Rejected edit to rsl_rl_ppo_cfg.py with entropy_coef change] — reason: "直接使用α=1是否会导致q_dot=q_ref+delta_q直接让机器人摔倒？这样Critic也学不到任何东西？"
+- [Rejected edit to rsl_rl_ppo_cfg.py with alpha_init change] — reason not explicitly stated but the tool use was blocked before the edit happened
+- "但实际上Stage 1中FrontRES只学习到在正确或接近正确的q_ref上输出delta_q，Stage 2中遇到DR，可能会发生OOD，输出的delta_q不再正确，Critic依然什么都学不到"
+
+---
+
+7. Pending Tasks:
+
+- **Resolve the Stage 2 fundamental convergence design problem**: The Critic warmup deadlock needs a solution that accounts for Stage 1→Stage 2 OOD. Proposed alpha=1.0 was rejected. No alternative has been agreed upon yet.
+- **entropy_coef increase**: 0.001 → 0.01 was proposed but the config edit was rejected (first rejection, before the alpha discussion). This change is still needed regardless.
+- The user is still waiting for a response to the OOD concern about Critic learning nothing in Stage 2.
+
+---
+
+8. Current Work:
+
+The session ended mid-discussion on the fundamental Stage 2 convergence issue. The user raised a critical point that invalidates the alpha=1.0 warmup proposal:
+
+**User's last message**: "但实际上Stage 1中FrontRES只学习到在正确或接近正确的q_ref上输出delta_q，Stage 2中遇到DR，可能会发生OOD，输出的delta_q不再正确，Critic依然什么都学不到"
+
+Translation: "Stage 1 FrontRES only learned to output delta_q on correct/near-correct q_ref. In Stage 2 with DR, OOD may occur, the output delta_q is no longer correct, and the Critic still cannot learn anything."
+
+This is the last outstanding problem: a chicken-and-egg bootstrap problem where:
+- Critic needs to see real r_delta (requires alpha high enough)
+- But FrontRES is OOD for Stage 2 DR → outputs wrong Δq at alpha=1.0 → falls → no positive r_delta signal
+
+---
+
+9. Optional Next Step:
+
+The next step is to respond (text only, as instructed) to the user's OOD concern and propose a solution to the fundamental Stage 2 bootstrap problem. The conversation is waiting for this response.
+
+The user's concern verbatim: "但实际上Stage 1中FrontRES只学习到在正确或接近正确的q_ref上输出delta_q，Stage 2中遇到DR，可能会发生OOD，输出的delta_q不再正确，Critic依然什么都学不到"
+
+The response should address: Given OOD from Stage 1 to Stage 2, how can Stage 2 be designed so the Critic can actually calibrate and training can converge? Possible directions:
+1. Remove critic warmup entirely, rely on PPO's built-in stability (numerical fixes + higher entropy_coef)
+2. Use the B1 split differently: GMT baseline is the uncorrupted policy, and FrontRES learns incrementally from small alpha
+3. Restructure Stage 2 to not depend on Stage 1 OOD weights being correct at initialization — instead rely on PPO's inherent exploration to discover corrections gradually
+4. Add auxiliary supervised loss from Stage 1 during Stage 2 to anchor FrontRES near Stage 1 solution while RL fine-tunes
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: C:\Users\ChengYuxuan\.claude\projects\c--ArtiIntComVis-MOSAIC\2b99aabb-3476-4bdb-9737-6e7bcc708a5e.jsonl
+Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.
+
+---
+
+
+**User**
+
+请为我总结我们讨论过的问题，并列出我们规划的解决方案，使用要点的形式，方便我查看是否还有遗漏
+
+---
+
+
+**Claude**
+
+## 问题总结与解决方案
+
+---
+
+### 一、代码 Bug（已修复）
+
+**Bug 1 — `get_env_action` 维度不匹配**
+- 问题：`_cached_observations` 保存全量 [N, obs_dim]，B1 split 用切片 obs[:N_train] 调用 `get_env_action`，内部维度不匹配
+- 修复：检查 `cached.shape[0] != delta_q.shape[0]`，回退到传入的 `observations`
+- 文件：[front_residual_actor_critic.py](source/rsl_rl/rsl_rl/modules/front_residual_actor_critic.py)
+
+**Bug 2 — `_std_gmt` 未切片**
+- 问题：`action_std` 返回全量 [N, A]，与 `_mean_gmt [N_base, A]` 形状不匹配
+- 修复：`_std_gmt = self.alg.policy.action_std[N_train:]`
+- 文件：[on_policy_runner.py](source/rsl_rl/rsl_rl/runners/on_policy_runner.py)
+
+---
+
+### 二、数值稳定性问题（已修复）
+
+**问题 3 — std 坍缩导致 IS ratio 溢出**
+- 机制：std clamp 到 1e-6 → 29 维 log_prob ≈ +400 → log_ratio ≈ 313 → exp(313) = float32 Inf → 梯度 Inf → 跳过 optimizer → std 不更新 → 循环
+- 修复 A：std_min clamp 从 `1e-6` → `0.01`
+- 修复 B：`log_ratio = (...).clamp(-10, 10)` 在 `exp()` 之前
+- 修复 C：增强 Inf/NaN 诊断日志，打印 std_mean / adv 范围 / log_ratio 范围
+- 文件：[front_residual_actor_critic.py](source/rsl_rl/rsl_rl/modules/front_residual_actor_critic.py)，[ppo.py](source/rsl_rl/rsl_rl/algorithms/ppo.py)
+
+---
+
+### 三、训练动力学问题（已修复配置）
+
+**问题 4 — Critic warmup 制造分布错配**
+- 机制：actor 冻结 + alpha=0.1 阶段，Critic 学 V(s | π_frozen, α=0.1)；训练阶段策略分布完全不同 → Critic V 估计立即失效 → advantage 方差爆炸 → std 坍缩
+- 修复：`critic_warmup_iterations` 1000 → **0**
+
+**问题 5 — alpha 课程造成 r_delta≈0 陷阱**
+- 机制：alpha=0.1 → FrontRES 修正量只占 10% → r_delta ≈ 0 → Critic 学到 V≈0 → 与后续 alpha=1.0 时真实价值完全不匹配
+- 修复：`delta_q_alpha_init` 0.1 → **1.0**，`delta_q_alpha_ramp_iterations` 9000 → **0**
+
+**问题 6 — entropy_coef 过小**
+- 机制：0.001 对应 std 梯度量级仅 ~0.001/σ，无法对抗 PPO 使 std 收缩的倾向
+- 修复：`entropy_coef` 0.001 → **0.01**
+
+---
+
+### 四、根本性训练失败风险（已分析，**尚未实施解决方案**）
+
+**问题 7 — OOD → 全负 r_delta → Δq=0 捷径陷阱**
+- 机制链条：
+  1. Stage 1 仅在正确 q_ref 上训练 → Stage 2 DR 引入 OOD
+  2. OOD Δq 错误 → r_frontres << r_baseline → r_delta < 0 → Critic 学到 V(s) = 负
+  3. Actor 探索 Δq≈0 → r_delta≈0 → A = 0 - (负) = 正 advantage
+  4. reg_loss 同时推 Δq→0 → 两股力量锁死在 no-op 局部最优
+  5. 29 维空间中随机探索难以意外发现有效修正方向 → 无法逃脱
+
+- **规划解决方案（未实施）**：
+  - **Stage 2 DR 课程**：从轻度 DR 开始（FrontRES 接近 in-distribution → 小幅正 r_delta → Critic 正确校准），逐步增强 DR 强度
+  - **lambda_reg 延迟启动**：轻度 DR 阶段设 `lambda_reg_init≈0`，等 Actor 已发展出有效 Δq 策略后再逐步开启，避免在探索初期将 Actor 压回 no-op
+
+---
+
+### 遗漏检查清单
+
+- [ ] Stage 2 DR 课程调度是否已在环境配置中实现？
+- [ ] `lambda_reg` 是否支持按迭代数动态调整（类似 alpha 课程的接口）？
+- [ ] B1 split 的 baseline 环境是否与 FrontRES 环境使用**相同的 DR 采样**，确保 r_delta 的对比公平性？
+
+---
+
+
+**Claude**
+
+这个担忧需要更精确地区分两种不同的情形。
+
+## 关键区分：V 的符号 vs V 的方差
+
+Critic 能否学到有用信息，取决于的**不是 V(s) 的正负，而是 V(s) 在状态空间上的方差**。
+
+```
+TD error = r + γV(s') - V(s)
+```
+
+只要不同状态下 r_delta 有差异，TD error 就非零，梯度就存在。
+
+---
+
+## 情形 A：V 负但有方差（Critic 可以学习）
+
+即使所有 r_delta 都是负值，只要不同状态对应不同程度的负值：
+
+```
+状态 s_stable → 轻微摔跌 → r_delta = -1 → V(s_stable) = -99
+状态 s_unstable → 立即崩溃 → r_delta = -5 → V(s_unstable) = -495
+```
+
+Critic 学到的是**相对排序**：`V(s_stable) > V(s_unstable)`。这个排序经由 TD bootstrap 传播：
+
+```
+从 s_unstable 转移到 s_stable 的动作：
+TD error = -1 + γ(-99) - (-495) > 0  ←  正梯度，该动作被强化
+```
+
+Actor 学到"从危险状态转移到稳定状态"，即使这两个状态的 V 都是负的。这是 RL 的正常工作方式，负奖励本身不是问题。
+
+---
+
+## 情形 B：V 负且方差趋近于零（Critic 真的学不到东西）
+
+当 OOD 极为严重时，FrontRES 从任意状态都在 1-2 步内以相同方式让机器人摔倒：
+
+```
+所有 (s, a) → 相同的摔倒轨迹 → r_delta ≈ 常数
+V(s₁) ≈ V(s₂) ≈ V(s₃) ≈ -C
+TD error ≈ 0 for all transitions
+```
+
+此时 Critic 无法区分状态，所有 advantage 趋近零，Actor 得不到有效梯度。**这才是真正的"Critic 学不到任何有用信息"的情形。**
+
+---
+
+## 这个退化情形在实践中有多大概率发生？
+
+现实中，即使 FrontRES 严重 OOD，各状态的 r_delta 也不太可能完全相同，原因如下：
+
+**不同的 falls 有不同的时间和幅度**
+
+机器人不会瞬间倒下，从站立到摔倒有一个过程。初始状态稳定的 episode 能撑更久，累积 r_delta 与初始状态不稳定的 episode 明显不同。
+
+**B1 split 的 baseline 本身也有方差**
+
+```
+r_delta = r_frontres - r_baseline
+```
+
+即使 r_frontres 在所有状态下相近，不同 DR 采样下的 r_baseline 也会有差异，从而给 r_delta 引入方差。
+
+**OOD 不等于均匀错误**
+
+FrontRES 对某些关节/状态的修正可能恰好正确，对另一些错误。这导致不同状态下 Δq 的"错误程度"不同，r_delta 也不同。
+
+---
+
+## 但在强 DR 冷启动下风险真实存在
+
+如果 Stage 2 一开始就施加最强的 DR（float + sink + slip + body_drag 全部最大），FrontRES 几乎必然处于情形 B：
+
+```
+强 DR → q_ref 严重失真 → FrontRES 所有输出全部 OOD
+      → 从任意状态都在 t=2 摔倒 → r_delta 方差极小
+      → Critic 退化 → Δq=0 捷径锁死 Actor
+```
+
+**这正是 DR 课程存在的原因**：确保 Stage 2 开始时 FrontRES 不处于完全 OOD 的状态，保证 r_delta 有足够方差让 Critic 正常校准。
+
+---
+
+## 一个额外的安全网：Advantage 归一化
+
+标准 PPO 的 mini-batch 更新会对 advantage 做归一化：
+
+```
+A_norm = (A - mean(A)) / std(A)
+```
+
+即使 r_delta 全部为负、方差较小，归一化后仍然会有一半 advantage 为正、一半为负。"最不坏"的动作被强化，"最坏"的动作被抑制。这在情形 B 的边缘区域提供了部分保护，但无法解决完全退化的情形（std(A)→0 时归一化数值不稳定）。
+
+---
+
+## 结论
+
+| 情形 | 发生条件 | Critic 能否学习 | 解法 |
+|---|---|---|---|
+| V 全负但有方差 | OOD 但不均匀 | **能**，学习相对排序 | 无需额外干预 |
+| V 全负且方差→0 | 严重 OOD，所有状态一样差 | **不能** | DR 课程防止冷启动时进入此情形 |
+
+担忧的情形确实存在，但它的触发条件是"强 DR 冷启动"而非"alpha=1.0"本身。DR 课程解决的正是这个触发条件，而不是 alpha 课程。
+
+---
+
+
+**Claude**
+
+Now add logging in `log()`:
+
+---
+
+
+**Claude**
+
+Now add DR scale to the terminal log:
+
+---
+
+
+**Claude**
+
+Now read all modified sections to verify correctness:
+
+---
+
+
+**Claude**
+
+Good. Now check the config changes:
+
+---
+
+
+**Claude**
+
+Spotted a critical bug: `_perturb_target` is a reference to the same object as `_mcmd.perturber.cfg` (Python passes by reference in `MotionPerturber.__init__`). Writing `_mcmd.perturber.cfg.float_prob = value` also overwrites `_perturb_target.float_prob`, corrupting the target values on the second iteration.
+
+Fix: store a snapshot copy of the original float values:
+
+---
+
+
+**Claude**
+
+Now do a final read of the complete modified region to verify everything is correct:
+
+---
+
+
+**Claude**
+
+All good. Let me verify the lambda_reg penalty section and the locals block once more:
+
+---
+
+
+**Claude**
+
+Code is correct. Let me do one final check on the `_NS` import placement — it should only execute once, not inside the `for it` loop:
+
+---
+
+
+**Claude**
+
+`from types import SimpleNamespace` is at `learn()` scope before the `for it` loop — executes once. 
+
+---
+
+
+**Claude**
+
+所有修改完成，梳理如下：
+
+---
+
+## 修改汇总
+
+### [rsl_rl_ppo_cfg.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py)
+
+`G1FlatFrontRESFinetuneRunnerCfg` 新增两个参数：
+
+```python
+dr_curriculum_iterations: int = 5000        # DR 从 0 线性增长到 full 的迭代数
+stage2_start_iteration:   int = 25000       # Stage 2 绝对起始迭代，用于断点续训时正确恢复进度
+```
+
+---
+
+### [on_policy_runner.py](source/rsl_rl/rsl_rl/runners/on_policy_runner.py)
+
+**1. 预循环初始化（Bug fix 关键）**
+
+用 `SimpleNamespace` 存储扰动目标值的**数值拷贝**，而非引用。原因：`MotionPerturber.__init__` 中 `self.cfg = cfg` 是引用赋值，`_mcmd.perturber.cfg` 与 `env.cfg.motion_perturbations` 是同一对象。若存引用，第一次写入后目标值即被覆盖，课程从第二轮起失效。
+
+**2. 每轮迭代开始时更新 DR 强度**
+
+```
+scale = clamp((it - stage2_start) / dr_curriculum_iters, 0, 1)
+perturber.cfg.float_prob = target.float_prob * scale
+...（8个扰动参数同步缩放）
+```
+
+**3. 新增 `lambda_reg` 奖励塑形（补全之前未实现的部分）**
+
+`lambda_reg` 之前只在 `ppo.py` 中作为诊断指标记录，实际从未被施加。现在在 runner 的 rollout 循环内以 reward shaping 形式实现：
+
+```python
+r_reg = -lambda_reg × mean_j(Δq_j²)   # 仅对 FrontRES envs
+```
+
+通过 `_dr_done` 门控：**DR 课程期间不施加**，防止 reg 在 Actor 探索阶段就将其推向 Δq=0 捷径。
+
+**4. 新增监控指标**（wandb + 终端日志）
+
+| 指标 | 含义 |
+|---|---|
+| `Curriculum/dr_scale` | 当前 DR 课程进度（0→1） |
+| `FrontRES/reg_penalty_per_step` | 每步 lambda_reg 惩罚均值（课程期间为0，结束后为实际值） |
+
+---

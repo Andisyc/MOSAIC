@@ -714,10 +714,20 @@ class FrontRESActorCritic(nn.Module):
         # Build distribution over Δq-space
         # NOTE: scalar std is an unconstrained nn.Parameter; apply softplus to
         # guarantee std > 0 at all times and avoid Normal(mean, negative_std) crash.
+        #
+        # WHY clamp(min=0.01) instead of 1e-6:
+        #   With 29 action dims and std=1e-6, log_prob(a≈μ) = -29*log(1e-6) ≈ +400.
+        #   If old log_prob was computed with std=0.05 (≈+87), then log_ratio=313,
+        #   ratio=exp(313) which overflows float32 → Inf surrogate → Inf gradient.
+        #   With std_min=0.01: log_prob_max = -29*log(0.01) ≈ +133.
+        #   Combined with log_ratio clipping in ppo.py, this prevents Inf IS ratios.
+        #   In practice, a well-trained locomotion policy has std ≈ 0.02–0.05,
+        #   so 0.01 is a safe floor that does not prevent meaningful exploration decay.
+        _STD_MIN = 0.01
         if self.noise_std_type == "scalar":
-            std = torch.nn.functional.softplus(self.std).clamp(min=1e-6).expand_as(delta_q_mean)
+            std = torch.nn.functional.softplus(self.std).clamp(min=_STD_MIN).expand_as(delta_q_mean)
         elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).clamp(min=1e-6).expand_as(delta_q_mean)
+            std = torch.exp(self.log_std).clamp(min=_STD_MIN).expand_as(delta_q_mean)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
 
