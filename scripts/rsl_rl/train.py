@@ -138,10 +138,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.commands.motion.motion = args_cli.motion
 
     # specify directory for logging experiments
-    # log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    # log_root_path = os.path.abspath(log_root_path)
-    # log_root_path = '/home/yuxuancheng/MOSAIC/logs/rsl_rl/g1_flat_supervised'
-    log_root_path = "/hdd0/yuxuancheng/MOSAIC/g1_flat_supervised"
+    # log_root_path 根据 experiment_name 自动派生，避免不同训练阶段的 checkpoint 混入同一目录。
+    # experiment_name 由各 RunnerCfg 定义（如 "g1_flat_frontres_finetune"、"g1_flat_supervised"）。
+    log_root_path = f"/hdd0/yuxuancheng/MOSAIC/{agent_cfg.experiment_name}"
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
 
     # specify directory for logging runs: {time-stamp}_{run_name}

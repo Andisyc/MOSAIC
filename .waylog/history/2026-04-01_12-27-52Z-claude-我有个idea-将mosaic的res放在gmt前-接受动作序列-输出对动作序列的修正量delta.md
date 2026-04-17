@@ -8400,3 +8400,89 @@ is_full_resume: bool = False  # Stage 1→Stage 2 权重迁移（冷启动）
 就是 [rsl_rl_ppo_cfg.py:181-183](source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py#L181-L183) 这里。`_s1`/`_s2` 是 Stage 1 的路径，现在要改成 model_30000.pt 的路径：
 
 ---
+
+
+**Claude**
+
+路径占位符已更新，你需要把 `stage2/model_30000.pt` 替换成实际的日志目录路径，例如：
+
+```
+/hdd0/yuxuancheng/MOSAIC/g1_flat_supervised/2025-XX-XX_XX-XX-XX/model_30000.pt
+```
+
+实际路径查一下服务器上的日志目录：
+```bash
+ls /hdd0/yuxuancheng/MOSAIC/g1_flat_frontres_finetune/*/model_30000.pt
+```
+
+找到后替换 `_s1`/`_s2` 里的路径即可。`student_checkpoint_path` 会自动选择存在的那个。
+
+---
+
+
+**User**
+
+我的启动命令如下，请检查代码，这个启动命令是否会在断点续训时覆盖某些参数？
+
+HYDRA_FULL_ERROR=1 nohup bash ~/IsaacLab_mosaic/isaaclab.sh -p ~/MOSAIC/scripts/rsl_rl/train.py \
+    --task=FrontRES-RLFinetune-Tracking-Flat-G1-v0 \
+    --num_envs=12000 \
+    --motion /hdd0/yuxuancheng/AMASS_G1NPZ_Final \
+    --logger wandb \
+    --headless \
+    --device cuda:7 >/hdd0/yuxuancheng/MOSAIC/train.txt 2>&1 &
+
+---
+
+
+**Claude**
+
+关键问题在三处，逐一分析：
+
+## 1. `--run_name` 有默认值，会静默覆盖
+
+[cli_args.py:42](scripts/rsl_rl/cli_args.py#L42) 中 `--run_name` 默认值是 `"FrontRES_Stage_2_finetune"`：
+
+```python
+arg_group.add_argument("--run_name", type=str, default="FrontRES_Stage_2_finetune", ...)
+```
+
+[cli_args.py:127-128](scripts/rsl_rl/cli_args.py#L127-L128) 中无论你是否传 `--run_name`，这个默认值都会覆盖 `agent_cfg.run_name`。只影响日志目录名，不影响训练参数，**无害**。
+
+---
+
+## 2. `max_iterations` 是相对值 — 这是主要问题
+
+命令中没有传 `--max_iterations`，所以 `agent_cfg.max_iterations = 65000`（配置值）。
+
+[train.py:204](scripts/rsl_rl/train.py#L204)：
+```python
+runner.learn(num_learning_iterations=agent_cfg.max_iterations)  # 传入 65000
+```
+
+`learn()` 内部：
+```python
+start_iter = self.current_learning_iteration  # 30000（从 checkpoint 加载）
+tot_iter   = start_iter + num_learning_iterations  # 30000 + 65000 = 95000
+```
+
+**结论：训练会从 iter 30000 跑到 95000，额外 65000 轮，而不是停在原计划的 65000。**
+
+如果你只想跑到 65000，需要加参数：
+
+```bash
+--max_iterations 35000   # 35000 = 65000 - 30000
+```
+
+---
+
+## 3. `log_root_path` 硬编码为 `g1_flat_supervised` — 需要修改
+
+[train.py:144](scripts/rsl_rl/train.py#L144)：
+```python
+log_root_path = "/hdd0/yuxuancheng/MOSAIC/g1_flat_supervised"
+```
+
+Stage 2 的新 checkpoint 会被存进 `g1_flat_supervised/` 而不是 `g1_flat_frontres_finetune/`，与实验名不符，以后找 checkpoint 会很混乱。建议改为：
+
+---
