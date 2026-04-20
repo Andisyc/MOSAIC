@@ -8816,3 +8816,250 @@ python train.py --task ... --motion ... --max_iterations 40000 [其他参数]
 这样 `tot_iter = 46500 + 40000 = 86500`，是合理的训练终点。
 
 ---
+
+
+**User**
+
+现在更新的代码推送到服务器上训练已经来到54374轮次了，kl_divergence在3左右波动；Surrogate一路缓慢走低现在在4左右波动；reg_penalty_per_step缓慢走高，现在来到大约-0.00125；r_delta_per_step在0.001附近波动；delta_q_norm_std和delta_q_norm_mean一路缓慢走低，现在在1.347左右波动；但mean_r_delta还是在0附近波动，learning_rate根本没有变化，全程是0.00001，请评价收敛情况
+
+---
+
+
+**Claude**
+
+## 收敛情况评价：Adaptive Schedule 已永久失效
+
+### 进展（对比 47500 轮时）
+
+| 指标 | 47500 轮 | 54374 轮 | 趋势 |
+|---|---|---|---|
+| KL | 4 | 3 | ↓ 缓慢改善 |
+| Surrogate | 7 | 4 | ↓↓ 明显改善 |
+| lr | 1e-5 | 1e-5 | → 完全不动 |
+| r_delta/step | +0.001 | +0.001 | → 平稳 |
+
+Critic 在收敛（Surrogate 7→4），但 **adaptive schedule 的正反馈链路已被永久切断**。
+
+---
+
+### 根本原因：desired_kl 设置仍然错误
+
+上次的修复（0.008 → 0.23）方向对，但 **系数估算有误**。
+
+adaptive schedule 的触发条件：
+```
+KL > desired_kl × 2  →  lr 降低（乘 1/1.5）
+KL < desired_kl / 2  →  lr 升高（乘 1.5）
+```
+
+当前状态：
+- **KL 在 lr=1e-5 下的结构性最小值 ≈ 3**（即便在最低 lr 下，20次梯度步也会积累 KL=3）
+- desired_kl = 0.23 → 触发降 lr 的阈值 = 0.46 → 永远 `KL=3 > 0.46` → **lr 永远被压在下限 1e-5**
+- 触发升 lr 的阈值 = 0.115 → 在 lr=1e-5 下 KL=3，永远不可能 < 0.115
+
+结论：**无论训练多久，lr 不会自动回升**。
+
+---
+
+### 需要修改的代码
+
+**方案一（推荐）：切换 Fixed lr，跳过 adaptive schedule**
+
+[rsl_rl_ppo_cfg.py:283-288](source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py#L283-L288)：
+
+```python
+learning_rate=3e-5,       # 保守：比当前 1e-5 高 3×，不破坏稳定性
+schedule="fixed",          # 彻底关闭 adaptive schedule
+# desired_kl 不再生效，可保留作记录
+desired_kl=0.23,
+```
+
+或更激进（Critic 已收敛 40%，风险可接受）：
+```python
+learning_rate=1e-4,
+schedule="fixed",
+```
+
+**方案二：保留 adaptive，大幅提高 desired_kl**
+
+```python
+desired_kl=6.0,    # > 当前 KL(3) × 2=6，schedule 才能开始允许 lr 上升
+```
+
+---
+
+### 建议
+
+选方案一，`learning_rate=3e-5, schedule="fixed"`，理由：
+
+1. Surrogate 已从 7 降到 4，说明 Critic 在正确方向上收敛，现在提高 lr 有支撑
+2. Fixed lr 完全绕开有缺陷的 KL 循环
+3. 3e-5 是当前 1e-5 的 3 倍，policy 更新幅度温和，不会破坏已学到的行为
+4. 如果稳定，下一次续训可以升到 1e-4
+
+是否需要我直接修改配置文件？
+
+---
+
+
+**Claude**
+
+## Adaptive Schedule 的工作原理
+
+```
+每个 mini-batch 更新后计算 KL，然后：
+
+KL > desired_kl × 2  →  lr = max(1e-5, lr ÷ 1.5)   【降速】
+KL < desired_kl ÷ 2  →  lr = min(1e-2, lr × 1.5)   【加速】
+否则                  →  lr 不变
+```
+
+设计意图是形成负反馈闭环：lr 高 → KL 大 → 降 lr → KL 下降 → 允许升 lr → 稳定在 KL ≈ desired_kl 附近。
+
+**为什么在我们的系统里失效：**
+
+Adaptive schedule 有一个隐含前提——**lr=lr_floor 时系统 KL 应该 < desired_kl**，否则这个闭环就是单向只降从不升的死锁。
+
+我们的情况：
+```
+在 lr_floor=1e-5 下，系统结构性 KL ≈ 3
+desired_kl = 0.23
+
+触发降速阈值 = 0.23 × 2 = 0.46
+触发升速阈值 = 0.23 ÷ 2 = 0.115
+
+3 > 0.46  →  每个 mini-batch 触发降速
+lr 在前20次迭代降至 1e-5，永远达不到 0.115 → 升速条件永远不成立
+```
+
+闭环变成了开环：**只降不升，lr 在第一天就死锁了。** desired_kl=0.23 相比 desired_kl=0.008 只是把"死锁的速度"从 KL=10 时变成了 KL=3 时，问题本质没变。
+
+---
+
+## 从 30k 重头还是从当前续训？
+
+### 先确认：30k 不是"干净的起点"
+
+30k 的权重同样是在 lr=1e-5 下训练的（KL bug 在 Stage 2 第一天就触发了）。从 30k 重头只是少了 24000 轮的低效训练，并不能获得"正确 lr 下的 25000 轮起点"。
+
+### 对比两个选项
+
+| | 从 30k 重头 | 从 ~54000 续训 |
+|---|---|---|
+| 浪费算力 | 重跑 24000 轮 | 无损失 |
+| DR 状态 | 需重走完整 DR ramp | 早已 100% |
+| r_delta 信号 | 30k 时为负或零 | 现已稳定 +0.001 |
+| Critic 质量 | Surrogate ≈ 7（未校准）| Surrogate ≈ 4（部分校准） |
+| Adam 矩估计 | 同样来自 lr=1e-5 历史 | 同样来自 lr=1e-5 历史 |
+| 额外收益 | 几乎没有 | — |
+
+**两者的 Adam moments 都是 lr=1e-5 下积累的，出发权重质量 54000 > 30000（Critic 更好、r_delta 已正），没有理由倒退。**
+
+### 最佳选择：从当前最新 checkpoint 续训 + 切换 Fixed lr
+
+```python
+learning_rate = 3e-5,
+schedule = "fixed",       # 彻底绕开死锁的 adaptive schedule
+is_full_resume = True,    # 保留 Adam 矩估计（方向有用，magnitude 会在几百轮内重适应）
+reset_lr_on_resume = False,  # fixed 模式下 lr 由配置直接控制，不需要 reset
+```
+
+`3e-5` 的理由：当前政策在 lr=1e-5 下已稳定 29000+ 轮，直接跳到 5e-4 会破坏已学到的保守行为；3e-5 是温和的 3× 提升，让 Adam moments 有时间重适应新梯度尺度后再考虑提高。
+
+是否需要我修改配置文件？
+
+---
+
+
+**Claude**
+
+## 为什么切换 Fixed Schedule 有效
+
+### 根本原因：移除了死锁的反馈闭环
+
+Adaptive schedule 是一个**闭环控制系统**，Fixed schedule 是**开环**：
+
+```
+Adaptive（当前）：
+  lr ──→ 更新策略 ──→ 计算 KL ──→ 调整 lr ──┐
+  └───────────────────────────────────────────┘
+  死锁：KL=3 > 0.46，每次都触发降速，lr 永远在 1e-5
+
+Fixed（修改后）：
+  lr=3e-5（固定）──→ 更新策略
+  KL 不再影响 lr，死锁条件根本不存在
+```
+
+---
+
+### 为什么 lr=3e-5 能带来学习
+
+**学习信号确实存在**：r_delta_per_step=+0.001 > 0，说明梯度方向是正确的，只是被 lr=1e-5 限制了步长。
+
+从 1e-5 到 3e-5，每次迭代的策略更新量提高 3×：
+```
+每轮有效更新 ∝ lr × 梯度 × 20步(5epoch×4mini-batch)
+
+lr=1e-5 时：更新量 X
+lr=3e-5 时：更新量 3X
+```
+
+---
+
+### 为什么不用更高的 lr
+
+这里有一个真实风险需要说明：
+
+KL 与 lr 大致成正比（Adam 归一化后每步 Δμ ∝ lr）：
+
+```
+lr=1e-5 时 KL≈3（已观测）
+lr=3e-5 时 KL≈9（预估）
+lr=1e-4 时 KL≈30（预估）
+```
+
+PPO 的 clip 范围是 ratio ∈ [0.8, 1.2]，对应安全 KL 大约 < 0.5。**KL=9 时大量样本会超出 clip 范围**，这些样本的梯度被截断，等于浪费了 rollout 数据，学习效率下降。
+
+但 KL=9 不会导致训练崩溃，因为：
+- clip 截断了最坏情况的策略退化
+- 未被截断的部分仍然提供有效梯度
+- Surrogate 已从 7 降到 4，说明 Critic 部分校准，advantages 不是纯噪声
+
+3e-5 是一个保守起点。如果训练稳定（Surrogate 继续下降，r_delta 上升），可以下一次续训时提高到 1e-4。
+
+---
+
+### 本质
+
+```
+问题不在于"梯度方向错了"
+问题在于"步子太小，adaptive schedule 让步子永远迈不大"
+
+Fixed lr = 强制给定步子大小，跳过有缺陷的步长控制器
+```
+
+---
+
+
+**Claude**
+
+验证三处修改都正确：
+
+---
+
+
+**Claude**
+
+修改完成。三处变更汇总：
+
+| 位置 | 修改前 | 修改后 |
+|---|---|---|
+| `student_checkpoint_path` | `model_46500.pt` | `model_54000.pt` |
+| `learning_rate` | `5.0e-4` | `3e-5` |
+| `schedule` | `"adaptive"` | `"fixed"` |
+
+`reset_lr_on_resume=True` 保留不变——它在 fixed 模式下同样起效，确保 load() 时 optimizer 里残留的 1e-5 被覆盖为配置的 3e-5。
+
+推送前确认一下服务器上 `model_54000.pt` 实际存在（save_interval=500，54374 轮时最新保存点应为 54000）。
+
+---

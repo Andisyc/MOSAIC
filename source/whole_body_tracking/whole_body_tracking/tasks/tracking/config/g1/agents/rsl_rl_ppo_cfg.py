@@ -179,8 +179,8 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
     # Checkpoint 路径（绝对路径，直接传给 runner.load()，绕过 log_root_path 拼接）
     # train.py 检测到 student_checkpoint_path 存在时优先使用，否则回退到 load_run/load_checkpoint 机制
     # is_full_resume=False → Stage 1 权重迁移（冷启动）; is_full_resume=True → Stage 2 断点续训
-    _s1 = Path("/home/yuxuancheng/MOSAIC/stage2/model_46500.pt")  # SUST_Main
-    _s2 = Path("/home/chengyuxuan/MOSAIC/stage2/model_46500.pt")  # Wujie_4090
+    _s1 = Path("/home/yuxuancheng/MOSAIC/stage2/model_54000.pt")  # SUST_Main
+    _s2 = Path("/home/chengyuxuan/MOSAIC/stage2/model_54000.pt")  # Wujie_4090
     student_checkpoint_path = _s1 if _s1.exists() else (_s2 if _s2.exists() else None)
 
     # ── 断点续训模式控制 ──────────────────────────────────────────────────────
@@ -192,11 +192,9 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
     #           适用于：首次从 Stage 1 checkpoint 启动 Stage 2
     is_full_resume: bool = True
 
-    # lr 重置：当 checkpoint 中的 lr 因 adaptive schedule 被压至下限（如 1e-5）时，
-    # 需要在续训时重置为配置初始值，否则 desired_kl 修复后 lr 仍需很多轮才能恢复。
-    # True  = 忽略 checkpoint lr，从配置的 learning_rate 重新开始
-    # False = 继承 checkpoint lr（正常断点续训，lr 未被崩溃时使用）
-    reset_lr_on_resume: bool = True
+    # lr 重置：schedule="fixed" 时 lr 由配置直接控制，无需 reset（固定值覆盖 checkpoint）。
+    # schedule="adaptive" 且 checkpoint lr 因 KL bug 被压至下限时才需要 True。
+    reset_lr_on_resume: bool = True  # fixed 模式下同样生效：确保 lr 从配置的 3e-5 开始
 
     # DR 课程：Stage 2 开始时 MotionPerturber 强度线性从 0 增长到 motion_perturbations 配置值。
     # 防止 FrontRES 在 Stage 2 冷启动时面对完全 OOD 的 q_ref，导致全负 r_delta → Δq=0 捷径陷阱。
@@ -279,13 +277,12 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
         use_clipped_value_loss=True,
         clip_param=0.2,              # 限制策略更新幅度
         entropy_coef=0.01,           # OOD 初始阶段需要足够探索：0.001 太小（梯度~0.001/σ），0.01 有效
-        learning_rate=5.0e-4,        # 微调必须用比从零训练更小的学习率
-        schedule="adaptive",
-        # desired_kl 必须按动作维度数缩放：KL 在 ppo.py 中用 torch.sum 对所有动作维度求和。
-        # G1 有 29 个自由度，RSL-RL 标准单维度目标 ≈ 0.008，故 desired_kl = 0.008 × 29 ≈ 0.23。
-        # 原值 0.008 等效单维目标 = 0.008/29 ≈ 0.00028，正常训练 KL ≈ 0.35/dim → 总 KL ≈ 10，
-        # 导致 adaptive schedule 每个 mini-batch 都触发降 lr，最终将 lr 永久压至下限 1e-5。
-        desired_kl=0.23,             # 29 DOF 校正后的目标（原 0.008 导致 lr 崩溃）
+        learning_rate=3e-5,          # 从 lr=1e-5 温和升至 3e-5（3×），避免破坏已有行为
+        schedule="fixed",            # 彻底绕开 adaptive schedule 死锁：
+                                     #   adaptive 在此系统的结构性最小 KL≈3 >> desired_kl=0.23，
+                                     #   闭环只降不升，lr 从第一天起永久压在 floor(1e-5)。
+                                     #   fixed 模式下 desired_kl 不生效，lr 由配置直接控制。
+        desired_kl=0.23,             # 保留作记录（fixed 模式下不生效）
         max_grad_norm=1.0,
 
         # --- FrontRES 正则化：防止修正量过大 ---
