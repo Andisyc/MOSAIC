@@ -9063,3 +9063,159 @@ Fixed lr = 强制给定步子大小，跳过有缺陷的步长控制器
 推送前确认一下服务器上 `model_54000.pt` 实际存在（save_interval=500，54374 轮时最新保存点应为 54000）。
 
 ---
+
+
+**User**
+
+现在我必须准备好对应的可视化代码RobotBridge，路径在C:\ArtiIntComVis\RobotBridge，首先我必须有一个可以修改动作序列的工具，能施加与训练中相同的域随机化，接着我会使用replay_npz.py可视化这段动作序列，确保从概念上GMT直接跟踪这段动作序列就会直接摔倒，然后我希望分别使用RobotBridge中的GMT和FrontRES+GMT跟踪这段动作序列，在Mujoco中可视化，三段可视化能直接展示FrontRES的有效性，请检查代码是否已经准备好
+
+---
+
+
+**Claude**
+
+先探索 RobotBridge 的整体结构。
+
+---
+
+
+**Claude**
+
+让我读几个关键文件补充细节。
+
+---
+
+
+**Claude**
+
+现在我有完整的信息了。以下是代码准备情况报告：
+
+---
+
+## 代码准备情况
+
+### 已确认的训练 DR 参数（来自 `tracking_env_cfg.py:1122-1129`）
+```python
+float_prob=0.3,      float_ratio=0.05   # 根节点上浮
+sink_prob=0.3,       sink_ratio=0.05    # 根节点下沉
+foot_slip_prob=0.2,  foot_slip_ratio=0.03  # 脚滑
+body_drag_prob=0.2,  body_drag_ratio=0.02  # 身体阻力
+```
+
+---
+
+### 四个目标的完成度
+
+| 目标 | 状态 | 说明 |
+|---|---|---|
+| **A. DR 扰动工具** | ❌ 不存在 | `MotionPerturber` 仅在 MOSAIC，依赖 Isaac Lab，无独立脚本 |
+| **B. replay_npz.py** | ❌ 不存在 | 基础设施齐全（Mujoco viewer、motion loader），但无纯回放脚本 |
+| **C. GMT 跟踪** | ✅ 完整 | `run.py --config-name=gmt` 可直接运行 |
+| **D. FrontRES+GMT 跟踪** | ❌ 不存在 | RobotBridge 中无 agent、env、config，全部需要新建 |
+
+---
+
+### 需要新建的文件
+
+**Goal A — `deploy/perturb_npz.py`**
+- 加载 .npz → 逐帧确定性地应用训练中相同的 DR 参数 → 保存新 .npz
+- MotionPerturber 逻辑需要从 MOSAIC 移植（去掉 Isaac Lab 依赖，改为 numpy）
+
+**Goal B — `deploy/replay_npz.py`**
+- 加载 .npz → 初始化 Mujoco → 逐帧 `set qpos from joint_pos` → 渲染
+- 无 policy，无 action，纯关节角度回放
+
+**Goal D — 三个新文件**
+```
+deploy/agents/frontres_agent.py   # 加载 FrontRES .pt + GMT .onnx，组合推理
+deploy/envs/frontres.py           # 继承 GMTEnv，在 GMT obs 中注入 Δq 修正
+deploy/config/frontres.yaml       # 主配置
+deploy/config/agent/frontres.yaml
+deploy/config/env/frontres.yaml
+```
+
+**FrontRES 推理流程：**
+```
+obs → FrontRES(obs) → Δq
+obs[q_ref_start:q_ref_start+29] += Δq   # 修改 q_ref
+modified_obs → GMT → actions
+```
+其中 `q_ref_start_idx=232`（与训练配置一致）。
+
+---
+
+**是否需要我依次实现这三个部分？建议顺序：B（replay）→ A（perturb）→ D（FrontRES），这样可以先验证回放通路，再验证扰动效果，最后接入 FrontRES。**
+
+---
+
+
+**Claude**
+
+现在有所有信息了。关键细节：
+- 训练 perturber 的锚点是 `torso_link`（body_names 中索引 7）
+- 脚部是 `left_ankle_roll_link`（子集索引 3）和 `right_ankle_roll_link`（子集索引 6）
+- 所有扰动都是对根节点的平移 → 应对 .npz 中**所有 30 个 body 同步偏移**以保持骨骼完整
+
+---
+
+
+**Claude**
+
+完成。三种典型用法：
+
+```bash
+# 1. Demo 模式：全程 0.5m 悬空（最直观，GMT 必然摔倒）
+python scripts/perturb_npz.py input.npz output_float.npz --float_height 0.5
+
+# 2. 训练完全相同的随机 DR（fixed seed 可复现）
+python scripts/perturb_npz.py input.npz output_train_dr.npz --seed 42
+
+# 3. 叠加：固定悬浮 + 随机扰动
+python scripts/perturb_npz.py input.npz output_combo.npz \
+    --float_height 0.3 --float_prob 0.5 --float_ratio 0.1 --seed 0
+```
+
+**设计要点：**
+- 所有扰动对全部 30 个 body **同步平移**，骨骼不变形
+- `body_lin_vel_w` 有意保持不变（与训练 MotionPerturber 一致，drag 只改 position 不改 velocity）
+- G1 默认足部索引 6（左）/ 12（右），`--auto_feet` 可自动检测最低 z 坐标的两个 body
+- `--no_stochastic` 配合 `--float_height` 可得到纯确定性输出
+
+---
+
+
+**User**
+
+请将perturb_npz.py修改成使用parser.add_argument("--motion_file")设置路径的方式，而不是直接读取命令行输入的方式，并且请参考训练中已经有的域随机化，大概在C:\ArtiIntComVis\MOSAIC\source\whole_body_tracking\whole_body_tracking\tasks\tracking\tracking_env_cfg.py文件中，注意是针对q_ref的域随机化，而不是针对Mujoco中机器人的域随机化
+
+---
+
+
+**Claude**
+
+参数已确认，和脚本默认值一致。现在修改参数风格并更新注释。
+
+---
+
+
+**Claude**
+
+完成。用法示例：
+
+```bash
+# Demo：整段序列悬浮 0.5m（最直观）
+python scripts/perturb_npz.py --motion_file dance.npz --float_height 0.5
+
+# 训练完全相同的随机 DR（与 tracking_env_cfg.py:1122-1129 一致）
+python scripts/perturb_npz.py --motion_file dance.npz --seed 42
+
+# 纯确定性悬浮（不加随机扰动）
+python scripts/perturb_npz.py --motion_file dance.npz \
+    --float_height 0.5 --no_stochastic
+
+# 输出路径自动推导为 dance_perturbed.npz（--output 省略时）
+```
+
+与 `replay_npz.py` 参数风格完全一致（`--motion_file`），可直接串联使用。
+
+---
