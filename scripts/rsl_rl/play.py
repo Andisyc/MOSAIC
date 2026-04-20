@@ -228,6 +228,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.events = None
         print("[INFO]: Disabled event manager for evaluation.")
 
+    # 关闭 q_ref 级别的 MotionPerturber（所有概率归零）
+    # play 时使用预扰动的 .npz，不需要运行时再叠加随机扰动
+    if hasattr(env_cfg, "motion_perturbations"):
+        from whole_body_tracking.tasks.tracking.mdp.motion_perturbations import MotionPerturbationCfg
+        env_cfg.motion_perturbations = MotionPerturbationCfg()
+        print("[INFO]: Zeroed motion_perturbations for evaluation.")
+
     # Disable time-out termination during play to allow continuous replay
     if hasattr(env_cfg, "terminations") and hasattr(env_cfg.terminations, "time_out"):
         print("[INFO]: Disabling timeout termination for playback run.")

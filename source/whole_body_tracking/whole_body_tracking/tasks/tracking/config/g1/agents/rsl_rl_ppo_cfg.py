@@ -179,8 +179,8 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
     # Checkpoint 路径（绝对路径，直接传给 runner.load()，绕过 log_root_path 拼接）
     # train.py 检测到 student_checkpoint_path 存在时优先使用，否则回退到 load_run/load_checkpoint 机制
     # is_full_resume=False → Stage 1 权重迁移（冷启动）; is_full_resume=True → Stage 2 断点续训
-    _s1 = Path("/home/yuxuancheng/MOSAIC/stage2/model_54000.pt")  # SUST_Main
-    _s2 = Path("/home/chengyuxuan/MOSAIC/stage2/model_54000.pt")  # Wujie_4090
+    _s1 = Path("/home/yuxuancheng/MOSAIC/stage2/model_58500.pt")  # SUST_Main
+    _s2 = Path("/home/chengyuxuan/MOSAIC/stage2/model_58500.pt")  # Wujie_4090
     student_checkpoint_path = _s1 if _s1.exists() else (_s2 if _s2.exists() else None)
 
     # ── 断点续训模式控制 ──────────────────────────────────────────────────────
@@ -202,6 +202,27 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
     dr_curriculum_iterations: int = 5000
     # Stage 2 起始绝对迭代数，用于 DR 课程进度计算，支持断点续训时正确恢复 DR 强度。
     stage2_start_iteration: int = _STAGE1_MAX_ITERATIONS
+
+    # 阶梯 DR 课程：初始课程完成后，自动按台阶递增扰动幅度直至 FrontRES 崩溃或训练结束。
+    # 工作原理：
+    #   监控 r_delta_per_step 的 EMA 斜率；当斜率趋近于零（平台期）且停留时间 ≥
+    #   dr_staircase_min_plateau_iters 时，自动以 dr_staircase_ramp_iters 线性爬坡
+    #   到下一台阶倍率，然后继续监控。
+    # 倍率列表（相对 motion_perturbations 基础值，仅缩放幅度 ratio，不改变概率 prob）：
+    #   例：float_ratio=0.05 × 1.6 → 0.08 m；× 2.4 → 0.12 m；× 3.6 → 0.18 m；× 5.0 → 0.25 m
+    # 设为空字符串 "" 禁用阶梯课程（只用初始 0→full 的单次课程）。
+    dr_staircase_multipliers: str = "1.6,2.4,3.6,5.0"
+    # 每次台阶切换时线性爬坡到新幅度的迭代数（过渡期，防止突变触发 Δq=0 捷径陷阱）
+    dr_staircase_ramp_iters: int = 2000
+    # 每台阶最短停留迭代数（短于此时间不触发晋级，避免噪声误判为平台期）
+    dr_staircase_min_plateau_iters: int = 3000
+    # EMA 斜率绝对值低于此阈值即判定为平台期（单位：r_delta/iter）
+    dr_staircase_plateau_threshold: float = 2e-7
+    # 断点续训时从第几个台阶开始（0 = 基础台阶；1 = 第一次晋级后，以此类推）
+    # 首次从旧 checkpoint (无 staircase 状态) 续训时设为 1：
+    #   跳过已确认饱和的 level 0 (float_ratio=0.05)，直接从 1.6× 爬坡开始。
+    # 后续续训由 checkpoint 自动恢复正确 level，此字段不再生效。
+    dr_staircase_start_level: int = 1
 
     # Critic 预热：禁用（=0）。
     #

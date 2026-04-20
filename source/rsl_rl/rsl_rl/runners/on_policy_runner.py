@@ -495,6 +495,70 @@ class OnPolicyRunner:
         else:
             _perturb_target = None
 
+        # Staircase DR: auto-advance perturbation magnitude after r_delta plateaus at each level.
+        # Activates only after the initial dr_curriculum_iterations ramp completes (dr_scale=1.0).
+        # Only ratio fields are scaled (float_ratio, sink_ratio, etc.); prob fields stay constant.
+        _staircase_mults_str = self.cfg.get("dr_staircase_multipliers", "")
+        _staircase_mults = (
+            [float(x) for x in _staircase_mults_str.split(",") if x.strip()]
+            if _staircase_mults_str else []
+        )
+        _staircase_ramp_iters   = int(self.cfg.get("dr_staircase_ramp_iters", 2000))
+        _staircase_min_plateau  = int(self.cfg.get("dr_staircase_min_plateau_iters", 3000))
+        _staircase_plateau_thr  = float(self.cfg.get("dr_staircase_plateau_threshold", 2e-7))
+        _staircase_start_level  = int(self.cfg.get("dr_staircase_start_level", 0))
+
+        _staircase_active = _is_frontres and len(_staircase_mults) > 0
+
+        # If staircase is active but _perturb_target was not set (dr_curriculum_iterations=0),
+        # fetch it directly so the staircase has a base to multiply against.
+        if _staircase_active and _perturb_target is None:
+            _env_raw_sc = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+            if hasattr(_env_raw_sc, 'cfg') and hasattr(_env_raw_sc.cfg, 'motion_perturbations'):
+                from types import SimpleNamespace as _NS_sc
+                _pt_sc = _env_raw_sc.cfg.motion_perturbations
+                _perturb_target = _NS_sc(
+                    float_prob=float(_pt_sc.float_prob),   float_ratio=float(_pt_sc.float_ratio),
+                    sink_prob=float(_pt_sc.sink_prob),     sink_ratio=float(_pt_sc.sink_ratio),
+                    foot_slip_prob=float(_pt_sc.foot_slip_prob), foot_slip_ratio=float(_pt_sc.foot_slip_ratio),
+                    body_drag_prob=float(_pt_sc.body_drag_prob), body_drag_ratio=float(_pt_sc.body_drag_ratio),
+                )
+            else:
+                _staircase_active = False
+
+        if _staircase_active:
+            # Priority for starting level/mult:
+            #   1. Checkpoint (self._staircase_level set by load()) — most accurate, handles all resumes
+            #   2. Config dr_staircase_start_level — manual override for old checkpoints
+            #   3. Default: level 0, mult 1.0 (fresh start)
+            if (hasattr(self, "_staircase_level") and self._staircase_level is not None
+                    and hasattr(self, "_staircase_cur_mult") and self._staircase_cur_mult is not None):
+                _staircase_level    = int(self._staircase_level)
+                _staircase_cur_mult = float(self._staircase_cur_mult)
+                _source = "checkpoint"
+            else:
+                _staircase_level    = _staircase_start_level
+                _staircase_cur_mult = (_staircase_mults[_staircase_level - 1]
+                                       if _staircase_level > 0 else 1.0)
+                _source = f"config (dr_staircase_start_level={_staircase_start_level})"
+
+            _staircase_prev_mult = _staircase_cur_mult
+            _staircase_is_ramping       = False
+            _staircase_ramp_start_iter  = start_iter
+            _staircase_at_level_since   = start_iter
+            _staircase_ema              = None
+            _staircase_ema_alpha        = 0.05
+            _staircase_ema_at_entry     = None
+            # Keep instance vars in sync so save() always writes the correct state
+            self._staircase_level    = _staircase_level
+            self._staircase_cur_mult = _staircase_cur_mult
+            print(
+                f"[Runner] Staircase DR enabled: {len(_staircase_mults)} levels "
+                f"(mults={_staircase_mults}), level={_staircase_level} [{_source}] "
+                f"(cur_mult={_staircase_cur_mult:.2f}x), "
+                f"ramp={_staircase_ramp_iters} iter, min_plateau={_staircase_min_plateau} iter"
+            )
+
         for it in range(start_iter, tot_iter):
             start = time.time()
 
@@ -545,6 +609,28 @@ class OnPolicyRunner:
                         _mcmd.perturber.cfg.foot_slip_ratio = _perturb_target.foot_slip_ratio * _dr_scale
                         _mcmd.perturber.cfg.body_drag_prob  = _perturb_target.body_drag_prob  * _dr_scale
                         _mcmd.perturber.cfg.body_drag_ratio = _perturb_target.body_drag_ratio * _dr_scale
+
+                        # Staircase override: once initial ramp completes (dr_scale=1.0),
+                        # scale ratios by the current staircase multiplier (ramp-interpolated).
+                        # Probabilities remain unchanged — only magnitudes grow.
+                        if _staircase_active and _dr_scale >= 1.0:
+                            if _staircase_is_ramping:
+                                ramp_t = min(1.0, (it - _staircase_ramp_start_iter)
+                                             / max(1, _staircase_ramp_iters))
+                                _cur_sc_mult = (_staircase_prev_mult
+                                                + ramp_t * (_staircase_mults[_staircase_level - 1]
+                                                            - _staircase_prev_mult))
+                                if ramp_t >= 1.0:
+                                    _staircase_is_ramping   = False
+                                    _staircase_cur_mult     = _staircase_mults[_staircase_level - 1]
+                                    _staircase_at_level_since = it
+                                    _staircase_ema_at_entry = _staircase_ema
+                            else:
+                                _cur_sc_mult = _staircase_cur_mult
+                            _mcmd.perturber.cfg.float_ratio     = _perturb_target.float_ratio     * _cur_sc_mult
+                            _mcmd.perturber.cfg.sink_ratio      = _perturb_target.sink_ratio      * _cur_sc_mult
+                            _mcmd.perturber.cfg.foot_slip_ratio = _perturb_target.foot_slip_ratio * _cur_sc_mult
+                            _mcmd.perturber.cfg.body_drag_ratio = _perturb_target.body_drag_ratio * _cur_sc_mult
 
             # FrontRES reward-shaping state: reset at the start of each rollout.
             _frontres_prev_delta_q: torch.Tensor | None = None  # [N, A] for smoothness penalty
@@ -827,6 +913,59 @@ class OnPolicyRunner:
             frontres_dr_scale            = (min(1.0, max(0.0, (it - _stage2_start) / max(1, _dr_curriculum_iters)))
                                             if _is_frontres and _dr_curriculum_iters > 0 else None)
 
+            # Staircase: update EMA and check for plateau (end-of-iteration, after r_delta is known)
+            _staircase_level_for_log = None
+            _staircase_mult_for_log  = None
+            if _staircase_active:
+                _initial_ramp_done = (
+                    _dr_curriculum_iters == 0 or
+                    (it - _stage2_start) >= _dr_curriculum_iters
+                )
+                if _initial_ramp_done:
+                    _staircase_level_for_log = _staircase_level
+                    _staircase_mult_for_log  = _staircase_cur_mult if not _staircase_is_ramping else (
+                        _staircase_prev_mult + min(1.0, (it - _staircase_ramp_start_iter)
+                                                   / max(1, _staircase_ramp_iters))
+                        * (_staircase_mults[_staircase_level - 1] - _staircase_prev_mult)
+                        if _staircase_level > 0 else 1.0
+                    )
+                    # Update EMA (only when not ramping — plateau detection is for stable periods)
+                    if not _staircase_is_ramping and frontres_rdelta_mean is not None:
+                        if _staircase_ema is None:
+                            _staircase_ema = frontres_rdelta_mean
+                            _staircase_ema_at_entry = frontres_rdelta_mean
+                        else:
+                            _staircase_ema = (_staircase_ema_alpha * frontres_rdelta_mean
+                                              + (1.0 - _staircase_ema_alpha) * _staircase_ema)
+                        # Plateau detection: check if EMA has barely moved since level entry
+                        iters_at_level = it - _staircase_at_level_since
+                        if (iters_at_level >= _staircase_min_plateau
+                                and _staircase_ema_at_entry is not None
+                                and _staircase_level < len(_staircase_mults)):
+                            ema_slope = abs(_staircase_ema - _staircase_ema_at_entry) / max(1, iters_at_level)
+                            if ema_slope < _staircase_plateau_thr:
+                                # Advance to next staircase level
+                                _staircase_prev_mult      = _staircase_cur_mult
+                                _staircase_level         += 1
+                                _staircase_ramp_start_iter = it
+                                _staircase_is_ramping     = True
+                                _staircase_ema_at_entry   = None
+                                new_ratio = _perturb_target.float_ratio * _staircase_mults[_staircase_level - 1]
+                                # Sync instance vars immediately so that if training is
+                                # interrupted during the ramp, the next resume starts
+                                # at this level (not the previous one).
+                                self._staircase_level    = _staircase_level
+                                self._staircase_cur_mult = _staircase_mults[_staircase_level - 1]
+                                print(
+                                    f"[Staircase] iter={it}  plateau detected "
+                                    f"(slope={ema_slope:.2e} < thr={_staircase_plateau_thr:.2e}).  "
+                                    f"Advancing to level {_staircase_level}/{len(_staircase_mults)}: "
+                                    f"mult {_staircase_prev_mult:.2f}x → "
+                                    f"{_staircase_mults[_staircase_level-1]:.2f}x  "
+                                    f"(float_ratio: {_perturb_target.float_ratio*_staircase_prev_mult:.3f} m → "
+                                    f"{new_ratio:.3f} m)"
+                                )
+
             # log info
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
@@ -941,6 +1080,12 @@ class OnPolicyRunner:
             if locs.get("frontres_dr_scale") is not None:
                 self.writer.add_scalar("Curriculum/dr_scale",
                                        locs["frontres_dr_scale"], locs["it"])
+            if locs.get("_staircase_level_for_log") is not None:
+                self.writer.add_scalar("Curriculum/staircase_level",
+                                       locs["_staircase_level_for_log"], locs["it"])
+            if locs.get("_staircase_mult_for_log") is not None:
+                self.writer.add_scalar("Curriculum/staircase_mult",
+                                       locs["_staircase_mult_for_log"], locs["it"])
 
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
@@ -1056,6 +1201,12 @@ class OnPolicyRunner:
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,}
+
+        # Persist staircase DR state so resume picks up at the correct level,
+        # not level-0. Saved as plain scalars — zero overhead.
+        if hasattr(self, "_staircase_level") and self._staircase_level is not None:
+            saved_dict["staircase_level"]    = self._staircase_level
+            saved_dict["staircase_cur_mult"] = self._staircase_cur_mult
         
         # -- Save RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
@@ -1267,6 +1418,17 @@ class OnPolicyRunner:
             if hasattr(self.privileged_obs_normalizer, 'until'):
                 self.privileged_obs_normalizer.until = self.privileged_obs_normalizer.count
             print(f"[Runner] Froze privileged_obs_normalizer (count={self.privileged_obs_normalizer.count})")
+
+        # Restore staircase DR state so resume starts at the correct level.
+        # If the checkpoint has no staircase_level (old checkpoint), defaults to None
+        # and learn() will fall back to dr_staircase_start_level from config.
+        self._staircase_level    = loaded_dict.get("staircase_level", None)
+        self._staircase_cur_mult = loaded_dict.get("staircase_cur_mult", None)
+        if self._staircase_level is not None:
+            print(f"[Runner] Staircase state restored from checkpoint: "
+                  f"level={self._staircase_level}, cur_mult={self._staircase_cur_mult:.3f}x")
+        else:
+            print("[Runner] No staircase state in checkpoint (old checkpoint or first run).")
 
         return loaded_dict["infos"]
 

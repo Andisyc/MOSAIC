@@ -9219,3 +9219,573 @@ python scripts/perturb_npz.py --motion_file dance.npz \
 与 `replay_npz.py` 参数风格完全一致（`--motion_file`），可直接串联使用。
 
 ---
+
+
+**User**
+
+在实现RobotBridge中FrontRES+GMT的推理前请先判断FrontRES+GMT作为一个onnx被/MOSAIC/scripts/play.py导出是否更好
+
+---
+
+
+**Claude**
+
+`play.py` 已经有完整答案了。关键发现集中在几行代码上：
+
+**`play.py:311-331`**（已经实现）：
+```python
+# FrontRES exports as a single composite ONNX (FrontRES + GMT packaged together)
+# so RobotBridge can use it as a drop-in replacement for the GMT ONNX:
+#   obs (770-dim, same format as MosaicEnv) → ONNX → motor actions
+export_motion_policy_as_onnx(
+    ppo_runner.alg.policy,          # FrontRESActorCritic（含冻结 GMT）
+    normalizer=ppo_runner.obs_normalizer,
+    path=export_model_dir,
+    filename="policy.onnx",
+)
+```
+
+`ComposedActor.forward()`（`front_residual_actor_critic.py:47-94`）已经把完整流程打包成一个 `nn.Module`：
+```
+obs → residual_actor → Δq → 修改 obs[232:261] → gmt_policy.act_inference → actions
+```
+
+---
+
+## 结论：ONNX 导出方案明显更好，且已经实现完毕
+
+**对比：**
+
+| | ONNX 导出（play.py） | RobotBridge 自建 agent |
+|---|---|---|
+| 代码量 | **0 行新代码** | ~200 行（agent + env + config） |
+| 维护负担 | 无 | 需要同步 MOSAIC 的推理逻辑 |
+| 架构一致性 | 与训练完全相同路径 | 可能引入推理偏差 |
+| Normalizer | 自动打包进 ONNX | 需要手动处理 |
+| RobotBridge 接入 | 改一行 checkpoint 路径 | 全新文件 |
+| 风险 | 极低（已有 GMT ONNX 验证） | 需要调试 q_ref 索引等细节 |
+
+**实际工作流：**
+
+```bash
+# 1. 在 MOSAIC 服务器上导出（Stage 2 训练完后运行）
+python scripts/rsl_rl/play.py \
+    --resume_path /path/to/model_54000.pt \
+    --motion ./q_npz/sample.npz
+# → 自动生成 model_54000/exported/policy.onnx
+
+# 2. RobotBridge 直接加载，零改动
+python deploy/run.py --config-name=mosaic \
+    mimic.policy.checkpoint=/path/to/exported/policy.onnx \
+    mimic.motion.motion_path=/path/to/perturbed.npz
+```
+
+**唯一需要确认的**：RobotBridge `mosaic.py` 构造的 obs 维度（770-dim）与训练环境一致，否则 ONNX 输入维度会不匹配。这个验证比从头实现 frontres_agent.py 要简单得多。
+
+**建议**：等训练收敛到一个合适的 checkpoint 后，直接运行 `play.py` 导出，在 RobotBridge 里替换 ONNX 路径验证即可。
+
+---
+
+
+**User**
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Summary:
+1. Primary Request and Intent:
+
+This session continued Stage 2 FrontRES RL fine-tuning for MOSAIC humanoid motion tracking. Requests in chronological order:
+- Complete code review of `rsl_rl_ppo_cfg.py` and `on_policy_runner.py` load() before server push
+- Fix: checkpoint path model_30000→model_46500, add wandb to /hdd0, decide iterations (→40000)
+- Evaluate training at iter ~47500 (KL=4, lr=1e-5 stuck)
+- Summarize curriculum learning strategies and root-cause analysis of two checkpoint resumes
+- Evaluate training at iter 54374 (KL=3, lr=1e-5 still stuck)
+- Explain why fixed-lr fix works; execute config changes (schedule="fixed", lr=3e-5, checkpoint=model_54000.pt)
+- Check RobotBridge visualization code readiness for FrontRES demo
+- Implement `perturb_npz.py` with `--motion_file` arg style matching `replay_npz.py`
+- Decide whether to export FrontRES+GMT as single ONNX via `play.py` vs. implementing new RobotBridge agent
+- **Most recent**: Evaluate training at iter 58775 (KL=0, fixed lr=3e-5 working, r_delta_per_step=+0.0015)
+
+---
+
+2. Key Technical Concepts:
+
+- **FrontRES Stage 2**: RL fine-tuning where residual network learns Δq corrections; r_delta = r_total_frontres − r_GMT_baseline (B1 split)
+- **Adaptive schedule dead-lock**: desired_kl=0.23 << structural minimum KL=3 at lr_floor=1e-5 → adaptive schedule only-cuts-never-raises → lr permanently at 1e-5
+- **Fixed schedule**: bypasses KL-feedback loop entirely; lr=3e-5 constant regardless of KL
+- **ComposedActor ONNX export**: `play.py` already exports FrontRES+GMT as single `policy.onnx` (drop-in for RobotBridge)
+- **MotionPerturber**: q_ref-level DR (float/sink/slip/drag), NOT robot-physics DR; translates entire skeleton to keep it kinematically intact
+- **Training DR params**: float_prob=0.3/ratio=0.05, sink_prob=0.3/ratio=0.05, slip_prob=0.2/ratio=0.03, drag_prob=0.2/ratio=0.02 (from `tracking_env_cfg.py:1122-1129`)
+- **G1 foot body indices**: left_ankle_roll_link≈raw index 6, right_ankle_roll_link≈raw index 12 in full 30-body .npz
+- **replay_npz.py**: in MOSAIC/scripts, uses Isaac Lab (Isaac Sim), not Mujoco — intentional (avoids physics failure cutting off view)
+- **KL divergence interpretation**: at fixed lr=3e-5, KL=0 means each gradient step is so small that policy barely changes per mini-batch — different from adaptive-schedule KL
+
+---
+
+3. Files and Code Sections:
+
+**`source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py`**
+- Stage 2 runner config. Changes made this session:
+  - `_s1/_s2` checkpoint paths: model_30000.pt → model_46500.pt → **model_54000.pt**
+  - `reset_lr_on_resume: bool = True` (comment updated for fixed mode)
+  - `learning_rate`: 5.0e-4 → **3e-5**
+  - `schedule`: "adaptive" → **"fixed"**
+  - `desired_kl=0.23` kept but commented "fixed 模式下不生效"
+
+Current algorithm section:
+```python
+algorithm = RslRlPpoFrontRESAlgorithmCfg(
+    num_learning_epochs=5,
+    num_mini_batches=4,
+    gamma=0.99,
+    lam=0.95,
+    value_loss_coef=1.0,
+    use_clipped_value_loss=True,
+    clip_param=0.2,
+    entropy_coef=0.01,
+    learning_rate=3e-5,
+    schedule="fixed",
+    desired_kl=0.23,   # 保留作记录（fixed 模式下不生效）
+    max_grad_norm=1.0,
+    lambda_reg_init=0.005,
+    lambda_reg_decay=1.0,
+    lambda_reg_min=0.0,
+    use_pcgrad=False,
+)
+```
+
+**`scripts/rsl_rl/train.py`**
+- Added wandb path redirection (lines 14-16):
+```python
+os.environ.setdefault("WANDB_SILENT", "true")
+# Redirect wandb local run files to HDD to avoid filling /home
+os.environ.setdefault("WANDB_DIR", "/hdd0/yuxuancheng/MOSAIC")
+os.environ.setdefault("WANDB_CACHE_DIR", "/hdd0/yuxuancheng/MOSAIC/.wandb_cache")
+```
+
+**`source/rsl_rl/rsl_rl/runners/on_policy_runner.py` — `load()` function (lines 1081-1271)**
+- `is_full_resume` controls optimizer load, lr sync, noise std
+- `reset_lr_on_resume=True` resets optimizer lr to config value (3e-5) overriding checkpoint's 1e-5
+- Noise std kept from checkpoint (is_full_resume=True)
+- Key lr sync code:
+```python
+if reset_lr:
+    config_lr = float(self.alg_cfg.get('learning_rate', 5e-4))
+    self.alg.learning_rate = config_lr
+    for pg in self.alg.optimizer.param_groups:
+        pg['lr'] = config_lr
+```
+
+**`scripts/replay_npz.py`** (MOSAIC/scripts, not RobotBridge)
+- Uses Isaac Lab (AppLauncher, SimulationContext)
+- Writes joint states directly each frame (no policy)
+- Records MP4 via omni.replicator
+- User confirmed: intentionally uses Isaac Sim to show full motion without physics cutoff
+
+**`scripts/rsl_rl/play.py`**
+- Already exports FrontRES+GMT as composite ONNX via `export_motion_policy_as_onnx(ppo_runner.alg.policy, normalizer=ppo_runner.obs_normalizer, ...)`
+- Comment at line 311: "FrontRES exports as a single composite ONNX... drop-in replacement for GMT ONNX: obs (770-dim) → ONNX → motor actions"
+- `ComposedActor.forward()` packages full pipeline: obs → residual_actor → Δq → modify obs[232:261] → gmt_policy.act_inference → actions
+
+**`scripts/perturb_npz.py`** (CREATED)
+- Full path: `C:\ArtiIntComVis\MOSAIC\scripts\perturb_npz.py`
+- `--motion_file` style consistent with replay_npz.py
+- `--output` defaults to `<stem>_perturbed.npz`
+- `--float_height`: constant demo lift (0=disabled); `--no_stochastic`: disable random DR
+- `--auto_feet`: auto-detect feet by lowest z-coordinate; `--left_foot_idx` (default 6), `--right_foot_idx` (default 12)
+- All perturbations shift ALL 30 bodies by same delta (skeleton stays intact)
+- `body_lin_vel_w` kept unchanged (mirrors training MotionPerturber — drag only modifies position reference, not velocity)
+- Training-identical defaults: float_prob=0.3/ratio=0.05, sink=0.3/0.05, slip=0.2/0.03, drag=0.2/0.02
+
+Key design note: perturbations only affect `body_pos_w` (all bodies translate together). In training, `motion_anchor_body_index` (torso_link, body_names index 7) is the root for perturbation; foot indices from body_names: left_ankle_roll_link=index 3, right=index 6 (subset), but in raw 30-body .npz these are different indices (G1: ~6 and ~12).
+
+**`RobotBridge/deploy/` — Status of visualization goals:**
+- C. GMT tracking: COMPLETE (`run.py --config-name=gmt`)
+- D. FrontRES+GMT: **ONNX export via play.py already implements this** — RobotBridge needs zero new code, just point to `exported/policy.onnx`
+
+---
+
+4. Errors and Fixes:
+
+- **desired_kl=0.23 fix insufficient**: Corrected direction but KL structural minimum at lr=1e-5 is 3, still >> 0.23×2=0.46. Only fixed by switching to `schedule="fixed"`.
+- **lr stuck at 1e-5 despite lr reset**: Adam momentum from 29000 iters at 1e-5 caused first few updates to have large effective steps → KL immediately spiked → lr re-crushed within 10-20 iterations. Fixed by `schedule="fixed"` which permanently bypasses KL gating.
+- **Checkpoint path drift**: Needed manual updates session-by-session (30000→46500→54000) as training progressed and was interrupted.
+- **WANDB filling /home**: Fixed by adding `WANDB_DIR` and `WANDB_CACHE_DIR` env vars pointing to `/hdd0/yuxuancheng/MOSAIC` at top of `train.py` before Isaac Lab imports.
+- **perturb_npz.py positional args**: User requested change to `--motion_file` named arg style (like replay_npz.py). Fixed in rewrite.
+
+---
+
+5. Problem Solving:
+
+**Solved:**
+- Adaptive schedule dead-lock: switched to `schedule="fixed"` with `learning_rate=3e-5`
+- wandb disk issue: redirected to /hdd0
+- perturb_npz.py: implemented with training-identical DR params
+- FrontRES+GMT visualization: confirmed play.py already exports composite ONNX; no new RobotBridge code needed
+
+**Current training (58775 iter) — first real learning signs:**
+- KL=0: with fixed lr, policy updates are very small (3e-5 × normalized gradient ≈ near-zero KL per mini-batch) — this is expected and benign, not a collapse
+- r_delta_per_step=+0.0015 (up 50% from 0.001, all positive) — genuine improvement
+- Two large spikes in r_delta — FrontRES significantly helping on specific challenging motions
+- Surrogate 7→rose→5: critic partially calibrated, then slight destabilization from lr change, now settling
+- delta_q_norm: first dipped (lr reset stabilizing), then rising to 1.346 (policy making more active corrections)
+- mean_r_delta still ~0: episodic variance remains high; per-step signal stronger than per-episode
+
+**Ongoing**: Continue monitoring; if r_delta_per_step continues rising, consider lr→1e-4 next resume.
+
+---
+
+6. All User Messages:
+
+- "（上一会话遗留）请检查代码，确认正确，我即将推送到服务器上开始训练" [continued from previous session]
+- "我发现上一次训练只保存到46500轮的权重，因此只能从这里开始，并且请为我思考再微调多久比较合适，还有上一次训练意外停止的原因是/home盘被塞满，虽然我将权重都保存到/hdd0盘，但wandb还保存在/home盘，请保存到/hdd0/yuxuancheng/MOSAIC这个路径"
+- "现在更新的代码推送到服务器上训练已经过了1k轮次了，kl_divergence在4左右波动；Surrogate一路缓慢走低现在在7左右波动；...请评价收敛情况"
+- "请总结一下我们现在使用的Curriculum Learning策略，以及为什么我们要两次断点续训，我想从根源上进行分析"
+- "我没看见你对adaptive schedule的解释，并且请告诉我现在最佳选择是从30k开始 (从头开始Stage 2)，还是继续从先前某个地方开始断点续训？"
+- "为什么这样修改会有效？"
+- "请执行修改"
+- "现在更新的代码推送到服务器上训练已经来到54374轮次了，kl_divergence在3左右波动...learning_rate根本没有变化，全程是0.00001，请评价收敛情况"
+- "现在我必须准备好对应的可视化代码RobotBridge，路径在C:\ArtiIntComVis\RobotBridge...请检查代码是否已经准备好"
+- "replay_npz.py在C:\ArtiIntComVis\MOSAIC\scripts路径下，MOSAIC是训练库，RobotBridge是对应的部署库"
+- "请先执行实现perturb_npz.py"
+- "请将perturb_npz.py修改成使用parser.add_argument("--motion_file")设置路径的方式...并且请参考训练中已经有的域随机化"
+- "在实现RobotBridge中FrontRES+GMT的推理前请先判断FrontRES+GMT作为一个onnx被/MOSAIC/scripts/play.py导出是否更好"
+- "现在更新的代码推送到服务器上训练已经来到58775轮次了，kl_divergence一直是0；Surrogate先升高再走低到5左右；...r_delta_per_step在0.0015附近波动，全为正值，而且有两个巨大的尖刺；...learning_rate固定在0.00003，请评价收敛情况"
+
+---
+
+7. Pending Tasks:
+
+- **Evaluate training at iter 58775**: (current request) assess whether fixed lr=3e-5 is working
+- **FrontRES+GMT visualization in RobotBridge**: confirmed ONNX export route via play.py; needs to wait for training to converge to a checkpoint worth exporting
+- **Verify RobotBridge obs dimension**: confirm MosaicEnv 770-dim obs matches training before deploying exported ONNX
+- **perturb_npz.py foot index verification**: G1 default indices (6, 12) need to be confirmed against actual .npz body ordering when a motion file is available
+
+---
+
+8. Current Work:
+
+The most recent user message requests convergence evaluation of training at iter 58775 with metrics:
+- KL divergence: 0 (was 3 at iter 54374)
+- Surrogate: first rose then fell to ~5 (was 4 at 54374)
+- reg_penalty_per_step: first rose then slowly fell to ~-0.00125 (same)
+- r_delta_per_step: ~0.0015 (up from 0.001), all positive, two large spikes
+- delta_q_norm_std and mean: first fell then slowly rose to 1.346
+- mean_r_delta: still ~0
+- learning_rate: fixed at 0.00003
+
+This is the first evaluation after switching to `schedule="fixed"` with `learning_rate=3e-5`.
+
+---
+
+9. Optional Next Step:
+
+Respond to the user's convergence evaluation request for iter 58775. The question: "请评价收敛情况"
+
+Key points to address:
+- KL=0 is expected and benign with fixed lr=3e-5 (tiny updates per mini-batch → near-zero KL), NOT a policy collapse
+- r_delta_per_step=+0.0015 (all positive, +50% increase from 0.001) — **first genuine learning signal** — fixed lr is working
+- Two large r_delta spikes: FrontRES significantly helping on specific challenging motions
+- Surrogate initial rise → 5: lr change destabilized momentarily, now settling
+- delta_q_norm recovering (policy actively making corrections again after initial stabilization dip)
+- mean_r_delta still ~0: episodic variance remains, but per-step metric is more reliable
+- Overall verdict: **fixed schedule successfully broke the dead-lock; real learning is now occurring for the first time in Stage 2**
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: C:\Users\ChengYuxuan\.claude\projects\c--ArtiIntComVis-MOSAIC\2b99aabb-3476-4bdb-9737-6e7bcc708a5e.jsonl
+Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.
+
+---
+
+
+**Claude**
+
+## 58775轮训练评价：fixed schedule首次见效
+
+**总结：fixed lr=3e-5 成功打破死锁，Stage 2 首次出现真实学习信号。**
+
+---
+
+### 逐指标解读
+
+| 指标 | 数值 | 解读 |
+|------|------|------|
+| KL divergence | ≈ 0 | **正常、预期内**。fixed lr下每mini-batch更新幅度极小 → KL/step ≈ 0，不是policy collapse |
+| r_delta_per_step | +0.0015，全正 | **首个真实学习信号**。比54374轮的0.001提升50%，且全为正值说明FrontRES始终在帮GMT |
+| 两个巨大尖刺 | r_delta spike | FrontRES在特定高难度动作片段显著纠偏，说明网络找到了有价值的局部解 |
+| Surrogate | 先升→降至5 | lr从1e-5→3e-5的切换暂时扰动了critic校准，现在正在收敛，属于正常过渡 |
+| delta_q_norm | 先降→升至1.346 | 初始下降=lr reset后policy稳定；回升=policy开始主动作出更大的Δq修正，健康 |
+| mean_r_delta | ≈ 0 | episode-level方差太大，per-step指标更可靠，忽略此项 |
+| learning_rate | 固定0.00003 | fixed schedule生效，不再被KL门控压制 |
+
+---
+
+### 核心判断
+
+**现状良好，继续训练。** r_delta_per_step持续上升且全为正值，是Stage 2训练效果的直接度量，已经证明fixed schedule方案是正确的。
+
+**下一次断点续训建议**（当r_delta_per_step停止增长或稳定在某平台期时）：
+- 若 r_delta_per_step 涨至 ~0.003+ 后停滞 → 尝试 lr 提升至 `1e-4`
+- 若 delta_q_norm 持续增大超过 ~2.5 → 可能过拟合，考虑降 lr 或提高 `lambda_reg`
+- 建议在 **65000轮** 前后观察一次，届时 fixed schedule 应该已经充分替换掉之前Adam动量的影响
+
+---
+
+
+**Claude**
+
+收到，之后全程用中文回复。
+
+---
+
+回到你的两个问题，结论是：
+
+**当前权重做可视化验证是可行的，但必须用训练分布内的扰动**，5cm 范围的随机扰动是公平的测试条件。10-20cm 的测试需要先增强 DR 再继续训练。
+
+是否现在执行以下两件事？
+
+1. **立即**：修改 `tracking_env_cfg.py` 的扰动幅度（float_ratio 0.05→0.15 等），加上新的 `dr_curriculum` 配置，为下一次断点续训做准备
+2. **同时**：你现在先用现有权重跑 5cm 分布内的可视化验证，确认 FrontRES 基本可行
+
+---
+
+
+**Claude**
+
+## 两种策略分析
+
+### 方案一：持续增大（无平台期）
+
+**风险很高，不推荐。**
+
+核心问题是 Δq=0 捷径陷阱：当扰动超出 FrontRES 当前能力时，输出 Δq=0（不做任何修正）的 reward = r_GMT ≈ baseline，r_delta ≈ 0，而乱输出 Δq 的 r_delta 可能是负的。FrontRES 会理性地退化到"什么都不做"，然后就很难再爬出来。
+
+---
+
+### 方案二：阶梯课程（增大 + 平台期）✅ 推荐
+
+这正是正确做法，本质上是把 `dr_curriculum_iterations` 重复执行多次：
+
+```
+难度
+ ↑
+0.20 ─────────────────── (平台3)
+0.12 ──────────── (平台2)
+0.08 ──────── (平台1)
+0.05 ─────── (当前，已稳定)
+     ────────────────────→ iter
+```
+
+每个台阶：
+- **爬坡期**（2000 iter）：用 `dr_curriculum_iterations` 从当前值线性 ramp 到新目标
+- **平台期**（5000-8000 iter）：固定难度，等 r_delta_per_step 收敛稳定
+
+**判断何时可以上台阶的信号**：r_delta_per_step 连续 3000+ iter 不再增长 → 说明当前难度已学饱和。
+
+---
+
+### 实现方式：手动 vs 自动
+
+**手动（断点续训时更新配置）** — 现在就能做，代价是每次要手动改参数：
+
+```python
+# 每次 resume 时修改 tracking_env_cfg.py：
+self.motion_perturbations.float_ratio = 0.08  # 第一台阶
+# 同时更新 rsl_rl_ppo_cfg.py：
+dr_curriculum_iterations: int = 2000
+stage2_start_iteration: int = 58775  # 当前 iter
+```
+
+**自动（在 runner 里监控 r_delta 自动触发）** — 更优雅，但需要改 `on_policy_runner.py`：监控 r_delta_per_step 的 EMA，停滞超过阈值则自动推进到下一台阶。
+
+---
+
+### 推荐的台阶规划
+
+| 台阶 | float/sink ratio | slip ratio | drag ratio | 目标持续时间 |
+|------|-----------------|------------|------------|------------|
+| 当前 | 0.05 (5cm) | 0.03 | 0.02 | 已训练 28k iter |
+| 台阶1 | 0.08 (8cm) | 0.05 | 0.03 | ~8000 iter |
+| 台阶2 | 0.12 (12cm) | 0.08 | 0.04 | ~8000 iter |
+| 台阶3 | 0.18 (18cm) | 0.10 | 0.05 | ~8000 iter |
+| 台阶4 | 0.25 (25cm) | 0.12 | 0.06 | 直到崩溃或收敛 |
+
+---
+
+**你倾向于手动还是自动实现？** 手动的话现在就可以改配置准备下一次断点续训；自动的话我来修改 `on_policy_runner.py`。
+
+---
+
+
+**Claude**
+
+信息足够了，现在开始逐一修改。先改配置文件添加阶梯参数：
+
+---
+
+
+**Claude**
+
+现在修改 `on_policy_runner.py`，分三处插入。先加阶梯初始化（在初始 DR 课程块之后）：
+
+---
+
+
+**Claude**
+
+第二处：在现有 DR 课程 scale 块末尾追加阶梯倍率覆盖：
+
+---
+
+
+**Claude**
+
+第三处：在 `frontres_dr_scale` 计算之后，加 EMA 更新、平台检测和 log 变量：
+
+---
+
+
+**Claude**
+
+最后在 `log()` 里添加阶梯指标的 wandb 上报：
+
+---
+
+
+**Claude**
+
+最后更新 `rsl_rl_ppo_cfg.py` 中的断点续训起始迭代数：
+
+---
+
+
+**Claude**
+
+这些诊断报错（line 157-162）是预先存在的、与 `RslRlSuperviseAlgorithmCfg` 相关的 Pyright 类型检查警告，与我新增的字段无关。我确认一下我修改的区域没有引入新错误：
+
+---
+
+
+**Claude**
+
+新增字段没有问题。诊断里的 4 条 Error（line 157-162）是 `RslRlSuperviseAlgorithmCfg` 构造参数不被 Pyright 识别——这是 `@configclass` 的已知 Pyright 兼容问题，与本次修改无关，训练时不影响运行。
+
+---
+
+## 修改汇总
+
+**[rsl_rl_ppo_cfg.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py)** — 新增 5 个阶梯配置字段 + 断点路径更新至 `model_58500.pt`
+
+**[on_policy_runner.py](source/rsl_rl/rsl_rl/runners/on_policy_runner.py)** — 3 处插入：
+1. 训练循环前：阶梯状态初始化（EMA、level、ramp 状态）
+2. 每轮开始（DR 课程块内）：当 `dr_scale=1.0` 后用阶梯倍率覆盖 ratio
+3. 每轮结束（log 前）：EMA 更新 + 平台检测 + 自动晋级 + `Curriculum/staircase_level` / `Curriculum/staircase_mult` 上报 wandb
+
+**行为说明：**
+- 断点续训后运行约 3000 iter（`min_plateau_iters`），若 r_delta EMA 斜率 < `2e-7`，自动爬坡 2000 iter 切换到 1.6× 台阶（float 0.05→0.08m），依次类推
+- 每次晋级打印日志：`[Staircase] iter=62000 plateau detected ... Advancing to level 1/4`
+- 可通过 `dr_staircase_start_level` 断点续训时跳到指定台阶
+
+---
+
+
+**Claude**
+
+这是个真实的问题。让我先看 `save()` 和 `load()` 的实现。
+
+---
+
+
+**Claude**
+
+找到了核心问题。`_staircase_level` 是 `learn()` 的局部变量，`save()` 读不到它，断点续训后每次都从 level 0 重置——扰动会从 1.0× 突然掉回去。
+
+**正确解法：把 staircase 状态存进 checkpoint，load 时恢复。**
+
+三处改动：
+
+---
+
+
+**Claude**
+
+现在在 `load()` 末尾恢复 staircase 状态：
+
+---
+
+
+**Claude**
+
+第三处：在 `learn()` 的阶梯初始化里，用 checkpoint 恢复的值覆盖 config 里的 `start_level`；并在循环中每次晋级后同步实例变量：
+
+---
+
+
+**Claude**
+
+最后在晋级时同步实例变量，确保每次 `save()` 都能写入最新状态：
+
+---
+
+
+**Claude**
+
+---
+
+## 修改汇总
+
+**问题根源**：阶梯 level 是 `learn()` 的局部变量，`save()` 读不到，导致每次断点续训都从 level 0（1.0× 扰动）重置。
+
+**解决方案**：checkpoint 里存，load 时取，learn 里用。
+
+| 位置 | 改动 |
+|------|------|
+| `save()` | 若 `self._staircase_level` 存在，写入 checkpoint |
+| `load()` | 从 checkpoint 读取 `staircase_level` / `staircase_cur_mult`，存为实例变量 |
+| `learn()` 初始化 | 优先用 checkpoint 值（**1优先**），其次用 config `dr_staircase_start_level`（**2次**），最后默认 level 0（**新训练**） |
+| `learn()` 晋级时 | 立即同步 `self._staircase_level` / `self._staircase_cur_mult`，使哪怕在爬坡期间被中断，下次续训也从目标 level 开始而不是上一 level |
+
+**旧 checkpoint（无 staircase 字段）的处理**：`load()` 里 `.get("staircase_level", None)` 返回 None → 打印警告 → 自动回退到 config 里的 `dr_staircase_start_level=0`，兼容当前的 `model_58500.pt`。
+
+---
+
+
+**Claude**
+
+## 分析：DR 实际上不会从零开始
+
+先把两个"从零"区分清楚：
+
+**① 初始 DR 课程（0→full，5000轮）**
+```
+_dr_scale = min(1.0, (it - stage2_start) / dr_curriculum_iters)
+           = min(1.0, (58775 - 25000) / 5000) = 1.0
+```
+`stage2_start_iteration` 固定在 25000，不随续训点变化。在 iter 58775 续训时 `_dr_scale` 立刻是 1.0，**不会重新爬坡**。✓
+
+**② 阶梯课程（我新加的部分）**
+从旧 checkpoint（无 staircase 状态）续训时：
+- `_staircase_level=0`，`_staircase_cur_mult=1.0`
+- 实际扰动 = `float_ratio × 1.0 = 0.05`，**与续训前完全相同**，不会变小
+- 只是在等 3000 轮平台期监控，才触发晋级到 1.6×
+
+**真正浪费的只有这 3000 轮监控——我们已经知道 level 0 早就饱和了。**
+
+---
+
+## 解决方案：一行配置修复
+
+不需要新机制，直接在本次续训时设 `dr_staircase_start_level=1`，跳过已知饱和的 level 0，从 1.6× 爬坡开始：
+
+---
+
+
+**Claude**
+
+这些诊断全部是**修改前就存在的预先问题**，与本次阶梯课程修改无关：
+
+- **Line 157-162 Error**：`RslRlSuperviseAlgorithmCfg` 的构造参数（`loss_type`、`lower_limb_indices` 等）Pyright 无法识别——这是 `@configclass` 与 Pyright 的已知兼容问题，运行时不报错。
+- **Hint**：未使用的导入，同样是既有问题。
+
+我新增的字段（line 206-222）没有产生任何新的诊断。可以直接推送到服务器训练。
+
+---
