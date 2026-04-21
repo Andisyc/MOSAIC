@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import statistics
 import time
@@ -272,12 +273,14 @@ class OnPolicyRunner:
                 teacher_obs_shape=[num_teacher_obs] if num_teacher_obs is not None else None,
                 ref_vel_estimator_obs_shape=[num_ref_vel_estimator_obs] if self.ref_vel_estimator_obs_type is not None else None,)
         elif self.training_type == "supervise":
+            # action_shape must match the supervision target dim (num_privileged_obs),
+            # NOT self.env.num_actions (robot DOFs). The target is [Δq(29), Δz(1)] = 30 dims.
             self.alg.init_storage(
                 self.env.num_envs,
                 self.num_steps_per_env,
                 [num_obs],
                 [num_privileged_obs],
-                [self.env.num_actions],)
+                [num_privileged_obs],)
         else:
             self.alg.init_storage(
                 self.training_type,
@@ -465,33 +468,39 @@ class OnPolicyRunner:
         #   resume at 30000: stage2_start=25000 → progress=5000 → scale correctly reflects elapsed ✓
         _dr_curriculum_iters = int(self.cfg.get("dr_curriculum_iterations", 0))
         _stage2_start        = int(self.cfg.get("stage2_start_iteration", start_iter))
+        # DR schedule shape: "linear" | "exp" | "sqrt"
+        # exp:  dr_scale = 1 − exp(−t/τ), τ = dr_curriculum_iters/3 → 95% at t=dr_curriculum_iters
+        # sqrt: dr_scale = sqrt(t/T_max) → rapid early rise, gentle plateau
+        # linear: dr_scale = t/T_max (original)
+        _dr_schedule_type = self.cfg.get("dr_schedule_type", "linear")
         if _is_frontres and _dr_curriculum_iters > 0:
             _env_raw = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
             if hasattr(_env_raw, 'cfg') and hasattr(_env_raw.cfg, 'motion_perturbations'):
-                # IMPORTANT: store a VALUE COPY (SimpleNamespace), NOT a reference.
-                # MotionPerturber stores cfg by reference (self.cfg = cfg in __init__), so
-                # _mcmd.perturber.cfg IS env.cfg.motion_perturbations — the same object.
-                # Writing _mcmd.perturber.cfg.float_prob would corrupt _perturb_target on
-                # the next iteration if we stored a reference instead of a copy.
                 from types import SimpleNamespace as _NS
                 _pt = _env_raw.cfg.motion_perturbations
                 _perturb_target = _NS(
-                    float_prob=float(_pt.float_prob),
-                    float_ratio=float(_pt.float_ratio),
-                    sink_prob=float(_pt.sink_prob),
-                    sink_ratio=float(_pt.sink_ratio),
-                    foot_slip_prob=float(_pt.foot_slip_prob),
-                    foot_slip_ratio=float(_pt.foot_slip_ratio),
-                    body_drag_prob=float(_pt.body_drag_prob),
-                    body_drag_ratio=float(_pt.body_drag_ratio),
+                    float_prob        = float(_pt.float_prob),
+                    float_ratio       = float(_pt.float_ratio),
+                    sink_prob         = float(_pt.sink_prob),
+                    sink_ratio        = float(_pt.sink_ratio),
+                    foot_slip_prob    = float(_pt.foot_slip_prob),
+                    foot_slip_ratio   = float(_pt.foot_slip_ratio),
+                    body_drag_prob    = float(_pt.body_drag_prob),
+                    body_drag_ratio   = float(_pt.body_drag_ratio),
+                    root_tilt_prob    = float(getattr(_pt, 'root_tilt_prob',    0.0)),
+                    root_tilt_max_rad = float(getattr(_pt, 'root_tilt_max_rad', 0.0)),
+                    joint_noise_prob  = float(getattr(_pt, 'joint_noise_prob',  0.0)),
+                    joint_noise_std   = float(getattr(_pt, 'joint_noise_std',   0.0)),
                 )
-                print(f"[Runner] DR curriculum enabled: 0 → full over {_dr_curriculum_iters} Stage-2 iter "
+                print(f"[Runner] DR curriculum enabled ({_dr_schedule_type}): "
+                      f"0 → full over {_dr_curriculum_iters} Stage-2 iter "
                       f"(stage2_start={_stage2_start}, "
-                      f"float_prob_max={_perturb_target.float_prob:.2f}, "
-                      f"slip_prob_max={_perturb_target.foot_slip_prob:.2f})")
+                      f"float_prob={_perturb_target.float_prob:.2f}, "
+                      f"root_tilt_max={_perturb_target.root_tilt_max_rad:.3f}rad, "
+                      f"joint_noise_std={_perturb_target.joint_noise_std:.3f}rad)")
             else:
                 _perturb_target = None
-                print("[Runner] WARNING: dr_curriculum_iterations > 0 but env.cfg.motion_perturbations not found — DR curriculum disabled")
+                print("[Runner] WARNING: dr_curriculum_iterations > 0 but env.cfg.motion_perturbations not found")
         else:
             _perturb_target = None
 
@@ -596,23 +605,37 @@ class OnPolicyRunner:
             # Runs every iteration so the perturber ramps smoothly without needing a reset hook.
             if _is_frontres and _perturb_target is not None:
                 _stage2_progress = it - _stage2_start
-                _dr_scale = min(1.0, max(0.0, _stage2_progress / max(1, _dr_curriculum_iters)))
+                # --- DR schedule (steeper than linear) ---
+                if _dr_schedule_type == "exp":
+                    # Exponential: τ = T/3 → 95% reached at t = T (3τ)
+                    _tau = max(1.0, _dr_curriculum_iters / 3.0)
+                    _dr_scale = float(min(1.0, 1.0 - math.exp(-_stage2_progress / _tau)))
+                elif _dr_schedule_type == "sqrt":
+                    # Square-root: rapid early rise, slow final stretch
+                    _dr_scale = float(min(1.0, (_stage2_progress / max(1, _dr_curriculum_iters)) ** 0.5))
+                else:  # "linear"
+                    _dr_scale = float(min(1.0, max(0.0, _stage2_progress / max(1, _dr_curriculum_iters))))
+
                 _env_raw = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
                 if hasattr(_env_raw, 'command_manager') and 'motion' in _env_raw.command_manager._terms:
                     _mcmd = _env_raw.command_manager._terms['motion']
                     if hasattr(_mcmd, 'perturber'):
-                        _mcmd.perturber.cfg.float_prob      = _perturb_target.float_prob      * _dr_scale
-                        _mcmd.perturber.cfg.float_ratio     = _perturb_target.float_ratio     * _dr_scale
-                        _mcmd.perturber.cfg.sink_prob       = _perturb_target.sink_prob       * _dr_scale
-                        _mcmd.perturber.cfg.sink_ratio      = _perturb_target.sink_ratio      * _dr_scale
-                        _mcmd.perturber.cfg.foot_slip_prob  = _perturb_target.foot_slip_prob  * _dr_scale
-                        _mcmd.perturber.cfg.foot_slip_ratio = _perturb_target.foot_slip_ratio * _dr_scale
-                        _mcmd.perturber.cfg.body_drag_prob  = _perturb_target.body_drag_prob  * _dr_scale
-                        _mcmd.perturber.cfg.body_drag_ratio = _perturb_target.body_drag_ratio * _dr_scale
+                        # Classic perturbations (float/sink/slip/drag)
+                        _mcmd.perturber.cfg.float_prob        = _perturb_target.float_prob        * _dr_scale
+                        _mcmd.perturber.cfg.float_ratio       = _perturb_target.float_ratio       * _dr_scale
+                        _mcmd.perturber.cfg.sink_prob         = _perturb_target.sink_prob         * _dr_scale
+                        _mcmd.perturber.cfg.sink_ratio        = _perturb_target.sink_ratio        * _dr_scale
+                        _mcmd.perturber.cfg.foot_slip_prob    = _perturb_target.foot_slip_prob    * _dr_scale
+                        _mcmd.perturber.cfg.foot_slip_ratio   = _perturb_target.foot_slip_ratio   * _dr_scale
+                        _mcmd.perturber.cfg.body_drag_prob    = _perturb_target.body_drag_prob    * _dr_scale
+                        _mcmd.perturber.cfg.body_drag_ratio   = _perturb_target.body_drag_ratio   * _dr_scale
+                        # New perturbations: root tilt + joint noise
+                        _mcmd.perturber.cfg.root_tilt_prob    = _perturb_target.root_tilt_prob    * _dr_scale
+                        _mcmd.perturber.cfg.root_tilt_max_rad = _perturb_target.root_tilt_max_rad * _dr_scale
+                        _mcmd.perturber.cfg.joint_noise_prob  = _perturb_target.joint_noise_prob  * _dr_scale
+                        _mcmd.perturber.cfg.joint_noise_std   = _perturb_target.joint_noise_std   * _dr_scale
 
-                        # Staircase override: once initial ramp completes (dr_scale=1.0),
-                        # scale ratios by the current staircase multiplier (ramp-interpolated).
-                        # Probabilities remain unchanged — only magnitudes grow.
+                        # Staircase override (legacy, active only if dr_staircase_multipliers != "")
                         if _staircase_active and _dr_scale >= 1.0:
                             if _staircase_is_ramping:
                                 ramp_t = min(1.0, (it - _staircase_ramp_start_iter)
@@ -635,11 +658,12 @@ class OnPolicyRunner:
             # FrontRES reward-shaping state: reset at the start of each rollout.
             _frontres_prev_delta_q: torch.Tensor | None = None  # [N, A] for smoothness penalty
             # Accumulators for wandb logging (per iteration, divided by shaping steps)
-            _frontres_rdelta_sum:        float = 0.0   # mean r_delta across FrontRES envs per step
-            _frontres_baseline_sum:      float = 0.0   # mean GMT baseline per step
+            _frontres_rdelta_sum:         float = 0.0
+            _frontres_baseline_sum:       float = 0.0
             _frontres_smooth_penalty_sum: float = 0.0
-            _frontres_reg_penalty_sum:   float = 0.0   # mean lambda_reg penalty per step
-            _frontres_shaping_steps:     int   = 0
+            _frontres_reg_penalty_sum:    float = 0.0
+            _frontres_delta_z_abs_sum:    float = 0.0   # mean |Δz| per step (diagnostic)
+            _frontres_shaping_steps:      int   = 0
             # lambda_reg shaping: only activate after DR curriculum completes.
             # Rationale: during ramp-up, reg pushing Δq→0 would reinforce the no-op shortcut trap
             # before the Actor has had any chance to discover effective corrections.
@@ -786,6 +810,10 @@ class OnPolicyRunner:
                         # Logging accumulators
                         _frontres_rdelta_sum   += r_delta.mean().item()
                         _frontres_baseline_sum += r_base.item()
+                        # Δz diagnostic: log mean absolute z-correction per step
+                        _dz = getattr(self.alg.policy, 'last_delta_z', None)
+                        if _dz is not None:
+                            _frontres_delta_z_abs_sum += _dz.abs().mean().item()
                         _frontres_shaping_steps += 1
 
                         # Update prev_delta_q for smoothness tracking (all N envs)
@@ -910,8 +938,20 @@ class OnPolicyRunner:
                                             if _is_frontres and _frontres_shaping_steps > 0 else None)
             frontres_reg_penalty_mean    = (_frontres_reg_penalty_sum / _frontres_shaping_steps
                                             if _is_frontres and _frontres_shaping_steps > 0 else None)
-            frontres_dr_scale            = (min(1.0, max(0.0, (it - _stage2_start) / max(1, _dr_curriculum_iters)))
-                                            if _is_frontres and _dr_curriculum_iters > 0 else None)
+            frontres_delta_z_abs_mean    = (_frontres_delta_z_abs_sum / _frontres_shaping_steps
+                                            if _is_frontres and _frontres_shaping_steps > 0 else None)
+            # DR scale: mirror the schedule computed inside the rollout loop
+            if _is_frontres and _dr_curriculum_iters > 0:
+                _log_progress = it - _stage2_start
+                if _dr_schedule_type == "exp":
+                    _log_tau = max(1.0, _dr_curriculum_iters / 3.0)
+                    frontres_dr_scale = float(min(1.0, 1.0 - math.exp(-_log_progress / _log_tau)))
+                elif _dr_schedule_type == "sqrt":
+                    frontres_dr_scale = float(min(1.0, (_log_progress / max(1, _dr_curriculum_iters)) ** 0.5))
+                else:
+                    frontres_dr_scale = float(min(1.0, max(0.0, _log_progress / max(1, _dr_curriculum_iters))))
+            else:
+                frontres_dr_scale = None
 
             # Staircase: update EMA and check for plateau (end-of-iteration, after r_delta is known)
             _staircase_level_for_log = None
@@ -1046,8 +1086,11 @@ class OnPolicyRunner:
 
         # -- Losses (reclassify FrontRES diagnostics out of Loss/ into FrontRES/)
         _frontres_diag_keys = {"delta_q_norm_mean", "delta_q_norm_std", "smooth_metric", "lambda_reg"}
+        _stage1_dz_keys     = {"loss_dz", "dz_pred_abs", "dz_gt_abs", "dz_mae"}
         for key, value in locs["loss_dict"].items():
-            if isinstance(self.alg.policy, FrontRESActorCritic) and key in _frontres_diag_keys:
+            if self.training_type == "supervise" and key in _stage1_dz_keys:
+                self.writer.add_scalar(f"Stage1/DeltaZ/{key}", value, locs["it"])
+            elif isinstance(self.alg.policy, FrontRESActorCritic) and key in _frontres_diag_keys:
                 self.writer.add_scalar(f"FrontRES/{key}", value, locs["it"])
             else:
                 self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
@@ -1080,6 +1123,9 @@ class OnPolicyRunner:
             if locs.get("frontres_dr_scale") is not None:
                 self.writer.add_scalar("Curriculum/dr_scale",
                                        locs["frontres_dr_scale"], locs["it"])
+            if locs.get("frontres_delta_z_abs_mean") is not None:
+                self.writer.add_scalar("FrontRES/delta_z_abs_mean",
+                                       locs["frontres_delta_z_abs_mean"], locs["it"])
             if locs.get("_staircase_level_for_log") is not None:
                 self.writer.add_scalar("Curriculum/staircase_level",
                                        locs["_staircase_level_for_log"], locs["it"])

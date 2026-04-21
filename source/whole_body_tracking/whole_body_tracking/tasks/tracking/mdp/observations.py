@@ -126,19 +126,37 @@ def selected_keypoints_pos_w_heading(
 
 def get_supervision_target_delta_q(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     """
-    Computes the supervision target delta_q = q_sim - q_ref and stores it in the extras dictionary.
-    
-    This function is intended to be used as a "dummy" observation term to ensure that the
-    ground truth for the supervised learning is computed every step and passed out
-    via the infos dictionary.
+    Computes the supervision target delta_q = q_ref - q_sim.
+    Kept for backward compatibility. New code should use get_supervision_target_delta_q_z.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
-    
-    # q_ref: reference joint positions from the motion data
     q_ref = command.joint_pos
-    
-    # q_sim: simulated joint positions from the robot asset
     q_sim = command.robot_joint_pos
-    
-    delta_q_gt = q_ref - q_sim
-    return delta_q_gt
+    return q_ref - q_sim
+
+
+def get_supervision_target_delta_q_z(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """
+    Computes combined supervision target [delta_q (29), delta_z (1)] for FrontRES Stage 1.
+
+    delta_q = q_ref - q_sim   — joint angle corrections (rad), shape (N, 29)
+    delta_z = z_sim - z_ref   — root z correction (m),        shape (N, 1)
+
+    Sign convention for delta_z matches the Stage 2 application:
+      anchor_z_corrected = anchor_z + delta_z
+    We want the corrected reference to reach the robot, so delta_z = z_sim - z_ref.
+    Negative delta_z means the reference is floating above the robot (float artifact).
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+
+    q_ref = command.joint_pos       # (N, 29) reference joint positions
+    q_sim = command.robot_joint_pos # (N, 29) simulated joint positions
+    delta_q_gt = q_ref - q_sim      # (N, 29)
+
+    # anchor_pos_w already includes env_origins; root_pos_w is also world-frame
+    # → env_origins cancel in the difference
+    z_ref = command.anchor_pos_w[:, 2:3]                   # (N, 1) world z of reference
+    z_sim = command.robot.data.root_pos_w[:, 2:3]          # (N, 1) world z of robot
+    delta_z_gt = z_sim - z_ref                             # (N, 1) negative when ref floats above robot
+
+    return torch.cat([delta_q_gt, delta_z_gt], dim=-1)     # (N, 30)

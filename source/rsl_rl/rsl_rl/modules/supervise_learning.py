@@ -44,20 +44,22 @@ class SuperviseLearning(nn.Module):
 
     def __init__(
         self,
-        num_actor_obs,    # 对应工厂模式传入的 policy 观测维度
-        num_critic_obs,   # 对应工厂模式传入的 critic 观测维度
-        num_actions,      # Δq dim
+        num_actor_obs,          # 对应工厂模式传入的 policy 观测维度
+        num_critic_obs,         # 对应工厂模式传入的 critic 观测维度
+        num_actions,            # Δq dim (= robot joint DOFs, e.g. 29 for G1)
         student_hidden_dims=[256, 256, 256],
         activation="elu",
-        gmt_path: str = None,  # Path to load the ONNX model
+        gmt_path: str = None,   # Path to GMT .pt checkpoint
+        num_z_outputs: int = 0, # Additional Δz outputs appended after Δq; 1 → output is [Δq(29), Δz(1)]
         **kwargs,
     ):
         """
         Args:
             num_actor_obs (int): input dim of FrontRES
             num_critic_obs (int): unused
-            num_actions (int): output dim of FrontRES
-            gmt_path (str): GMT ONNX
+            num_actions (int): number of joint Δq outputs (= robot DOFs)
+            gmt_path (str): path to frozen GMT .pt checkpoint
+            num_z_outputs (int): number of auxiliary z-correction outputs (0 = legacy behaviour)
         """
         if kwargs:
             print(
@@ -150,17 +152,22 @@ class SuperviseLearning(nn.Module):
                 print("[SuperviseLearning] WARNING: no obs_norm_state_dict in GMT checkpoint")
 
         # ========== student (FrontRES 网络) ==========
-        student_layers = [] # 这个 MLP 就是学习预测残差Δq的学生网络
+        self.num_actions = num_actions
+        self.num_z_outputs = num_z_outputs
+        total_output_dim = num_actions + num_z_outputs  # e.g. 29 + 1 = 30
+
+        student_layers = []
         student_layers.append(nn.Linear(num_actor_obs, student_hidden_dims[0]))
         student_layers.append(activation)
         for layer_index in range(len(student_hidden_dims)):
             if layer_index == len(student_hidden_dims) - 1:
-                student_layers.append(nn.Linear(student_hidden_dims[layer_index], num_actions))
+                student_layers.append(nn.Linear(student_hidden_dims[layer_index], total_output_dim))
             else:
                 student_layers.append(nn.Linear(student_hidden_dims[layer_index], student_hidden_dims[layer_index + 1]))
                 student_layers.append(activation)
         self.student = nn.Sequential(*student_layers)
 
+        print(f"[SuperviseLearning] Student MLP output: {num_actions} Δq + {num_z_outputs} Δz = {total_output_dim} dims")
         print(f"[SuperviseLearning] Student MLP: {self.student}")
 
         # 临时存储分布状态 (兼容 rsl_rl 内部流程)

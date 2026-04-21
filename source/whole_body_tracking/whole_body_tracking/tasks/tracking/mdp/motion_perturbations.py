@@ -4,6 +4,8 @@ This module provides domain randomization by applying perturbations to the refer
 
 from __future__ import annotations
 
+import math
+
 import torch
 from isaaclab.utils import configclass
 
@@ -37,6 +39,18 @@ class MotionPerturbationCfg:
     """Probability of applying sink perturbation."""
     sink_ratio: float = 0.0
     """The magnitude of the sink as a ratio of the body's original height."""
+
+    # -- Root orientation tilt perturbation
+    root_tilt_prob: float = 0.0
+    """Probability of applying root orientation tilt perturbation."""
+    root_tilt_max_rad: float = 0.0
+    """Maximum tilt angle in radians applied to root pitch/roll. GMT fails around 3-5 deg (~0.05-0.09 rad)."""
+
+    # -- Joint angle noise perturbation
+    joint_noise_prob: float = 0.0
+    """Probability of applying joint angle noise perturbation."""
+    joint_noise_std: float = 0.0
+    """Standard deviation of Gaussian noise added to reference joint angles (radians)."""
 
 
 class MotionPerturber:
@@ -99,6 +113,18 @@ class MotionPerturber:
             perturbed_root_pos = self._apply_sink(perturbed_root_pos)
 
         return perturbed_root_pos
+
+    def apply_quat_perturbation(self, root_quat: torch.Tensor) -> torch.Tensor:
+        """Apply root orientation tilt to the anchor quaternion. Input/output shape: (num_envs, 4) as (w,x,y,z)."""
+        if self.cfg.root_tilt_prob > 0.0:
+            return self._apply_root_tilt(root_quat)
+        return root_quat
+
+    def apply_joint_perturbation(self, joint_pos: torch.Tensor) -> torch.Tensor:
+        """Apply joint angle noise to the reference joint positions. Input/output shape: (num_envs, num_joints)."""
+        if self.cfg.joint_noise_prob > 0.0:
+            return self._apply_joint_noise(joint_pos)
+        return joint_pos
 
     def _apply_foot_slip(self, root_pos: torch.Tensor, left_foot_pos: torch.Tensor, right_foot_pos: torch.Tensor) -> torch.Tensor:
         """
@@ -165,3 +191,57 @@ class MotionPerturber:
         root_pos[sink_envs] -= sink_displacement[sink_envs]
 
         return root_pos
+
+    def _apply_root_tilt(self, quat: torch.Tensor) -> torch.Tensor:
+        """Apply a random pitch/roll tilt to the root orientation quaternion (w,x,y,z).
+
+        Rotates the reference root orientation by a random angle up to root_tilt_max_rad
+        around a random horizontal axis. This creates gravitational torque that GMT
+        cannot absorb through joint-angle corrections alone.
+        """
+        tilt_envs = torch.rand(self.num_envs, device=self.device) < self.cfg.root_tilt_prob
+        if not torch.any(tilt_envs):
+            return quat
+
+        # Random tilt direction in horizontal plane and magnitude
+        tilt_dir = torch.rand(self.num_envs, device=self.device) * (2.0 * math.pi)
+        tilt_mag = torch.rand(self.num_envs, device=self.device) * self.cfg.root_tilt_max_rad
+
+        # Build tilt quaternion: axis=(cos(dir), sin(dir), 0), angle=tilt_mag
+        half = tilt_mag * 0.5
+        sin_h = torch.sin(half)
+        tilt_quat = torch.stack([
+            torch.cos(half),
+            sin_h * torch.cos(tilt_dir),
+            sin_h * torch.sin(tilt_dir),
+            torch.zeros_like(tilt_mag),
+        ], dim=-1)  # (num_envs, 4)
+
+        # Quaternion multiply: q_out = tilt_quat * quat  (w,x,y,z convention)
+        perturbed = quat.clone()
+        q1 = tilt_quat[tilt_envs]
+        q2 = quat[tilt_envs]
+        w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+        w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+        perturbed[tilt_envs, 0] = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        perturbed[tilt_envs, 1] = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        perturbed[tilt_envs, 2] = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        perturbed[tilt_envs, 3] = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+        return perturbed
+
+    def _apply_joint_noise(self, joint_pos: torch.Tensor) -> torch.Tensor:
+        """Add Gaussian noise to reference joint angles.
+
+        Directly corrupts q_ref in FrontRES's correction domain — the residual
+        network can learn to cancel this noise via Δq output.
+        """
+        noise_envs = torch.rand(self.num_envs, device=self.device) < self.cfg.joint_noise_prob
+        if not torch.any(noise_envs):
+            return joint_pos
+
+        perturbed = joint_pos.clone()
+        noise = torch.randn(self.num_envs, joint_pos.shape[1], device=self.device) * self.cfg.joint_noise_std
+        perturbed[noise_envs] += noise[noise_envs]
+
+        return perturbed

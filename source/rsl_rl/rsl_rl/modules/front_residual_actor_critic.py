@@ -29,13 +29,14 @@ class ComposedActor(nn.Module):
     Composed actor for ONNX export: combines frozen GMT + trainable FrontRES.
 
     FrontRES (pre-GMT residual) pipeline:
-        obs → FrontRES → Δq
+        obs → FrontRES → [Δq (num_actions), Δz (num_z_outputs)]
         q_ref_corrected = q_ref + Δq   (modify q_ref inside obs)
         obs_modified → GMT → actions
+    Δz is stored as an attribute but not applied inside ONNX export (requires env-side hook).
     """
     def __init__(self, gmt_policy: ActorCritic, residual_actor: nn.Module,
                  gmt_actor_input_dim: int, num_actor_obs: int,
-                 q_ref_start_idx: int, num_actions: int):
+                 q_ref_start_idx: int, num_actions: int, num_z_outputs: int = 0):
         super().__init__()
         self.gmt_policy = gmt_policy
         self.residual_actor = residual_actor
@@ -43,6 +44,7 @@ class ComposedActor(nn.Module):
         self.num_actor_obs = num_actor_obs
         self.q_ref_start_idx = q_ref_start_idx
         self.num_actions = num_actions
+        self.num_z_outputs = num_z_outputs
 
     def forward(self, observations):
         """FrontRES pre-GMT pipeline: correct q_ref, then run GMT."""
@@ -57,8 +59,10 @@ class ComposedActor(nn.Module):
                 f"Unexpected observation dimension: {obs_dim}. "
                 f"Expected {self.num_actor_obs} or {self.gmt_actor_input_dim}")
 
-        # 1. FrontRES computes Δq from policy observations
-        delta_q = self.residual_actor(policy_obs)
+        # 1. FrontRES computes [Δq, Δz] from policy observations
+        frontres_out = self.residual_actor(policy_obs)
+        delta_q = frontres_out[:, :self.num_actions]    # (B, 29) joint corrections
+        # Δz not applied inside ComposedActor/ONNX — needs env-side z correction hook
 
         # 2. Apply Δq to q_ref inside the observation vector
         obs_modified = policy_obs.clone()
@@ -137,12 +141,16 @@ class FrontRESActorCritic(nn.Module):
         activation="elu",
         init_noise_std=1.0,
         noise_std_type: str = "scalar",
-        # Output clipping: tanh(raw_output) * max_delta_q bounds Δq to [-max_delta_q, max_delta_q]
-        # per joint.  Prevents action explosion when the residual actor's gradient pushes
-        # Δq toward large values before the regularization penalty can counteract it.
-        # Default 0.5 rad ≈ ±28.6°; covers typical sim-to-real correction range without
-        # allowing pathological overshooting.  Set to float('inf') to disable.
+        # Output clipping for Δq: tanh(raw) * max_delta_q bounds each joint correction.
+        # Default 0.5 rad ≈ ±28.6°; set to float('inf') to disable.
         max_delta_q: float = 0.5,
+        # Additional root z-correction outputs appended after Δq.
+        # 0 = legacy behaviour (Δq only); 1 = [Δq (num_actions), Δz (1)].
+        # When > 0, residual_actor output dim = num_actions + num_z_outputs.
+        num_z_outputs: int = 0,
+        # Output clipping for Δz: tanh(raw) * max_delta_z bounds root z correction.
+        # 0.3 m covers typical float/sink artifacts (AMASS→G1 conversion errors).
+        max_delta_z: float = 0.3,
         **kwargs,
     ):
         if kwargs:
@@ -157,11 +165,13 @@ class FrontRESActorCritic(nn.Module):
 
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
-        self.num_actions = num_actions
+        self.num_actions = num_actions          # = robot joint DOFs = GMT output dim (e.g. 29)
+        self.num_z_outputs = num_z_outputs      # extra Δz outputs (0 = legacy)
+        self.total_output_dim = num_actions + num_z_outputs  # FrontRES output (e.g. 30)
         self.q_ref_start_idx = q_ref_start_idx
         self.noise_std_type = noise_std_type
-        # tanh output clipping: Δq ∈ (-max_delta_q, max_delta_q) per joint
-        self.max_delta_q = max_delta_q
+        self.max_delta_q = max_delta_q          # tanh clip for Δq (rad)
+        self.max_delta_z = max_delta_z          # tanh clip for Δz (m)
 
         activation_fn = resolve_nn_activation(activation)
 
@@ -321,14 +331,15 @@ class FrontRESActorCritic(nn.Module):
         
         # ========== Build Fron-End Residual Network ==========
         
-        # 这就是我们在第一阶段使用监督学习训练的 FrontRES (student)
-        # 它输出的是 Δq
+        # FrontRES outputs [Δq (num_actions), Δz (num_z_outputs)] = total_output_dim dims
         self.residual_actor = self._build_residual_actor(
-            input_dim=num_actor_obs, 
-            output_dim=num_actions,
+            input_dim=num_actor_obs,
+            output_dim=self.total_output_dim,
             hidden_dims=residual_hidden_dims,
             activation=activation_fn,
             last_layer_gain=residual_last_layer_gain)
+        print(f"[FrontEndResidualActorCritic] FrontRES output: "
+              f"{num_actions} Δq + {num_z_outputs} Δz = {self.total_output_dim} dims")
         print(f"[FrontEndResidualActorCritic] FrontRES network: {self.residual_actor}")
 
         # ========== Build Critic ==========
@@ -366,10 +377,11 @@ class FrontRESActorCritic(nn.Module):
 
         # ========== Action Noise ==========
 
+        # Distribution covers the full output [Δq, Δz] = total_output_dim dims
         if self.noise_std_type == "scalar":
-            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+            self.std = nn.Parameter(init_noise_std * torch.ones(self.total_output_dim))
         elif self.noise_std_type == "log":
-            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(self.total_output_dim)))
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
@@ -389,7 +401,8 @@ class FrontRESActorCritic(nn.Module):
             gmt_actor_input_dim,
             num_actor_obs,
             q_ref_start_idx,
-            num_actions)
+            num_actions,
+            num_z_outputs)
         print("[ResidualActorCritic] Created composed actor for ONNX export")
 
         # ========== Store GMT input dimension for padding ==========
@@ -598,11 +611,8 @@ class FrontRESActorCritic(nn.Module):
         Returns:
             robot_actions (Tensor): motor commands output by GMT  [N, num_actions]
         """
-        # Correct q_ref inside the observation vector
-        # delta_q_alpha ∈ [0,1] is set by the runner curriculum scheduler.
-        # During critic warmup: small fixed value (e.g. 0.1) so FrontRES has a
-        # limited but non-zero effect, letting the critic learn the right V(s).
-        # After warmup: linearly ramps to 1.0 over alpha_ramp_iterations.
+        # delta_q here is already the Δq-only slice (first num_actions dims).
+        # Δz is stored separately in last_delta_z by the callers.
         obs_modified = policy_obs.clone()
         q_ref_end_idx = self.q_ref_start_idx + self.num_actions
         obs_modified[:, self.q_ref_start_idx:q_ref_end_idx] = (
@@ -634,7 +644,12 @@ class FrontRESActorCritic(nn.Module):
         """
         policy_obs, ref_vel, ref_vel_estimator_obs = self._parse_observations(observations)
 
-        delta_q = torch.tanh(self.residual_actor(policy_obs)) * self.max_delta_q
+        raw = self.residual_actor(policy_obs)
+        delta_q = torch.tanh(raw[:, :self.num_actions]) * self.max_delta_q
+        if self.num_z_outputs > 0:
+            self.last_delta_z = torch.tanh(raw[:, self.num_actions:]) * self.max_delta_z
+        else:
+            self.last_delta_z = None
 
         with torch.no_grad():
             robot_actions = self._apply_delta_q_and_run_gmt(
@@ -703,12 +718,18 @@ class FrontRESActorCritic(nn.Module):
         # Cache full observations so get_env_action can access ref_vel if present
         self._cached_observations = observations
 
-        # FrontRES computes Δq mean (gradient flows through here during PPO update)
-        # Apply tanh * max_delta_q to bound Δq per joint and prevent action explosion.
-        # tanh is differentiable everywhere → gradient flows cleanly through the clipping.
-        delta_q_mean = torch.tanh(self.residual_actor(policy_obs)) * self.max_delta_q
+        # FrontRES forward: output = [Δq (num_actions), Δz (num_z_outputs)]
+        raw = self.residual_actor(policy_obs)
+        delta_q_mean = torch.tanh(raw[:, :self.num_actions]) * self.max_delta_q
+        if self.num_z_outputs > 0:
+            delta_z_mean = torch.tanh(raw[:, self.num_actions:]) * self.max_delta_z
+            frontres_mean = torch.cat([delta_q_mean, delta_z_mean], dim=-1)  # (B, total_output_dim)
+            self.last_delta_z = delta_z_mean.detach()
+        else:
+            frontres_mean = delta_q_mean
+            self.last_delta_z = None
 
-        # Store for logging / regularization access by MOSAIC algorithm
+        # Store Δq for logging / regularization
         self.last_residual_actions = delta_q_mean.detach()
 
         # Build distribution over Δq-space
@@ -725,13 +746,15 @@ class FrontRESActorCritic(nn.Module):
         #   so 0.01 is a safe floor that does not prevent meaningful exploration decay.
         _STD_MIN = 0.01
         if self.noise_std_type == "scalar":
-            std = torch.nn.functional.softplus(self.std).clamp(min=_STD_MIN).expand_as(delta_q_mean)
+            std = torch.nn.functional.softplus(self.std).clamp(min=_STD_MIN).expand_as(frontres_mean)
         elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).clamp(min=_STD_MIN).expand_as(delta_q_mean)
+            std = torch.exp(self.log_std).clamp(min=_STD_MIN).expand_as(frontres_mean)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
 
-        self.distribution = Normal(delta_q_mean, std)
+        # Distribution is over full [Δq, Δz] output (total_output_dim dims).
+        # PPO stores frontres_mean samples as "actions"; get_env_action extracts Δq slice.
+        self.distribution = Normal(frontres_mean, std)
 
     def act(self, observations, **kwargs):
         """
@@ -766,17 +789,21 @@ class FrontRESActorCritic(nn.Module):
             cached = observations
         policy_obs, ref_vel, ref_vel_estimator_obs = self._parse_observations(cached)
 
+        # delta_q_sample may be the full [Δq, Δz] vector (total_output_dim dims).
+        # Only the Δq slice (first num_actions dims) is passed to GMT.
+        delta_q_only = delta_q_sample[:, :self.num_actions]
+
         with torch.no_grad():
             robot_actions = self._apply_delta_q_and_run_gmt(
-                policy_obs, delta_q_sample, ref_vel, ref_vel_estimator_obs)
+                policy_obs, delta_q_only, ref_vel, ref_vel_estimator_obs)
 
         return robot_actions
 
     def get_actions_log_prob(self, actions):
         """
-        Log-probability of Δq samples under the current distribution.
+        Log-probability of [Δq, Δz] samples under the current distribution.
 
-        `actions` here are Δq_sample values stored during rollout (NOT robot actions).
+        `actions` here are full frontres_output values stored during rollout (NOT robot actions).
         """
         return self.distribution.log_prob(actions).sum(dim=-1)
 

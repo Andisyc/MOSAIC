@@ -9789,3 +9789,1519 @@ _dr_scale = min(1.0, (it - stage2_start) / dr_curriculum_iters)
 我新增的字段（line 206-222）没有产生任何新的诊断。可以直接推送到服务器训练。
 
 ---
+
+
+**Claude**
+
+先检查 `commands.py` 里实际应用了哪些扰动、以及 `tracking_env_cfg.py` 是否配置了额外的扰动类型。
+
+---
+
+
+**Claude**
+
+确认了：当前代码中 `MotionPerturbationCfg` 的扰动类型**恰好就是这 4 种**，没有遗漏。
+
+```python
+# motion_perturbations.py — MotionPerturbationCfg 的完整字段
+float_prob / float_ratio      # 漂浮
+sink_prob  / sink_ratio       # 下沉
+foot_slip_prob / foot_slip_ratio / foot_slip_height   # 脚滑
+body_drag_prob / body_drag_ratio                      # 身体拖拽
+```
+
+`commands.py:1322` 的 `apply_perturbations()` 也只调用这 4 类，没有其他隐藏逻辑。
+
+---
+
+## 阶梯中有一个被遗漏的参数
+
+阶梯当前缩放的是：`float_ratio`、`sink_ratio`、`foot_slip_ratio`、`body_drag_ratio`（幅度）。
+
+但 **`foot_slip_height`（脚离地判定阈值，默认 0.05m）** 没有动。
+
+| 参数 | 作用 | 阶梯应该怎么处理 |
+|------|------|-----------------|
+| `foot_slip_height` | z 高于此值才触发 slip | **应该随阶梯下降**：阈值降低 → 更多帧被判定为"脚在空中" → slip 触发更频繁 |
+| `*_prob` | 触发概率 | **保持不变**即可：频率不是当前瓶颈，幅度才是 |
+
+目前 `foot_slip_height=0.05` 是训练固定值，随着 `foot_slip_ratio` 增大，可以考虑同步把阈值从 0.05 下降到 0.02，让高速运动中更多短暂腾空帧也能触发 slip。
+
+---
+
+## 是否需要修改？
+
+**保守建议（不改）**：4 种扰动的幅度缩放已经足够，`foot_slip_height` 是几何阈值，改动影响较难预判，优先看幅度缩放的效果。
+
+**激进建议（同步缩放）**：如果要彻底挑战 FrontRES，可以在 staircase 覆盖块中加一行：
+
+```python
+# 在 on_policy_runner.py 阶梯覆盖块里追加（可选）
+_mcmd.perturber.cfg.foot_slip_height = max(
+    0.02,
+    _perturb_target.foot_slip_height / _cur_sc_mult
+)
+```
+
+倍率越高 → 阈值越低 → slip 触发范围越宽。
+
+目前需要我加进去吗？还是先观察幅度缩放的效果再说？
+
+---
+
+
+**User**
+
+这种跳跃动作序列通过转换算法从人类动作序列转到机器人动作序列后很容易出现漂浮，似乎FrontRES很难判断哪个漂浮是转换错误，哪个漂浮是跳跃
+
+---
+
+
+**Claude**
+
+这是一个深层次的歧义问题，值得认真分析。
+
+## 歧义的本质
+
+FrontRES 通过 q_ref 看到的信息是：
+
+```
+转换错误漂浮：根节点 z = +20cm，但关节角 = 正常行走姿态
+合法跳跃动作：根节点 z = +20cm，但关节角 = 起跳/腾空姿态
+```
+
+FrontRES 无法直接知道"漂浮是错误还是意图"，它只能从**关节角与根节点高度之间是否协调一致**来推断。
+
+---
+
+## FrontRES 能否自行区分？
+
+理论上可以，依赖关节角上下文：
+
+| 情况 | 关节角特征 | 根节点高度 | FrontRES 应该做什么 |
+|------|-----------|-----------|-------------------|
+| 转换错误漂浮 | 走路姿态（髋/膝近伸直） | 高 | 输出弯膝 Δq，让 GMT 保持地面接触 |
+| 合法跳跃 | 起跳/腾空姿态（蹬伸→屈膝） | 高 | Δq ≈ 0，让 GMT 尝试跟随 |
+| 合法跳跃 + float 扰动 | 起跳姿态 | 更高 | **歧义**：该修正还是不管？ |
+
+但实际上 FrontRES 学到这种细粒度区分需要训练集中**两类数据都充足且标注清晰**，目前的 r_delta 奖励信号无法显式告诉它"这次漂浮是跳跃别管"。
+
+---
+
+## 真正的风险
+
+如果训练集中跳跃动作多，FrontRES 面临的是**双向错误的风险**：
+
+```
+策略1（激进修正）：遇到高根节点就输出弯膝 Δq
+  → 修好了转换错误  ✓
+  → 压制了真实跳跃  ✗
+
+策略2（保守不动）：高根节点时 Δq ≈ 0
+  → 跳跃正常执行   ✓
+  → 无法修复漂浮   ✗
+```
+
+r_delta 信号会让 FrontRES 倾向于**策略1**，因为 GMT 在转换错误漂浮上失败（baseline_per_step 下降）时修正 r_delta 最高，而跳跃上 GMT 本来也会失败（无法真正跳跃），修正与不修正的 r_delta 差别不大。**FrontRES 大概率会学到"高根节点 → 压回地面"这个捷径。**
+
+---
+
+## 实际影响有多大？
+
+关键在于训练数据构成：
+- AMASS 的 G1 转换数据以**行走、跑步、舞蹈**为主，跳跃序列占比很小
+- G1 物理上跳跃能力有限，高质量的跳跃转换本就很少
+- `perturb_npz.py` 加 float 扰动时针对的是已知非跳跃序列
+
+**对当前实验的实际影响很小**，但这是一个设计层面的隐患。
+
+---
+
+## 推荐解决方向
+
+**短期（不改代码）**：筛掉跳跃序列，或在 `perturb_npz.py` 里检测跳跃帧并跳过 float 扰动。
+
+**中期（根本解法）**：给 `MotionPerturbationCfg` 加一个 `float_max_root_height` 参数，当参考根节点本身已经足够高时禁用 float 扰动：
+
+```python
+# 只在根节点已处于低位时才施加漂浮扰动（避免在跳跃顶点再叠加）
+if root_pos_ref[:, 2] < self.cfg.float_max_root_height:
+    perturbed_root_pos = self._apply_float(perturbed_root_pos)
+```
+
+这样转换错误漂浮（整段序列根节点偏高）依然会被扰动，但已处于腾空状态的跳跃不会被再次叠加 float。
+
+是否需要现在实现这个保护？
+
+---
+
+
+**User**
+
+staircase/level在59k到大约63.8k处是1，从大约63.8l到68.8k处是2，从68.8k处开始是3，但baseline_per_step一直在0.048附近小幅震荡，非常稳定，我认为可能是GMT过于稳定的原因，导致FrontRES没有用武之地
+
+---
+
+
+**Claude**
+
+## 核心诊断：阶梯在工作，但 GMT 免疫于当前扰动类型
+
+阶梯触发时序完全正确（59k→63.8k→68.8k），问题出在另一处。
+
+```
+level 1 (1.6× = 0.08m)  baseline = 0.048
+level 2 (2.4× = 0.12m)  baseline = 0.048   ← 没有下降
+level 3 (3.6× = 0.18m)  baseline = 0.048   ← 依然没有下降
+```
+
+**baseline_per_step 跨三个台阶完全不变，说明 GMT 对 float/sink 这类扰动存在天然免疫区间，远超 18cm。** 这不是 FrontRES 的问题，是扰动类型选错了。
+
+---
+
+## 为什么 GMT 能免疫 float/sink？
+
+GMT 的训练目标是全身跟踪，其策略隐式学到了：
+
+> "参考根节点高一点没关系，我用腿的刚度/控制余量把自己稳住就行。"
+
+float/sink 只改变根节点的参考位置，而 GMT 的下肢控制器对参考根节点误差有一定容忍带——这个容忍带比 18cm 还宽。FrontRES 修改的是关节角 Δq，无法直接修正根节点参考，间接修正（弯膝补偿）也只能做到有限程度。
+
+---
+
+## 真正能挑战 GMT 的扰动类型
+
+| 扰动类型 | 当前状态 | GMT 能否轻松抵抗 | 优先级 |
+|---------|---------|---------------|--------|
+| float/sink（根节点垂直位移） | 已实现，最高 18cm | **能**，天然容忍 | 继续但意义有限 |
+| slip（根节点水平位移） | 已实现，最高 9cm | 部分能 | 可提升幅度 |
+| **关节角噪声**（q_ref 各关节加扰动） | **未实现** | **难**，直接破坏运动学目标 | **最高** |
+| **时序偏移**（q_ref 提前/延迟 N 帧） | **未实现** | 较难，打乱相位 | 高 |
+| **概率提升**（float_prob 0.3→0.7） | 未修改 | 稍难，扰动更密集 | 中 |
+
+**关节角噪声是最有效的选项**：float/sink 打乱的是根节点，GMT 用腿的裕量补回来；关节角噪声直接打乱 GMT 追踪的目标，GMT 没有"容忍带"可以利用。
+
+---
+
+## 建议方向
+
+**短期（不改架构）**：在 `MotionPerturbationCfg` 里新增关节角扰动：
+
+```python
+# 新增字段
+joint_noise_prob:  float = 0.0   # 每帧对 q_ref 各关节施加随机噪声的概率
+joint_noise_std:   float = 0.0   # 噪声标准差（rad）；0.05 rad ≈ 3°
+```
+
+在 `MotionPerturber.apply_perturbations()` 里新增一步：
+
+```python
+def _apply_joint_noise(self, joint_pos_ref: torch.Tensor) -> torch.Tensor:
+    noise_envs = torch.rand(self.num_envs, device=self.device) < self.cfg.joint_noise_prob
+    noise = torch.randn_like(joint_pos_ref) * self.cfg.joint_noise_std
+    joint_pos_ref[noise_envs] += noise[noise_envs]
+    return joint_pos_ref
+```
+
+这需要 `apply_perturbations()` 同时接收 `joint_pos_ref` 参数，并在 `commands.py` 里把扰动后的关节角写回 q_ref。
+
+**长期**：如果关节角噪声也无法持续挑战 GMT，说明 FrontRES 作为"q_ref 修正器"的定位本身需要重新审视——也许需要让 FrontRES 能直接修正根节点参考位置而不仅是关节角。
+
+---
+
+需要现在实现关节角噪声扰动吗？
+
+---
+
+
+**User**
+
+关节角误差和噪音到底是什么？这个问题似乎不太清晰明确，很难让人一下就想到
+
+---
+
+
+**Claude**
+
+这是一个非常好的质疑，"关节角误差"确实不如"机器人在空中漂浮"那样直观。让我把这个问题的具体形态说清楚。
+
+## 关节角误差的具体来源
+
+AMASS→G1 转换不可避免地产生以下几类具体的、有物理意义的误差：
+
+**① 形态差异误差（最根本）**
+
+人类和 G1 的肢体比例不同。当转换算法直接复制关节角时：
+
+```
+人类：大腿 55cm，小腿 45cm
+G1 ：大腿 40cm，小腿 35cm
+
+同样的膝关节角 = 90°，人类脚在 A 点，G1 脚在 B 点
+                                     A ≠ B（相差数厘米）
+```
+
+G1 跟随的 q_ref 说"脚应该在 A 点对应的关节角"，但 G1 的脚实际在 B 点——这就是关节角层面的系统性偏差。
+
+**② 工作空间截断误差**
+
+人类的肩关节活动范围比 G1 大。当人类做大幅举臂动作时，转换后的关节角会触碰 G1 的关节极限被强制截断：
+
+```
+原始：肩关节 θ = 185°（人类可以）
+G1限：肩关节 θ_max = 160°
+转换结果：θ_clamp = 160°（强制截断）
+真实偏差：25°
+```
+
+GMT 接收到一个"处于极限位置"的 q_ref，但这不是它训练时见过的正常运动模式。
+
+**③ 运动链误差累积**
+
+从根节点向末端传播时，每个关节的微小误差叠加：
+
+```
+根节点误差 0.5°
+    → 髋关节传播后变成 1.2°
+        → 膝关节传播后变成 2.8°
+            → 踝关节传播后变成 5.1°
+                → 脚尖位置误差约 3cm
+```
+
+---
+
+## 但用户的直觉是对的：这些仍然不够清晰
+
+"形态差异误差"、"工作空间截断"——这些描述虽然准确，但对于 FrontRES 的研究贡献来说，它们还缺一个核心问题：
+
+**GMT 自己为什么不能处理这些误差？**
+
+GMT 是一个强鲁棒的跟踪器，它已经在大量运动上训练过，本身就对小误差有容忍能力。如果关节角误差只是"差几度"，GMT 可能自行吸收掉，FrontRES 也没有存在意义。
+
+这就回到了你最初的观察——**GMT 太稳定了，FrontRES 没有用武之地。**
+
+---
+
+## 真正清晰的研究问题在哪里？
+
+重新审视整个设计，FrontRES 真正有价值的场景应该满足：
+
+1. **GMT 明确会失败**——不是"偶尔差一点"，而是可以预期会跌倒或大幅偏离
+2. **失败原因在 FrontRES 可修正的空间内**——关节角层面的系统性偏差
+3. **FrontRES 修正后 GMT 明显恢复**——有清晰的对照实验
+
+目前的训练框架（float/sink DR + r_delta 奖励）其实没有真正定义"GMT 在什么条件下失败"，而是依赖随机扰动碰巧让 GMT 失败。这导致研究点模糊。
+
+**真正清晰的研究点可能应该反过来定义**：先找到 GMT 确实会稳定失败的具体动作/转换场景，再设计 FrontRES 去修复它，而不是先设计扰动再看 FrontRES 能不能学到东西。
+
+这是否触及了你对这个研究方向更深层的疑虑？
+
+---
+
+
+**User**
+
+我重新思考了一下，认为FrontRES还必须额外输出根节点的Δz，并且FrontRES还必须输入未来帧，这样能更好处理跳跃这个动作，请评价我的想法
+
+---
+
+
+**Claude**
+
+## 评价：两个想法都方向正确，但需要仔细权衡
+
+### 想法一：FrontRES 额外输出 Δz ✅ 必要且架构上正确
+
+这直接修复了我们发现的架构错位：
+
+```
+当前：FrontRES(Δq) → 修关节角 → GMT 仍然看到浮空的根节点参考 → 部分修复
+改后：FrontRES(Δq + Δz) → 修关节角 + 修根节点高度 → GMT 看到正确参考 → 完整修复
+```
+
+需要在 `ComposedActor.forward()` 里多加一步：把 Δz 施加到 obs 中根节点参考位置所在的维度上，然后再传给 GMT。
+
+一个值得思考的问题：**是否只需要 Δz，还是应该输出 Δroot = (Δx, Δy, Δz)**？slip 扰动影响的是水平方向，如果只修 z 就留了一个对称性漏洞。但 Δz 是最关键的（float/sink），Δxy 可以后续再加。
+
+---
+
+### 想法二：FrontRES 输入未来帧 ✅ 逻辑正确，但有一个关键陷阱
+
+方向是对的——未来帧提供了时序上下文：
+
+```
+跳跃：根节点 z 先升后降，抛物线轨迹，关节角呈起跳/腾空/落地序列
+转换漂浮：根节点 z 持续偏高，无抛物线，关节角是行走姿态
+                                         ↑
+                        FrontRES 看到未来帧才能区分这两种情况
+```
+
+**关键陷阱**：不需要输入完整的未来帧（那会让 obs 维度爆炸），只需要**未来 N 帧的根节点 z 轨迹**。
+
+```
+当前 obs 770 维 → 加 5 个未来帧的根节点 z → 仅增加 5 维 → 改动极小
+                    vs.
+加 5 个完整未来帧 (q_ref+root) → +5×32=160 维 → 显著增加复杂度
+```
+
+---
+
+### 两个想法组合后的研究点
+
+把这两个改动加在一起，FrontRES 的定位变得非常清晰：
+
+> **FrontRES 通过读取未来帧的运动意图，在关节角空间和根节点空间同时输出修正，解决运动重定向中的系统性误差——包括能区分跳跃意图和转换漂浮这一原本难以区分的歧义问题。**
+
+这比"修关节角误差"更有说服力，也有明确的可视化实验：
+- 对比不带 FrontRES 的 GMT
+- 对比带 FrontRES 但无未来帧（无法区分跳跃/漂浮）
+- 对比带 FrontRES 且有未来帧（能正确区分）
+
+---
+
+### 需要解决的工程问题
+
+在决定实现前，有两件事需要先确认：
+
+1. **obs 里根节点参考位置在哪个维度？** 需要找到 `anchor_pos_w` 在 770 维 obs 中的具体 index，才能知道 Δz 要加在哪里
+
+2. **当前 obs 里已经有多少未来帧？** GMT 的 obs 可能已经包含 1–2 帧的 q_ref 前瞻，需要先确认现有结构再决定加多少
+
+是否需要我去查 obs 的构成，确认这两个前提？
+
+---
+
+
+**Claude**
+
+## 跳跃问题能否作为下一个工作
+
+可以，但有一个前提条件必须满足才能合理切割：
+
+**能做下一个工作的条件**：当前工作里 FrontRES 在非跳跃场景下能明确展示价值——即存在一批 GMT 失败、FrontRES 成功修复的对照实验。这样跳跃问题才能合理描述为"一个独立的、更难的边界场景，超出当前工作范围"。
+
+**不能切割的情况**：如果当前 DR 根本无法让 GMT 失败（即 baseline 始终 0.048），那 FrontRES 在任何场景下都没有展示出价值，跳跃问题就不是"下一个工作"，而是当前工作本身就没有完成。
+
+所以跳跃问题能否推后，取决于你能否先解决 GMT 太稳定这个更根本的问题。
+
+---
+
+## 关于 DR 策略的判断
+
+你的判断是正确的：**DR 必须让 GMT 失败，FrontRES 才有价值**。但极端 DR 还是陡峭曲线都不是关键——**问题出在扰动类型，不是强度**。
+
+现状是：
+```
+float/sink 5.0×（25cm）→ GMT baseline 仍然 0.048
+继续加大 float/sink → GMT 仍然不会失败（天花板存在）
+```
+
+float/sink 是位置扰动，GMT 的刚体控制对位置误差有天然裕量，无论你加多大都在这个裕量内。这是物理机制决定的，不是训练不够。
+
+**根节点姿态扰动**（roll/pitch 倾斜）完全不同：
+
+```
+10° 前倾 → 重力力矩 = M × g × l × sin(10°) ≈ 35kg × 9.8 × 0.5 × 0.17 ≈ 29 N·m
+           直接作用在支撑脚上，GMT 必须主动对抗
+           → baseline 会下降
+```
+
+姿态误差没有"容忍带"，因为重力是持续施加的外力，不是参考位置偏差。**即使从小值（0.05 rad = 3°）开始，GMT 也会有明显反应。**
+
+---
+
+## 建议的 DR 策略
+
+不需要极端 DR 也不需要更陡的曲线，需要的是**换正确的扰动类型后再走阶梯**：
+
+```
+现在                     下一步
+──────────────────────   ──────────────────────────────────────
+float/sink（位置）       → 加 root_tilt（姿态）+ joint_noise
+阶梯 level 3，18cm       → 从小值（3°，0.02 rad 关节噪声）开始
+GMT baseline = 0.048    → GMT baseline 应该立刻下降
+r_delta 卡在 0.0015     → r_delta 有机会真正增长
+```
+
+现有的阶梯机制可以直接复用，不需要重新设计训练流程，只需要在 `MotionPerturbationCfg` 里新增两种扰动类型。
+
+是否现在实现这两种扰动？
+
+---
+
+
+**User**
+
+我认为我们需要的是直接使用GMT扛不住的Motion Perturbation，不要再缓慢上升了，
+
+---
+
+
+**Claude**
+
+先读 `commands.py` 里 joint_pos 和 quat 的数据流，确认需要在哪里插入扰动。
+
+---
+
+
+**User**
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Summary:
+1. Primary Request and Intent:
+
+This session continued Stage 2 FrontRES RL fine-tuning for MOSAIC. Chronological requests:
+- Disable MotionPerturber in play.py for clean visualization testing
+- Evaluate convergence at iter 58775 (fixed lr=3e-5 working, r_delta=0.0015)
+- Implement automatic staircase DR curriculum (plateau detection → auto-advance)
+- Fix staircase checkpoint resume (state saved/restored in .pt file)
+- Skip wasted monitoring at known-plateau level 0 (set start_level=1)
+- List all motion-related DR and intensity ranges
+- Discuss jump/float ambiguity as research problem
+- Evaluate architectural mismatch: float/sink acts in world coordinates, FrontRES Δq only in joint space
+- Discuss FrontRES Δz output + future frames for jump handling
+- Evaluate convergence at iter 69512 (staircase confirmed working, baseline stuck at 0.048)
+- Diagnose GMT too stable → float/sink ineffective as DR (architecture-level insight)
+- **Most recent**: User wants direct, non-ramp DR that GMT cannot handle — root orientation tilt + joint noise
+
+---
+
+2. Key Technical Concepts:
+
+- **FrontRES Stage 2**: RL fine-tuning, residual network learns Δq joint angle corrections; r_delta = r_frontres − r_GMT_baseline
+- **Architectural mismatch**: Float/sink perturbs `anchor_pos_w` (world coordinate root position); FrontRES Δq only modifies `obs[232:261]` (joint angles) — these are orthogonal; FrontRES cannot directly cancel float/sink
+- **GMT robustness / tolerance band**: GMT handles root position displacement up to ~18-25cm (staircase levels 1-3 had zero effect on baseline); only level 4 (25cm) causes baseline to drop
+- **Staircase DR curriculum**: Monitor EMA of r_delta_per_step; detect plateau (slope < threshold for min_plateau_iters); auto-ramp to next difficulty level; saved/restored in checkpoint
+- **Δq=0 shortcut trap**: If DR too strong cold, FrontRES learns to output nothing because baseline reward > correction reward
+- **r_delta reward signal**: r_total_frontres − r_GMT; sparse when GMT is stable; FrontRES only gets useful gradient when GMT fails
+- **Root orientation tilt**: roll/pitch perturbation creates gravitational torque → GMT cannot absorb (unlike position displacement); destabilizes at 3-5°
+- **Joint angle noise**: Direct perturbation of q_ref joints → in FrontRES's correction domain → Δq directly cancels
+- **Jump/float ambiguity**: AMASS→G1 converted jumps produce float artifacts indistinguishable from conversion errors without temporal context
+- **ComposedActor**: FrontRES+GMT as single ONNX; obs → residual_actor → Δq → modify obs[232:261] → gmt_policy → actions
+
+---
+
+3. Files and Code Sections:
+
+**`scripts/rsl_rl/play.py`** — Disable MotionPerturber for evaluation
+```python
+# After env_cfg.events = None
+if hasattr(env_cfg, "motion_perturbations"):
+    from whole_body_tracking.tasks.tracking.mdp.motion_perturbations import MotionPerturbationCfg
+    env_cfg.motion_perturbations = MotionPerturbationCfg()
+    print("[INFO]: Zeroed motion_perturbations for evaluation.")
+```
+
+**`source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py`** — Added staircase fields + updated checkpoint path:
+```python
+_s1 = Path("/home/yuxuancheng/MOSAIC/stage2/model_58500.pt")
+_s2 = Path("/home/chengyuxuan/MOSAIC/stage2/model_58500.pt")
+
+dr_staircase_multipliers: str = "1.6,2.4,3.6,5.0"
+dr_staircase_ramp_iters: int = 2000
+dr_staircase_min_plateau_iters: int = 3000
+dr_staircase_plateau_threshold: float = 2e-7
+# Set to 1 for first resume from old checkpoint (skip known-plateaued base level):
+dr_staircase_start_level: int = 1
+```
+
+**`source/rsl_rl/rsl_rl/runners/on_policy_runner.py`** — Four major additions:
+
+**(A) Staircase initialization (after `_perturb_target = None`):**
+```python
+_staircase_mults_str = self.cfg.get("dr_staircase_multipliers", "")
+_staircase_mults = ([float(x) for x in _staircase_mults_str.split(",") if x.strip()] if _staircase_mults_str else [])
+_staircase_ramp_iters = int(self.cfg.get("dr_staircase_ramp_iters", 2000))
+_staircase_min_plateau = int(self.cfg.get("dr_staircase_min_plateau_iters", 3000))
+_staircase_plateau_thr = float(self.cfg.get("dr_staircase_plateau_threshold", 2e-7))
+_staircase_start_level = int(self.cfg.get("dr_staircase_start_level", 0))
+_staircase_active = _is_frontres and len(_staircase_mults) > 0
+
+if _staircase_active:
+    # Priority: checkpoint > config > default
+    if (hasattr(self, "_staircase_level") and self._staircase_level is not None
+            and hasattr(self, "_staircase_cur_mult") and self._staircase_cur_mult is not None):
+        _staircase_level = int(self._staircase_level)
+        _staircase_cur_mult = float(self._staircase_cur_mult)
+        _source = "checkpoint"
+    else:
+        _staircase_level = _staircase_start_level
+        _staircase_cur_mult = (_staircase_mults[_staircase_level - 1] if _staircase_level > 0 else 1.0)
+        _source = f"config"
+    _staircase_prev_mult = _staircase_cur_mult
+    _staircase_is_ramping = False
+    _staircase_ramp_start_iter = start_iter
+    _staircase_at_level_since = start_iter
+    _staircase_ema = None
+    _staircase_ema_alpha = 0.05
+    _staircase_ema_at_entry = None
+    self._staircase_level = _staircase_level
+    self._staircase_cur_mult = _staircase_cur_mult
+```
+
+**(B) Staircase override inside DR curriculum block (after existing ratio assignments):**
+```python
+if _staircase_active and _dr_scale >= 1.0:
+    if _staircase_is_ramping:
+        ramp_t = min(1.0, (it - _staircase_ramp_start_iter) / max(1, _staircase_ramp_iters))
+        _cur_sc_mult = (_staircase_prev_mult + ramp_t * (_staircase_mults[_staircase_level - 1] - _staircase_prev_mult))
+        if ramp_t >= 1.0:
+            _staircase_is_ramping = False
+            _staircase_cur_mult = _staircase_mults[_staircase_level - 1]
+            _staircase_at_level_since = it
+            _staircase_ema_at_entry = _staircase_ema
+    else:
+        _cur_sc_mult = _staircase_cur_mult
+    _mcmd.perturber.cfg.float_ratio = _perturb_target.float_ratio * _cur_sc_mult
+    _mcmd.perturber.cfg.sink_ratio = _perturb_target.sink_ratio * _cur_sc_mult
+    _mcmd.perturber.cfg.foot_slip_ratio = _perturb_target.foot_slip_ratio * _cur_sc_mult
+    _mcmd.perturber.cfg.body_drag_ratio = _perturb_target.body_drag_ratio * _cur_sc_mult
+```
+
+**(C) EMA + plateau detection (after `frontres_dr_scale` computation):**
+```python
+_staircase_level_for_log = None
+_staircase_mult_for_log = None
+if _staircase_active:
+    _initial_ramp_done = (_dr_curriculum_iters == 0 or (it - _stage2_start) >= _dr_curriculum_iters)
+    if _initial_ramp_done:
+        if not _staircase_is_ramping and frontres_rdelta_mean is not None:
+            if _staircase_ema is None:
+                _staircase_ema = frontres_rdelta_mean
+                _staircase_ema_at_entry = frontres_rdelta_mean
+            else:
+                _staircase_ema = (_staircase_ema_alpha * frontres_rdelta_mean + (1.0 - _staircase_ema_alpha) * _staircase_ema)
+            iters_at_level = it - _staircase_at_level_since
+            if (iters_at_level >= _staircase_min_plateau and _staircase_ema_at_entry is not None and _staircase_level < len(_staircase_mults)):
+                ema_slope = abs(_staircase_ema - _staircase_ema_at_entry) / max(1, iters_at_level)
+                if ema_slope < _staircase_plateau_thr:
+                    _staircase_prev_mult = _staircase_cur_mult
+                    _staircase_level += 1
+                    _staircase_ramp_start_iter = it
+                    _staircase_is_ramping = True
+                    _staircase_ema_at_entry = None
+                    self._staircase_level = _staircase_level
+                    self._staircase_cur_mult = _staircase_mults[_staircase_level - 1]
+                    print(f"[Staircase] iter={it} plateau detected. Advancing to level {_staircase_level}")
+```
+
+**(D) save() — persist staircase state:**
+```python
+if hasattr(self, "_staircase_level") and self._staircase_level is not None:
+    saved_dict["staircase_level"] = self._staircase_level
+    saved_dict["staircase_cur_mult"] = self._staircase_cur_mult
+```
+
+**(E) load() — restore staircase state (before `return loaded_dict["infos"]`):**
+```python
+self._staircase_level = loaded_dict.get("staircase_level", None)
+self._staircase_cur_mult = loaded_dict.get("staircase_cur_mult", None)
+if self._staircase_level is not None:
+    print(f"[Runner] Staircase state restored: level={self._staircase_level}, cur_mult={self._staircase_cur_mult:.3f}x")
+else:
+    print("[Runner] No staircase state in checkpoint.")
+```
+
+**(F) log() — wandb logging:**
+```python
+if locs.get("_staircase_level_for_log") is not None:
+    self.writer.add_scalar("Curriculum/staircase_level", locs["_staircase_level_for_log"], locs["it"])
+if locs.get("_staircase_mult_for_log") is not None:
+    self.writer.add_scalar("Curriculum/staircase_mult", locs["_staircase_mult_for_log"], locs["it"])
+```
+
+**`source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/motion_perturbations.py`** — Current state (4 perturbation types, all in world coordinates):
+- `float_prob/float_ratio`: root z upward displacement
+- `sink_prob/sink_ratio`: root z downward displacement
+- `foot_slip_prob/foot_slip_ratio/foot_slip_height`: horizontal slip when XOR(left_airborne, right_airborne)
+- `body_drag_prob/body_drag_ratio`: displacement opposite to root velocity
+
+**`source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/commands.py`** — Data flow (read in final message):
+- Line 1288-1289: `joint_pos` property → `return self._gather_by_motion("joint_pos")`
+- Line 1332-1334: `anchor_quat_w` property → `return quat[:, self.motion_anchor_body_index]`
+- Line 1312-1329: `anchor_pos_w` property → applies `perturber.apply_perturbations()` (position only)
+- These are the insertion points for new root tilt and joint noise perturbations
+
+---
+
+4. Errors and Fixes:
+
+- **MotionPerturber not disabled in play.py**: play.py disabled `events` and obs noise but NOT `motion_perturbations`. Pre-perturbed .npz would get double-perturbed. Fixed by zeroing `MotionPerturbationCfg()`.
+- **Staircase level resets on resume**: `_staircase_level` was a local variable, invisible to `save()`. Fixed by making it instance variable (`self._staircase_level`), saving to checkpoint dict, restoring in `load()`.
+- **Wasted 3000 monitoring iters on already-plateaued level**: First resume from old checkpoint (model_58500.pt) would waste 3000 iters confirming already-known plateau. Fixed by setting `dr_staircase_start_level=1`.
+- **Float/sink DR fundamental ceiling**: GMT tolerates root position displacement up to ~25cm; levels 1-3 (8-18cm) had zero effect. Not a bug but a design limitation — staircase mechanism correct but perturbation type wrong.
+- **IDE diagnostics (pre-existing)**: Lines 157-162 errors in rsl_rl_ppo_cfg.py about RslRlSuperviseAlgorithmCfg parameters not recognized by Pyright — these are `@configclass` vs Pyright compatibility issues, not runtime errors.
+
+---
+
+5. Problem Solving:
+
+**Solved:**
+- play.py double-perturbation: zeroed MotionPerturbationCfg on evaluation
+- Staircase checkpoint resume: save/restore state in .pt file
+- Staircase unnecessary monitoring: start_level=1 for first old-checkpoint resume
+
+**Diagnosed (requires action):**
+- **GMT too stable for float/sink**: baseline_per_step=0.048 constant across staircase levels 1-3; only drops at level 4 (25cm). Root cause: float/sink is positional; GMT has large positional tolerance band.
+- **Architectural mismatch**: FrontRES outputs Δq (joint angles) but float/sink perturbs world-coordinate root position — orthogonal spaces. FrontRES correction is indirect and has a low ceiling (~0.0015 r_delta plateau).
+- **FrontRES learning slow even at level 4**: Sparse failure events (only when random float near max AND motion at sensitive moment) + indirect correction path.
+
+**Research-level insights:**
+- Jump/float ambiguity: genuine research problem, acceptable as future work IF FrontRES shows value on non-jump cases
+- FrontRES scope: architecturally valid only for joint-angle-level errors (IK/FK retargeting artifacts), not root-position-level errors (which require Δz output)
+
+---
+
+6. All User Messages:
+
+- "现在如果我使用最新的FrontRES的权重尝试修正一段加过扰动的动作序列，意思是对FrontRES做可视化测试，能否成功？"
+- "请依据现在的训练指标评估当前FrontRES权重是否能成功修复受干扰的q_ref..."(metrics at 58775)
+- "我有两个疑问：1、当前FrontRES修正量较小的原因是GMT表现较好...2、很明显FrontRES不能只处理微调的扰动..."
+- "能否不停增大扰动直到FrontRES无法修复而崩溃？或者仍不断增大，但每次增大扰动都配一个平台期..."
+- "请执行修改，但我还有个问题，如何判断当前训练已经收敛？..."
+- "很明显由于我们总是断点续训，DR不能从0开始，请判断应该从何时开始，是否需要加入判断机制？"
+- "当前断点续训的DR似乎不能从零开始，从零开始似乎会浪费时间，请判断应该如何处理"
+- "我注意到现在DR阶梯中只有float/sink，slip，drag，但我们的代码中应该还有很多其他的MotionPerturbation，是否其他的DR也该同步增长？"
+- "请解释这个foot_slip_height的含义，并且如果动作序列本身就是跳跃，那这个值是否会干扰训练？"
+- "这种跳跃动作序列通过转换算法从人类动作序列转到机器人动作序列后很容易出现漂浮，似乎FrontRES很难判断哪个漂浮是转换错误，哪个漂浮是跳跃"
+- "请给我现在代码中所有的针对Motion的域随机化和强度范围"
+- "我重新思考了一下，认为FrontRES还必须额外输出根节点的Δz，并且FrontRES还必须输入未来帧，这样能更好处理跳跃这个动作，请评价我的想法"
+- "我不太清楚未来5帧是否足够，是否需要输入未来10帧甚至20帧？并且输入未来帧能否就自动学会判别浮空和跳跃？而且我们还需要重新设计能让GMT失衡的MotionPerturbation，比如两脚扭结或者身体前倾等"
+- "我知道对于跳跃问题，还需要配合跳跃动作序列才行，但很难一下子找到跳跃动作序列...我认为第二阶段训练的核心就是DR，而且得是GMT无法承受的DR才能凸显出FrontRES的价值，我们是否需要直接从极端DR开始，或者让上升曲线变得陡峭才行？"
+- "请用中文回复" (language instruction)
+- "现在更新的代码推送到服务器上训练已经来到69512轮次了..." (metrics)
+- "staircase/level在59k到大约63.8k处是1，从大约63.8l到68.8k处是2，从68.8k处开始是3，但baseline_per_step一直在0.048附近小幅震荡，非常稳定，我认为可能是GMT过于稳定的原因..."
+- "你提到了个很重要的问题：q_ref是关节角，因此FrontRES学习到的是关节角的delta_q，但floating修改的并不是关节角，而是机器人在世界坐标系的坐标，这似乎与FrontRES的输出产生了错位"
+- "我重新思考了一下，认为FrontRES还必须额外输出根节点的Δz..."（second version）
+- "关节角误差和噪音到底是什么？这个问题似乎不太清晰明确，很难让人一下就想到"
+- "我发现单纯加这种保护似乎不能根治，这似乎是一个新的研究问题"
+- "我观察了新的实验记录，staircase level到4后GMT才出现下降趋势，如果只是简单的DR，那GMT完全就能承受，FrontRES的学习速度很慢"
+- "我认为我们需要的是直接使用GMT扛不住的Motion Perturbation，不要再缓慢上升了"
+
+---
+
+7. Pending Tasks:
+
+- **Implement root orientation tilt perturbation** in `MotionPerturbationCfg` and `MotionPerturber` — GMT fails at 3-5° pitch/roll, directly creates gravitational torque
+- **Implement joint angle noise perturbation** — directly in FrontRES's correction domain
+- **Disable staircase** (set `dr_staircase_multipliers=""`) and use fixed strong values for new perturbation types
+- **Update `commands.py`** to apply root tilt at `anchor_quat_w` and joint noise at `joint_pos` property
+- **Update checkpoint path** in `rsl_rl_ppo_cfg.py` to latest checkpoint (currently model_58500, training likely further advanced)
+- **Consider FrontRES Δz output** (lower priority, after new perturbation types validated)
+- **Consider future frame input** (lower priority, after GMT failure signal established)
+
+---
+
+8. Current Work:
+
+The most recent work was reading `commands.py` to understand data flow for implementing new perturbation types. The user's final request: "我认为我们需要的是直接使用GMT扛不住的Motion Perturbation，不要再缓慢上升了" (need perturbations GMT cannot handle, no more slow ramp).
+
+The grep of commands.py revealed:
+- `joint_pos` property (line 1288-1289): `return self._gather_by_motion("joint_pos")` — insertion point for joint noise
+- `anchor_quat_w` property (line 1332-1334): `return quat[:, self.motion_anchor_body_index]` — insertion point for root orientation tilt
+
+The plan was to implement:
+1. Add `root_tilt_prob`, `root_tilt_ratio` and `joint_noise_prob`, `joint_noise_std` to `MotionPerturbationCfg`
+2. Add `_apply_root_tilt()` and `_apply_joint_noise()` to `MotionPerturber`
+3. Add `apply_quat_perturbation()` and `apply_joint_perturbation()` public methods
+4. Update `anchor_quat_w` in commands.py to call quat perturbation
+5. Update `joint_pos` in commands.py to call joint noise perturbation
+6. Set strong initial values in `tracking_env_cfg.py` (root_tilt_prob=0.3, root_tilt_ratio=0.15 rad; joint_noise_prob=0.4, joint_noise_std=0.08 rad)
+7. Disable staircase in `rsl_rl_ppo_cfg.py` (set multipliers="")
+
+---
+
+9. Optional Next Step:
+
+The user's most recent request: "我认为我们需要的是直接使用GMT扛不住的Motion Perturbation，不要再缓慢上升了"
+
+Next step: Implement root orientation tilt and joint angle noise perturbations across:
+1. `motion_perturbations.py`: Add new fields to `MotionPerturbationCfg` and new methods to `MotionPerturber`
+2. `commands.py`: Apply tilt at `anchor_quat_w` (line 1332) and joint noise at `joint_pos` (line 1288)
+3. `tracking_env_cfg.py`: Set strong initial values that immediately challenge GMT (root_tilt ~0.15 rad, joint_noise_std ~0.08 rad)
+4. `rsl_rl_ppo_cfg.py`: Disable staircase (`dr_staircase_multipliers: str = ""`) + set float/sink at moderate fixed level
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: C:\Users\ChengYuxuan\.claude\projects\c--ArtiIntComVis-MOSAIC\2b99aabb-3476-4bdb-9737-6e7bcc708a5e.jsonl
+Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.
+
+---
+
+
+**Claude**
+
+Now let me check the tracking_env_cfg.py for the current perturbation config and the ppo_cfg for staircase settings.
+
+---
+
+
+**Claude**
+
+文件完整正确。现在做一次整体变更总结：
+
+---
+
+**修改了 4 个文件：**
+
+**[motion_perturbations.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/motion_perturbations.py)**
+- `MotionPerturbationCfg` 新增 `root_tilt_prob/root_tilt_max_rad` 和 `joint_noise_prob/joint_noise_std` 四个字段
+- `MotionPerturber` 新增公开方法 `apply_quat_perturbation()` 和 `apply_joint_perturbation()`
+- 实现 `_apply_root_tilt()`：在水平面随机方向施加最大 `root_tilt_max_rad` 的四元数旋转，四元数乘法 `q_tilt × q_orig`
+- 实现 `_apply_joint_noise()`：对 q_ref 所有关节叠加均值为 0、标准差为 `joint_noise_std` 的高斯噪声
+
+**[commands.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/commands.py)**
+- `anchor_quat_w`（第 1332 行）：提取 root quat 后调用 `perturber.apply_quat_perturbation()`
+- `joint_pos`（第 1288 行）：gather 后调用 `perturber.apply_joint_perturbation()`
+
+**[tracking_env_cfg.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py)**
+- 新增：`root_tilt_prob=0.3, root_tilt_max_rad=0.15 rad`（~8.6°，超过 GMT 失衡阈值 3-5°）
+- 新增：`joint_noise_prob=0.4, joint_noise_std=0.08 rad`（~4.6°/关节，直接在 FrontRES Δq 域内）
+
+**[rsl_rl_ppo_cfg.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py)**
+- `dr_staircase_multipliers` 置为 `""` — 禁用阶梯课程，直接以固定强度训练
+
+推到服务器后，训练一开始就会同时施加根节点倾斜（破坏 GMT 平衡）和关节噪声（给 FrontRES 提供可学习的直接信号），`r_delta` 应当从 0.0015 的平台显著上升。
+
+---
+
+
+**Claude**
+
+先探索 Stage 1 的训练结构，了解当前架构再决定如何修改。
+
+---
+
+
+**Claude**
+
+让我读取关键文件来决定具体修改方案：
+
+---
+
+
+**Claude**
+
+Now let me read the observation functions and the Stage 1 environment config:
+
+---
+
+
+**Claude**
+
+Let me read the remaining relevant files:
+
+---
+
+
+**Claude**
+
+Now let me check the G1FlatSupervisedRunnerCfg in ppo_cfg:
+
+---
+
+
+**Claude**
+
+现在我完整理解了代码结构。Stage 1 需要的新输出项是 **Δz**（根节点竖直位置修正），使 FrontRES 输出从 29 维扩展到 30 维（29 Δq + 1 Δz）。以下依序修改所有文件。
+
+**修改 1：`observations.py`** — 新增监督目标函数：
+
+---
+
+
+**Claude**
+
+**修改 2：`tracking_env_cfg.py`** — Stage 1 TargetCfg 切换到新函数，同时保留 line 678 的旧函数：
+
+---
+
+
+**Claude**
+
+**修改 3：`rsl_rl_cfg.py`** — 新增 `num_z_outputs`、`num_joint_outputs`、`z_loss_weight` 配置字段：
+
+---
+
+
+**Claude**
+
+这些诊断错误是预先存在的 `MISSING` 类型问题，与本次修改无关。继续实现后续文件。
+
+**修改 4：`supervise_learning.py`** — 添加 `num_z_outputs` 参数，扩展 student 输出维度：
+
+---
+
+
+**Claude**
+
+**修改 5：`supervise.py`** — 添加 `num_joint_outputs`/`z_loss_weight` 参数，拆分 Δq/Δz 的损失逻辑：
+
+---
+
+
+**Claude**
+
+Now update `init_storage` to use the full output size, and `update()` to split Δq/Δz:
+
+---
+
+
+**Claude**
+
+Now update the `update()` method's masking and loss logic to split Δq and Δz:
+
+---
+
+
+**Claude**
+
+**修改 6：`rsl_rl_ppo_cfg.py`** — 更新 Stage 1 配置启用 `num_z_outputs=1`：
+
+---
+
+
+**Claude**
+
+这些错误与之前总结里提到的预先存在的 `@configclass` vs Pyright 兼容问题完全相同（Pyright 无法识别 `@configclass` 装饰器动态生成的参数），不影响运行时。继续完成 Stage 2 架构适配。
+
+**修改 7：`front_residual_actor_critic.py`** — 添加 `num_z_outputs` 支持，拆分 Δq/Δz 输出：
+
+---
+
+
+**Claude**
+
+这些警告都是 `self.distribution = None` 的预先存在问题。继续更新 `FrontRESActorCritic` 的核心参数和方法：
+
+---
+
+
+**Claude**
+
+参数已声明但尚未使用，需要在 `__init__` 体中添加对应逻辑。找到需要修改的关键位置：
+
+---
+
+
+**Claude**
+
+Now make the three targeted edits — store attributes, fix residual_actor output dim, fix std dim, fix ComposedActor call:
+
+---
+
+
+**Claude**
+
+Now update `_apply_delta_q_and_run_gmt` and `_frontres_forward` and `update_distribution` to split the output:
+
+---
+
+
+**Claude**
+
+Now update `_frontres_forward` and `update_distribution` to split [Δq, Δz]:
+
+---
+
+
+**Claude**
+
+Now update `update_distribution` to split the full output correctly:
+
+---
+
+
+**Claude**
+
+`frontres_mean` 还未传给 distribution，需要读取后续代码完成替换：
+
+---
+
+
+**Claude**
+
+Now update `get_env_action` to extract the Δq slice from the full 30-dim sample:
+
+---
+
+
+**Claude**
+
+最后更新 Stage 2 的 `rsl_rl_cfg.py` 配置项和 `rsl_rl_ppo_cfg.py` Stage 2 运行器配置：
+
+---
+
+
+**Claude**
+
+Now update the Stage 2 runner config in `rsl_rl_ppo_cfg.py` to enable `num_z_outputs=1`:
+
+---
+
+
+**Claude**
+
+所有修改完成。以下是完整变更汇总：
+
+---
+
+## Stage 1 修改汇总（7 个文件）
+
+### 核心架构变更：FrontRES 输出 29 → 30（29 Δq + 1 Δz）
+
+| 文件 | 变更 |
+|------|------|
+| [observations.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/observations.py) | 新增 `get_supervision_target_delta_q_z()`，返回 `[Δq_gt(29), Δz_gt(1)]`，其中 `Δz_gt = z_sim − z_ref` |
+| [tracking_env_cfg.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py) | Stage 1 `TargetCfg` 切换到新函数，监督目标升至 30 维 |
+| [supervise_learning.py](source/rsl_rl/rsl_rl/modules/supervise_learning.py) | 新增 `num_z_outputs` 参数，student MLP 输出 `num_actions + num_z_outputs` 维 |
+| [supervise.py](source/whole_body_tracking/whole_body_tracking/utils/supervise.py) | 新增 `num_joint_outputs`/`z_loss_weight` 参数；时间门控只作用于 Δq（0:29），Δz（29:）仅用终端 mask；两路损失加权求和 |
+| [rsl_rl_cfg.py](source/whole_body_tracking/whole_body_tracking/utils/rsl_rl_cfg.py) | `RslRlSuperviseJointPosCfg` 加 `num_z_outputs`；`RslRlSuperviseAlgorithmCfg` 加 `num_joint_outputs`、`z_loss_weight`；`RslRlFrontResidualActorCriticCfg` 加 `num_z_outputs`、`max_delta_z` |
+| [rsl_rl_ppo_cfg.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py) | Stage 1：`num_z_outputs=1`、`num_joint_outputs=29`、`z_loss_weight=0.5`；Stage 2：`num_z_outputs=1`、`max_delta_z=0.3` |
+| [front_residual_actor_critic.py](source/rsl_rl/rsl_rl/modules/front_residual_actor_critic.py) | `FrontRESActorCritic`：加 `num_z_outputs`/`max_delta_z`，residual_actor 输出 30 维，std 30 维，distribution 覆盖全部输出；`get_env_action` 只取 `[:29]` 传给 GMT；`ComposedActor` 同步更新 |
+
+### 设计要点
+
+- **Stage 1 Δz 信号**：无扰动时 `z_ref ≈ z_sim`（GMT 跟踪好），Δz_gt 量级约 1–3mm，因此 `z_loss_weight=0.5` 避免影响 Δq 收敛。Stage 2 RL 在 float/sink 扰动激活后 Δz 信号会大幅增强。
+- **时间门控隔离**：Δz 是米级位置量，变化频率与弧度级关节角不同，不应使用 0.2 rad 的跳变阈值，因此门控只作用于 Δq 前 29 维。
+- **Stage 2 兼容**：`get_env_action` 截取 `[:29]` 传 GMT，rollout buffer 存储完整 30 维输出用于 PPO log_prob 计算，架构前向兼容。
+
+---
+
+
+**Claude**
+
+先读取 Stage 1/2 日志相关代码，再统一实施：
+
+---
+
+
+**Claude**
+
+Let me read the `_perturb_target` initialization section:
+
+---
+
+
+**Claude**
+
+现在我有了完整的上下文，开始系统实施三处修改。
+
+---
+
+## 先讨论 Δz 的 Reward 设计（再实施其余两点）
+
+Stage 2 中 FrontRES 输出 Δz，但当前 Δz **未作用于环境**，PPO 梯度对 Δz 维度为零——网络无法学习。有三条路：
+
+| 方案 | 原理 | 复杂度 | 推荐时机 |
+|------|------|--------|---------|
+| **A. 冻结 Δz（Stage 2 only train Δq）** | 从 Stage 1 加载 Δz 权重，Stage 2 只对 `[:29]` Δq 做 RL | 低 | 现在，先跑通 Δq RL |
+| **B. 显式辅助奖励 `r_z`** | `r_z = −λ · \|Δz − (z_sim − z_ref)\|²`，加到 r_delta 里 | 中 | 需要 env 每步提供 z_gt，设计奖励权重 |
+| **C. 环境级应用（apply Δz → anchor_pos_w）** | runner 每步把 Δz 写入 command term，下一步的 tracking reward 自然奖励正确 Δz | 高 | 架构验证后 |
+
+**我的建议**：现在先用 **方案 A**（加一个 `freeze_z_outputs: bool = True` 开关），让 Stage 2 RL 专注于 Δq，避免 Δz 因零梯度随机漂移。Stage 1 建立的 Δz 权重不会被破坏，日后切换方案 B 或 C 只需修改该标志。
+
+---
+
+现在实施 WandB 日志 + 陡峭 DR 课程。
+
+**修改 1：`supervise.py`** — Stage 1 loss_dict 增加 Δz 分类指标：
+
+---
+
+
+**Claude**
+
+Now replace the linear `_dr_scale` computation with the schedule-aware version, and add new perturbation types to the per-iteration update:
+
+---
+
+
+**Claude**
+
+Now add the Δz accumulator in the rollout state initialization and the per-step update, plus the freeze_z_outputs mechanism:
+
+---
+
+
+**Claude**
+
+Find and update the per-step Δz accumulation after `policy.act()`. First locate the right line:
+
+---
+
+
+**Claude**
+
+Now add freeze_z_outputs logic and Stage 2 Δz computed vars, then update `frontres_dr_scale` to use the schedule:
+
+---
+
+
+**User**
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Summary:
+1. Primary Request and Intent:
+
+This session covered three major phases of development on MOSAIC FrontRES:
+
+**Phase 1**: Implement new motion perturbations (root orientation tilt + joint noise) that GMT cannot handle, replacing the ineffective float/sink staircase DR. Root tilt creates gravitational torque at ~3-5° that GMT cannot absorb; joint noise is directly in FrontRES's Δq correction domain.
+
+**Phase 2**: Restart Stage 1 FrontRES training with a new Δz output, making FrontRES output 30 dims (29 Δq joint corrections + 1 Δz root vertical correction). This required modifying supervision targets, loss computation, network architecture, and Stage 2 compatibility.
+
+**Phase 3** (in progress): Three sub-requests:
+1. Update WandB logging for Stage 1 and Stage 2 to include Δz metrics
+2. Discuss reward design for Δz in Stage 2 RL
+3. Replace staircase DR curriculum with a steeper exponential schedule
+
+---
+
+2. Key Technical Concepts:
+
+- **FrontRES Stage 1**: Supervised learning where student MLP learns to predict [Δq_gt (29), Δz_gt (1)] from observations
+- **Δz supervision target**: `delta_z_gt = z_sim - z_ref = robot.data.root_pos_w[:, 2] - anchor_pos_w[:, 2]`. Negative = reference floating above robot
+- **Temporal gate**: Applied only to Δq (joint angle changes, rad scale); Δz uses only terminal mask (position-scale quantity)
+- **Root orientation tilt**: Perturbs `anchor_quat_w` via quaternion multiplication with random horizontal-axis rotation. Creates gravitational torque GMT cannot handle at 8.6°
+- **Joint noise**: Gaussian noise on reference joint angles. Directly in FrontRES's Δq correction domain
+- **Exponential DR schedule**: `dr_scale = 1 - exp(-t/τ)` where `τ = dr_curriculum_iters/3`. Reaches 95% at `t=dr_curriculum_iters`, much steeper than linear
+- **ComposedActor**: FrontRES → [Δq, Δz] → applies only Δq to q_ref in obs → GMT → robot actions. Δz stored in `last_delta_z` but not applied to environment yet
+- **PPO distribution over full output**: Normal distribution over `total_output_dim=30` dims; `get_env_action` extracts `[:29]` (Δq only) for GMT
+- **Reward options for Δz**: (A) env-level apply Δz to anchor_pos_w [complex], (B) explicit `r_z = -λ|Δz-Δz_gt|²` [semi-supervised], (C) freeze Δz from Stage 1 [recommended: simplest]
+
+---
+
+3. Files and Code Sections:
+
+**`source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/motion_perturbations.py`**
+- Added `import math`
+- Extended `MotionPerturbationCfg` with 4 new fields:
+  ```python
+  root_tilt_prob: float = 0.0
+  root_tilt_max_rad: float = 0.0  # GMT fails at ~0.05-0.09 rad
+  joint_noise_prob: float = 0.0
+  joint_noise_std: float = 0.0
+  ```
+- Added public methods `apply_quat_perturbation(root_quat)` and `apply_joint_perturbation(joint_pos)`
+- `_apply_root_tilt()`: Random horizontal-axis tilt via quaternion multiplication (w,x,y,z convention):
+  ```python
+  tilt_dir = torch.rand(...) * (2.0 * math.pi)
+  tilt_mag = torch.rand(...) * self.cfg.root_tilt_max_rad
+  half = tilt_mag * 0.5
+  tilt_quat = torch.stack([cos(half), sin(half)*cos(tilt_dir), sin(half)*sin(tilt_dir), zeros], dim=-1)
+  # q_out = tilt_quat * quat
+  ```
+- `_apply_joint_noise()`: `noise = randn(num_envs, num_joints) * std`
+
+**`source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/commands.py`**
+- `anchor_quat_w` property: `return self.perturber.apply_quat_perturbation(root_quat)`
+- `joint_pos` property: `return self.perturber.apply_joint_perturbation(raw)`
+
+**`source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py`**
+- Stage 2 `FrontRESFinetuneTrackingEnvCfg.__post_init__`: added
+  ```python
+  self.motion_perturbations.root_tilt_prob = 0.3
+  self.motion_perturbations.root_tilt_max_rad = 0.15
+  self.motion_perturbations.joint_noise_prob = 0.4
+  self.motion_perturbations.joint_noise_std = 0.08
+  ```
+- Stage 1 `SupervisedObservationsCfg.TargetCfg`: updated to use `mdp.get_supervision_target_delta_q_z`
+
+**`source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp/observations.py`**
+- Added `get_supervision_target_delta_q_z()` function:
+  ```python
+  def get_supervision_target_delta_q_z(env, command_name) -> torch.Tensor:
+      command = env.command_manager.get_term(command_name)
+      q_ref = command.joint_pos; q_sim = command.robot_joint_pos
+      delta_q_gt = q_ref - q_sim  # (N, 29)
+      z_ref = command.anchor_pos_w[:, 2:3]       # world z of reference
+      z_sim = command.robot.data.root_pos_w[:, 2:3]  # world z of robot
+      delta_z_gt = z_sim - z_ref  # (N, 1)
+      return torch.cat([delta_q_gt, delta_z_gt], dim=-1)  # (N, 30)
+  ```
+- Kept original `get_supervision_target_delta_q()` for backward compat
+
+**`source/rsl_rl/rsl_rl/modules/supervise_learning.py`** (`SuperviseLearning`)
+- Added `num_z_outputs: int = 0` parameter
+- `total_output_dim = num_actions + num_z_outputs` (30 when num_z_outputs=1)
+- Student MLP output changed to `total_output_dim`
+- Stored `self.num_z_outputs` and `self.num_actions`
+
+**`source/whole_body_tracking/whole_body_tracking/utils/supervise.py`** (`SuperviseTrainer`)
+- Added `num_joint_outputs: int = 29` and `z_loss_weight: float = 0.5` params
+- `init_storage`: `static_weights = ones(num_joint_outputs)` (only covers Δq dims)
+- `update()` split logic:
+  ```python
+  nj = self.num_joint_outputs
+  pred_dq = predicted_actions[:, :nj]; pred_dz = predicted_actions[:, nj:]
+  target_dq = target_actions[:, :nj];  target_dz = target_actions[:, nj:]
+  # Temporal gate only on Δq part
+  jump = (target_dq - safe_prev_dq).abs()
+  # Δz: simple terminal mask
+  dz_loss = (dz_per * valid).sum() / n_valid_z
+  behavior_loss = dq_loss + self.z_loss_weight * dz_loss
+  ```
+- Added accumulators: `sum_dq_loss`, `sum_dz_loss`, `sum_dz_pred_abs`, `sum_dz_gt_abs`, `sum_dz_mae`
+- Updated `loss_dict` to include `loss_dq`, `loss_dz`, `dz_pred_abs`, `dz_gt_abs`, `dz_mae`
+
+**`source/whole_body_tracking/whole_body_tracking/utils/rsl_rl_cfg.py`**
+- `RslRlSuperviseJointPosCfg`: added `num_z_outputs: int = 0`
+- `RslRlSuperviseAlgorithmCfg`: added `num_joint_outputs: int = 29`, `z_loss_weight: float = 0.5`
+- `RslRlFrontResidualActorCriticCfg`: added `num_z_outputs: int = 0`, `max_delta_z: float = 0.3`
+
+**`source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py`**
+- Stage 1 `G1FlatSupervisedRunnerCfg`:
+  ```python
+  policy = RslRlSuperviseJointPosCfg(num_z_outputs=1, ...)
+  algorithm = RslRlSuperviseAlgorithmCfg(num_joint_outputs=29, z_loss_weight=0.5, ...)
+  ```
+- Stage 2 `G1FlatFrontRESFinetuneRunnerCfg`:
+  ```python
+  policy = RslRlFrontResidualActorCriticCfg(num_z_outputs=1, max_delta_z=0.3, ...)
+  ```
+- Staircase disabled: `dr_staircase_multipliers: str = ""`
+
+**`source/rsl_rl/rsl_rl/modules/front_residual_actor_critic.py`** (`FrontRESActorCritic` + `ComposedActor`)
+- `ComposedActor`: added `num_z_outputs` param; splits `frontres_out[:, :num_actions]` for Δq in forward
+- `FrontRESActorCritic.__init__`:
+  - Added `num_z_outputs: int = 0`, `max_delta_z: float = 0.3`
+  - `self.total_output_dim = num_actions + num_z_outputs`
+  - `residual_actor` output = `total_output_dim`
+  - `std`/`log_std` dimension = `total_output_dim`
+- `_frontres_forward()`:
+  ```python
+  raw = self.residual_actor(policy_obs)
+  delta_q = torch.tanh(raw[:, :self.num_actions]) * self.max_delta_q
+  if self.num_z_outputs > 0:
+      self.last_delta_z = torch.tanh(raw[:, self.num_actions:]) * self.max_delta_z
+  ```
+- `update_distribution()`:
+  ```python
+  delta_q_mean = tanh(raw[:, :num_actions]) * max_delta_q
+  delta_z_mean = tanh(raw[:, num_actions:]) * max_delta_z  # if num_z_outputs > 0
+  frontres_mean = cat([delta_q_mean, delta_z_mean])
+  self.distribution = Normal(frontres_mean, std)
+  ```
+- `get_env_action()`: `delta_q_only = delta_q_sample[:, :self.num_actions]` passed to GMT
+
+**`source/rsl_rl/rsl_rl/runners/on_policy_runner.py`** (in progress)
+- Added `import math`
+- Expanded `_perturb_target` to include `root_tilt_prob`, `root_tilt_max_rad`, `joint_noise_prob`, `joint_noise_std`
+- Added `_dr_schedule_type = self.cfg.get("dr_schedule_type", "linear")`
+- Replaced linear `_dr_scale` with:
+  ```python
+  if _dr_schedule_type == "exp":
+      _tau = max(1.0, _dr_curriculum_iters / 3.0)
+      _dr_scale = float(min(1.0, 1.0 - math.exp(-_stage2_progress / _tau)))
+  elif _dr_schedule_type == "sqrt":
+      _dr_scale = float(min(1.0, (_stage2_progress / max(1, _dr_curriculum_iters)) ** 0.5))
+  else:
+      _dr_scale = float(min(1.0, max(0.0, _stage2_progress / max(1, _dr_curriculum_iters))))
+  ```
+- Added new perturbation types to per-iteration perturber update
+- Added `_frontres_delta_z_abs_sum: float = 0.0` accumulator
+- Added per-step Δz accumulation: `_frontres_delta_z_abs_sum += policy.last_delta_z.abs().mean().item()`
+- **NOT YET**: `frontres_dr_scale` still uses old linear formula at line 939; `log()` method not updated for new metrics; `rsl_rl_ppo_cfg.py` Stage 2 config not updated with `dr_schedule_type`
+
+---
+
+4. Errors and Fixes:
+
+- **Pre-existing IDE diagnostics** (Pyright `@configclass` vs Python runtime): Lines in `rsl_rl_ppo_cfg.py` showing "no parameter named X" for `RslRlSuperviseAlgorithmCfg` fields — confirmed pre-existing, not runtime errors, no fix needed
+- **`math` import hint**: After adding `import math` to `motion_perturbations.py`, IDE showed "未存取" (unused) hint until `_apply_root_tilt` was added — resolved when implementation completed
+- **`frontres_mean` unused hint**: After refactoring `update_distribution()`, `frontres_mean` was defined but not passed to `Normal()` until the distribution line was updated — resolved in subsequent edit
+
+---
+
+5. Problem Solving:
+
+**Solved**:
+- New motion perturbations implemented: root_tilt (quaternion rotation) and joint_noise (Gaussian on joints)
+- Stage 1 architecture updated: 30-dim output [Δq(29), Δz(1)] with supervised targets
+- Stage 2 FrontRESActorCritic updated: handles 30-dim output, PPO over full output, GMT gets Δq slice only
+- Temporal gate correctly isolated to Δq dims (Δz uses simpler terminal mask)
+- DR curriculum: exponential schedule replaces staircase
+- Stage 1 loss_dict: split Δq/Δz metrics for separate WandB logging
+
+**In progress**:
+- `on_policy_runner.py` `log()` method: needs Δz metrics for Stage 1 (`Loss/` → `Stage1/DeltaZ/`) and Stage 2 (`FrontRES/delta_z_abs_mean`)
+- `frontres_dr_scale` local var: still uses linear formula, needs update to match new schedule
+- `rsl_rl_ppo_cfg.py`: needs `dr_schedule_type="exp"` and updated `dr_curriculum_iterations`
+
+**Pending Decision**:
+- Reward for Δz in Stage 2: Option C (freeze Δz, only train Δq) is recommended. Needs user confirmation.
+
+---
+
+6. All User Messages:
+
+- "现在如果我使用最新的FrontRES的权重尝试修正一段加过扰动的动作序列..." (visualization question from previous session)
+- "我认为我们需要的是直接使用GMT扛不住的Motion Perturbation，不要再缓慢上升了" (need perturbations GMT cannot handle)
+- "由于FrontRES需要添加新的输出项，因此必须从新开始Stage1的训练，请再修改Stage 1" (restart Stage 1 with new Δz output)
+- "我认为还需要修改的点：1、Stage 1和Stage 2 的wandb更新项 2、由于新增了delta_z，Reward项需要讨论 3、DR必须具有Curriculum schedule，先前我们讨论的是阶梯式，但现在请修改成更陡峭的形态" (three modifications needed)
+
+---
+
+7. Pending Tasks:
+
+- **Complete `on_policy_runner.py` `log()` updates**:
+  - Route Stage 1 Δz keys (`loss_dz`, `dz_pred_abs`, `dz_gt_abs`, `dz_mae`) to `Stage1/DeltaZ/` namespace
+  - Add `FrontRES/delta_z_abs_mean` for Stage 2 using `_frontres_delta_z_abs_sum / _frontres_shaping_steps`
+  - Update `frontres_dr_scale` local variable (line ~939) to use the same exponential schedule instead of old linear formula
+
+- **Update `rsl_rl_ppo_cfg.py` Stage 2 config**: Add `dr_schedule_type: str = "exp"` and `dr_curriculum_iterations: int = 1500`
+
+- **Decide and implement Δz reward for Stage 2**: User needs to confirm approach:
+  - Option A: Apply Δz to anchor_pos_w via runner (complex, most principled)
+  - Option B: `r_z = -λ|Δz - Δz_gt|²` explicit reward (semi-supervised)
+  - Option C: Freeze Δz from Stage 1 during Stage 2 RL (recommended, add `freeze_z_outputs: bool = True`)
+
+- **Remove/clean up staircase plateau detection code** from `on_policy_runner.py` (staircase already disabled via `dr_staircase_multipliers=""` but code still present and adds complexity)
+
+---
+
+8. Current Work:
+
+Was in the middle of implementing three changes to `on_policy_runner.py`:
+
+**WandB logging updates** — Added `_frontres_delta_z_abs_sum` accumulator and per-step Δz accumulation. Still need to update `log()` method to output:
+- For Stage 1: `Stage1/DeltaZ/loss_dz`, `Stage1/DeltaZ/dz_pred_abs`, `Stage1/DeltaZ/dz_gt_abs`, `Stage1/DeltaZ/dz_mae`
+- For Stage 2: `FrontRES/delta_z_abs_mean = _frontres_delta_z_abs_sum / _frontres_shaping_steps`
+
+**Steeper DR curriculum** — Added exponential schedule computation and new perturbation types to perturber update. Still need to fix `frontres_dr_scale` local variable (currently at line ~939):
+```python
+# CURRENT (wrong, still linear):
+frontres_dr_scale = (min(1.0, max(0.0, (it - _stage2_start) / max(1, _dr_curriculum_iters)))
+                    if _is_frontres and _dr_curriculum_iters > 0 else None)
+# NEEDS TO BE updated to use _dr_schedule_type
+```
+
+**Config update** — `rsl_rl_ppo_cfg.py` Stage 2 still needs:
+```python
+dr_schedule_type: str = "exp"
+dr_curriculum_iterations: int = 1500
+```
+
+---
+
+9. Optional Next Step:
+
+Continue with the three pending items from the user's most recent request: "Stage 1和Stage 2 的wandb更新项...DR必须具有Curriculum schedule...请修改成更陡峭的形态"
+
+Immediate next step: Update `on_policy_runner.py` `log()` method to route Δz metrics, and update the `frontres_dr_scale` local variable to use the exponential schedule. Then update `rsl_rl_ppo_cfg.py` with `dr_schedule_type="exp"` and `dr_curriculum_iterations=1500`.
+
+Specifically, the `log()` method at line ~1040 needs:
+```python
+# Stage 1: route Δz metrics to dedicated namespace
+_stage1_dz_keys = {"loss_dz", "dz_pred_abs", "dz_gt_abs", "dz_mae"}
+for key, value in locs["loss_dict"].items():
+    if key in _stage1_dz_keys:
+        self.writer.add_scalar(f"Stage1/DeltaZ/{key}", value, locs["it"])
+    elif isinstance(self.alg.policy, FrontRESActorCritic) and key in _frontres_diag_keys:
+        self.writer.add_scalar(f"FrontRES/{key}", value, locs["it"])
+    else:
+        self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
+
+# Stage 2: Δz magnitude logging
+if locs.get("frontres_delta_z_abs_mean") is not None:
+    self.writer.add_scalar("FrontRES/delta_z_abs_mean", locs["frontres_delta_z_abs_mean"], locs["it"])
+```
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: C:\Users\ChengYuxuan\.claude\projects\c--ArtiIntComVis-MOSAIC\2b99aabb-3476-4bdb-9737-6e7bcc708a5e.jsonl
+Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.
+
+---
+
+
+**Claude**
+
+Now let me find the `_frontres_delta_z_abs_sum` accumulator and the perturber update section:
+
+---
+
+
+**Claude**
+
+Good, the DR schedule and delta_z accumulator are already in place. Now I need to fix the two remaining issues:
+
+1. `frontres_dr_scale` at line 939 (still uses old linear formula)
+2. `log()` method needs Δz metric routing
+
+---
+
+
+**Claude**
+
+Now I have everything I need. Let me make all three changes:
+
+---
+
+
+**Claude**
+
+Now update the `log()` method to route Stage 1 Δz metrics and log Stage 2 Δz:
+
+---
+
+
+**Claude**
+
+Now add Stage 2 Δz magnitude logging in the FrontRES block of `log()`:
+
+---
+
+
+**Claude**
+
+Found a critical bug. The `init_storage` for Stage 1 passes `[self.env.num_actions]` (=29) as `action_shape` but the supervision target from `get_supervision_target_delta_q_z` is 30-dim — this would crash at runtime. Let me verify and fix it:
+
+---
+
+
+**Claude**
+
+Found the critical bug. Line 281: `[self.env.num_actions]` = 29 is passed as `action_shape` for the target buffer, but the supervision target is 30-dim. This crashes on `add_transitions`. Let me fix this and the `has_dz` logic in `supervise.py` at the same time:
+
+---
+
+
+**Claude**
+
+Now fix the `has_dz` check in `supervise.py` — it would be `False` early in training when Δz predictions are near zero, wrongly suppressing Δz log entries:
+
+---
+
+
+**Claude**
+
+Now let me verify `SuperviseLearning` has `self.num_z_outputs` as an attribute:
+
+---
+
+
+**Claude**
+
+Good — `self.num_z_outputs` exists. Now let me do a complete review of the sign convention and the Stage 1 config wiring:
+
+---
+
+
+**Claude**
+
+I need to check how Δq is actually applied in ComposedActor to verify sign consistency:
+
+---
+
+
+**Claude**
+
+Now I have the full picture. Let me also verify how `privileged_obs` = supervision target flows into the runner in Stage 1:
+
+---
+
+
+**Claude**
+
+Everything is now consistent. Let me give the complete analysis:
+
+---
+
+## Stage 1 代码审查结论
+
+### 1. 符号约定是否正确
+
+**Δq 方向：正确 ✓**
+
+```
+delta_q_gt = q_ref - q_sim   (rad)
+```
+
+逻辑链：假设 GMT 存在系统性欠跟踪 `q_sim = q_ref - ε`，则：
+- `Δq_gt = q_ref - q_sim = ε`（正值）
+- 应用：`q_ref_corrected = q_ref + Δq_pred = q_ref + ε`
+- GMT 再次跟踪：`q_sim_new ≈ (q_ref + ε) - ε = q_ref` ✓
+
+FrontRES 学的是 GMT 系统性误差的逆补偿，方向正确。
+
+**Δz 方向：正确 ✓**
+
+```
+delta_z_gt = z_sim - z_ref   (m)
+```
+
+逻辑链：Float 扰动使 `z_ref > z_sim`（参考上浮），则：
+- `Δz_gt = z_sim - z_ref < 0`（负值）
+- 应用：`anchor_z_corrected = anchor_z + Δz = z_ref + (z_sim - z_ref) = z_sim` ✓
+
+---
+
+### 2. 发现并修复的 Bug
+
+**Bug 1（已修复）— 严重，Stage 1 会直接崩溃：**
+
+[on_policy_runner.py:281](source/rsl_rl/rsl_rl/runners/on_policy_runner.py#L281)：`init_storage` 传入 `[self.env.num_actions]` = [29] 作为 `action_shape`，但监督目标是 30 维 `[Δq(29), Δz(1)]`。`add_transitions` 中 `.copy_()` 会因 shape 不匹配而崩溃。
+
+修复：改为 `[num_privileged_obs]`（= 30，由 `obs_dict["target"].shape[1]` 推断）。
+
+**Bug 2（已修复）— Δz 日志被静默屏蔽：**
+
+[supervise.py:314-316](source/whole_body_tracking/whole_body_tracking/utils/supervise.py#L314)：`has_dz = sum_dz_pred_abs > 0.0`。Stage 1 无扰动时 Δz_gt ≈ 0 → 模型输出 ≈ 0 → 条件为 False → Δz 日志条目被清空，尽管网络结构上确实有 Δz 输出。
+
+修复：改为结构性判断 `has_dz = getattr(self.policy, 'num_z_outputs', 0) > 0`。
+
+---
+
+### 3. Loss 项评估
+
+| 项目 | 量级参考 | 评注 |
+|------|---------|------|
+| `loss_dq` (Huber) | 初始 ~0.1–0.3 → 收敛 ~0.005–0.02 | 主训练信号，关注这个 |
+| `loss_dz` (Huber) | Stage 1 始终 ≈ 0 | Stage 1 无扰动，Δz_gt ≈ 0，本项无意义但不影响 Δq 训练 |
+| `z_loss_weight=0.5` | — | Stage 1 中 `dz_loss * 0.5 ≈ 0`，对 `behavior` 无影响 |
+
+**关于 `z_loss_weight=0.5`：** Stage 1 中该项贡献为零，保留即可。它在 Stage 2 RL 后才有实际意义（如果用 Option B/A 奖励 Δz）。若用 Option C（冻结 Δz），可直接忽略。
+
+---
+
+### 4. WandB 诊断项（已就绪）
+
+Stage 1 现在输出以下组：
+
+**`Loss/` 组（主要收敛信号）：**
+- `behavior` — 加权总 loss（Δq + 0.5×Δz）
+- `loss_dq` — 纯 Δq Huber loss
+- `delta_q_norm_ratio` — `||Δq_pred||/||Δq_gt||`，理想值接近 1.0
+- `cosine_similarity` — 预测方向准确度，理想 > 0.85
+- `valid_ratio` — 非 done 帧比例（应 ≈ 1.0）
+- `cascade_gate_ratio` — 级联 mask（Stage 1 无扰动应 ≈ 1.0）
+- `joint_mae_mean` / `joint_mae_max` — 各关节平均/最大 MAE
+
+**`Stage1/DeltaZ/` 组（Δz 专项，新增）：**
+- `loss_dz` — 应始终 ≈ 0
+- `dz_pred_abs` — `|Δz_pred|` 均值，应 < 0.01 m
+- `dz_gt_abs` — `|Δz_gt|` 均值，应 ≈ 0 m（无扰动）
+- `dz_mae` — `|Δz_pred − Δz_gt|` 均值
+
+**`GMT/` 组：**
+- `mean_episode_length` — GMT 在环境中存活长度（Stage 1 中反映数据集难度，非 FrontRES 质量）
+
+---
+
+### 5. 收敛判据
+
+按重要性排序：
+
+| 指标 | 收敛标准 | 说明 |
+|------|---------|------|
+| `cosine_similarity` | **稳定 > 0.90** | 最重要：预测 Δq 方向与 GT 一致 |
+| `joint_mae_max` | **下降并稳定** | 单关节最差误差，监测哪些关节滞后 |
+| `delta_q_norm_ratio` | **0.8 – 1.2 之间** | < 0.8 → 欠预测（保守），> 1.2 → 过预测（激进） |
+| `behavior` / `loss_dq` | **曲线平坦，无明显下降** | Loss 曲线到达平台即可 |
+| `valid_ratio` | **≈ 1.0** | temporal gate 触发率低，数据集干净 |
+| `cascade_gate_ratio` | **≈ 1.0** | Stage 1 无扰动，此项不应有问题 |
+
+**不要依赖 GMT 存活时长判断 Stage 1 收敛**，因为 Stage 1 中 FrontRES 的预测结果不被用于驱动环境（GMT 直接控制机器人），存活时长仅反映动作集难度。
+
+典型收敛点：`cosine_similarity` 在 15k–25k iter 附近到达 > 0.90 平台，`joint_mae_max` 趋于稳定（约 0.05–0.1 rad 量级，具体取决于数据集中困难片段比例）。
+
+---

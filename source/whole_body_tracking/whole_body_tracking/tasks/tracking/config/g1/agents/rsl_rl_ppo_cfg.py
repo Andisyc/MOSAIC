@@ -151,15 +151,22 @@ class G1FlatSupervisedRunnerCfg(RslRlOnPolicyRunnerCfg):
         student_hidden_dims=[1024, 1024, 512, 256],
         activation="elu",
         gmt_path=_gmt_pt_path,
+        # FrontRES outputs Δq (29 dims) + Δz (1 dim) = 30 dims total.
+        # Δz supervised target = z_sim - z_ref (root z correction, metres).
+        num_z_outputs=1,
     )
 
     algorithm = RslRlSuperviseAlgorithmCfg(
         loss_type="huber",
         # G1 29-DOF lower-limb joint indices (hip × 6, knee × 2, ankle × 4 = 12 joints).
-        # Adjust if your joint ordering differs — cross-check with the obs joint_pos slice.
         lower_limb_indices=list(range(12)),
         lower_limb_weight=2.0,
         jump_threshold=0.2,
+        # Split: first 29 dims = Δq (full masking), last 1 dim = Δz (terminal mask only).
+        num_joint_outputs=29,
+        # Δz signal is tiny in Stage 1 (no float perturbation); keep weight small
+        # so Δz doesn't bias Δq convergence. Stage 2 RL will amplify via reward.
+        z_loss_weight=0.5,
     )
 
 # ====== FrontRES Stage 1: Supervised Learning ======
@@ -199,7 +206,9 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
     # DR 课程：Stage 2 开始时 MotionPerturber 强度线性从 0 增长到 motion_perturbations 配置值。
     # 防止 FrontRES 在 Stage 2 冷启动时面对完全 OOD 的 q_ref，导致全负 r_delta → Δq=0 捷径陷阱。
     # 设为 0 禁用（直接使用全强度 DR，仅在 FrontRES 已对 Stage 2 DR 鲁棒时使用）。
-    dr_curriculum_iterations: int = 5000
+    dr_curriculum_iterations: int = 1500
+    # DR 课程形态："exp" = 指数加速（τ=T/3，t=T时达到95%）；"sqrt" = 平方根；"linear" = 匀速
+    dr_schedule_type: str = "exp"
     # Stage 2 起始绝对迭代数，用于 DR 课程进度计算，支持断点续训时正确恢复 DR 强度。
     stage2_start_iteration: int = _STAGE1_MAX_ITERATIONS
 
@@ -211,7 +220,7 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
     # 倍率列表（相对 motion_perturbations 基础值，仅缩放幅度 ratio，不改变概率 prob）：
     #   例：float_ratio=0.05 × 1.6 → 0.08 m；× 2.4 → 0.12 m；× 3.6 → 0.18 m；× 5.0 → 0.25 m
     # 设为空字符串 "" 禁用阶梯课程（只用初始 0→full 的单次课程）。
-    dr_staircase_multipliers: str = "1.6,2.4,3.6,5.0"
+    dr_staircase_multipliers: str = ""  # 已禁用：改用 root_tilt + joint_noise 直接施压
     # 每次台阶切换时线性爬坡到新幅度的迭代数（过渡期，防止突变触发 Δq=0 捷径陷阱）
     dr_staircase_ramp_iters: int = 2000
     # 每台阶最短停留迭代数（短于此时间不触发晋级，避免噪声误判为平台期）
@@ -284,6 +293,11 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
         # Δq 输出截断：tanh(raw) * max_delta_q，防止 action explosion。
         # 0.5 rad ≈ ±28.6°/关节，覆盖典型 sim-to-real 修正范围。
         max_delta_q=0.5,
+
+        # Δz 输出：与 Stage 1 保持一致（num_z_outputs=1 → 总输出 30 维）。
+        # max_delta_z=0.3m 覆盖典型 float/sink 幅度（最大 25cm 扰动 + 安全裕量）。
+        num_z_outputs=1,
+        max_delta_z=0.3,
     )
 
     algorithm = RslRlPpoFrontRESAlgorithmCfg(

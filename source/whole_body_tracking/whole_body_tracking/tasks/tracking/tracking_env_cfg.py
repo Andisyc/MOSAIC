@@ -880,8 +880,8 @@ class SupervisedTrackingEnvCfg(GeneralTrackingEnvCfg):
                 self.history_length = 5
 
         @configclass
-        class TargetCfg(ObsGroup): # 监督信号目标: delta_q_gt = q_ref - q_sim
-            supervision_target = ObsTerm(func=mdp.get_supervision_target_delta_q, params={"command_name": "motion"})
+        class TargetCfg(ObsGroup): # 监督信号目标: [delta_q (29), delta_z (1)] = 30 dims
+            supervision_target = ObsTerm(func=mdp.get_supervision_target_delta_q_z, params={"command_name": "motion"})
 
             def __post_init__(self):
                 self.enable_corruption = False
@@ -1127,3 +1127,11 @@ class FrontRESFinetuneTrackingEnvCfg(GeneralTrackingEnvCfg):
         self.motion_perturbations.foot_slip_ratio = 0.03
         self.motion_perturbations.body_drag_prob = 0.2
         self.motion_perturbations.body_drag_ratio = 0.02
+        # Root orientation tilt: creates gravitational torque GMT cannot absorb.
+        # 0.15 rad (~8.6 deg) is sufficient to destabilize GMT tracking.
+        self.motion_perturbations.root_tilt_prob = 0.3
+        self.motion_perturbations.root_tilt_max_rad = 0.15
+        # Joint angle noise: directly in FrontRES's Δq correction domain.
+        # 0.08 rad (~4.6 deg) per joint is a meaningful but learnable perturbation.
+        self.motion_perturbations.joint_noise_prob = 0.4
+        self.motion_perturbations.joint_noise_std = 0.08

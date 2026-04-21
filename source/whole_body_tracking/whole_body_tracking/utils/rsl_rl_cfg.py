@@ -220,6 +220,10 @@ class RslRlSuperviseJointPosCfg(RslRlPpoActorCriticCfg):
     class_name: str = "SuperviseLearning"
     student_hidden_dims: list[int] = [256, 256, 256]
     gmt_path: str = ""
+    # Number of auxiliary z-correction outputs appended after the Δq outputs.
+    # Total FrontRES output = num_actions (Δq) + num_z_outputs (Δz).
+    # Set to 1 for the standard [Δq (29), Δz (1)] architecture.
+    num_z_outputs: int = 0
 
 @configclass # algorithm
 class RslRlSuperviseAlgorithmCfg:
@@ -236,6 +240,12 @@ class RslRlSuperviseAlgorithmCfg:
     # Temporal gate: joints whose Δq_gt changes by more than this (rad) in one
     # step are excluded from the loss (pre-fall tracking failure detection)
     jump_threshold: float = 0.2
+    # Split point: first num_joint_outputs dims are Δq (get temporal gate + cascade mask),
+    # remaining dims are auxiliary outputs (Δz etc., get only terminal mask).
+    num_joint_outputs: int = 29
+    # Weight for auxiliary (Δz) loss relative to Δq loss.
+    # Start small: Stage 1 z tracking error without perturbations is tiny (~1-3 mm).
+    z_loss_weight: float = 0.5
 
 # ====== FrontRES Stage 1: Supervised Learning ======
 
@@ -245,7 +255,7 @@ class RslRlSuperviseAlgorithmCfg:
 class RslRlFrontResidualActorCriticCfg(RslRlPpoActorCriticCfg):
     """
     Front-End Residual Actor-Critic configuration.
-    Stage 2 RL Finetuning: FrontRES outputs Δq, which modifies q_ref before entering GMT.
+    Stage 2 RL Finetuning: FrontRES outputs [Δq, Δz], applies Δq to q_ref before GMT.
     """
     class_name: str = "FrontRESActorCritic"
 
@@ -261,6 +271,12 @@ class RslRlFrontResidualActorCriticCfg(RslRlPpoActorCriticCfg):
     gmt_checkpoint_path: str = MISSING
     gmt_policy_cfg: dict | None = None
     init_critic_from_gmt: bool = False
+
+    # Δz output configuration (must match Stage 1 setting)
+    num_z_outputs: int = 0
+    """Number of root z-correction outputs after Δq. 1 → total output = num_actions + 1."""
+    max_delta_z: float = 0.3
+    """tanh clip for Δz output (metres). 0.3 m covers typical float/sink artifacts."""
 
     # Ref vel estimator configuration (for GMT input)
     num_ref_vel_estimator_obs: int | None = None

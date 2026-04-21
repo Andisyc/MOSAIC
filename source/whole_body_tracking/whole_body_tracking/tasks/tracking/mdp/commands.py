@@ -1286,7 +1286,8 @@ class MultiMotionCommand(CommandTerm):
 
     @property
     def joint_pos(self) -> torch.Tensor:
-        return self._gather_by_motion("joint_pos")
+        raw = self._gather_by_motion("joint_pos")
+        return self.perturber.apply_joint_perturbation(raw)
 
     @property
     def joint_vel(self) -> torch.Tensor:
@@ -1331,7 +1332,8 @@ class MultiMotionCommand(CommandTerm):
     @property
     def anchor_quat_w(self) -> torch.Tensor:
         quat = self._gather_by_motion("body_quat_w")
-        return quat[:, self.motion_anchor_body_index]
+        root_quat = quat[:, self.motion_anchor_body_index]
+        return self.perturber.apply_quat_perturbation(root_quat)
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
