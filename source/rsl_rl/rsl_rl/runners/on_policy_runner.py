@@ -186,8 +186,10 @@ class OnPolicyRunner:
 
         # Track whether task-space FrontRES needs partial obs normalization.
         # When set, first _frontres_gmt_obs_dim dims are GMT-normalized;
-        # remaining dims (anchor error terms) pass through unchanged.
+        # remaining dims (anchor error terms) use Stage-1 empirical stats.
         self._frontres_gmt_obs_dim: int | None = None
+        self._frontres_extra_mean: torch.Tensor | None = None  # (1, K) Stage-1 mean for extra dims
+        self._frontres_extra_std:  torch.Tensor | None = None  # (1, K) Stage-1 std  for extra dims
 
         # Check if using ResidualActorCritic (special handling for GMT normalizer)
         if isinstance(policy, (ResidualActorCritic, FrontRESActorCritic)):
@@ -1413,6 +1415,21 @@ class OnPolicyRunner:
                 # normalizer — never overwrite it with a checkpoint's normalizer statistics.
                 if not isinstance(self.alg.policy, (ResidualActorCritic, FrontRESActorCritic)):
                     self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+                elif (isinstance(self.alg.policy, FrontRESActorCritic)
+                        and self._frontres_gmt_obs_dim is not None
+                        and "obs_norm_state_dict" in loaded_dict):
+                    # Task-space FrontRES: anchor-error dims [gmt_dim:] are not covered by
+                    # the GMT normalizer.  Restore Stage-1's empirical stats for those dims
+                    # so Stage 2 sees the same normalized scale that Stage 1 trained on.
+                    _s1_sd   = loaded_dict["obs_norm_state_dict"]
+                    _s1_mean = _s1_sd.get("_mean", None)  # shape (1, 800)
+                    _s1_std  = _s1_sd.get("_std",  None)  # shape (1, 800)
+                    if _s1_mean is not None and _s1_std is not None:
+                        gmt_dim = self._frontres_gmt_obs_dim
+                        self._frontres_extra_mean = _s1_mean[:, gmt_dim:].to(self.device)
+                        self._frontres_extra_std  = _s1_std[:,  gmt_dim:].to(self.device)
+                        print(f"[Runner] Loaded Stage-1 anchor-error normalizer stats "
+                              f"(dims {gmt_dim}–{_s1_mean.shape[-1]}) for FrontRES task-space.")
 
                 if self.training_type == "mosaic":
                     # For MOSAIC: determine whether to load privileged_obs_normalizer from checkpoint
@@ -1568,13 +1585,20 @@ class OnPolicyRunner:
     def _apply_obs_normalizer(self, obs: torch.Tensor) -> torch.Tensor:
         """Apply obs_normalizer, with partial pass-through for FrontRES task-space mode.
 
-        In task-space FrontRES, the last (num_obs - _frontres_gmt_obs_dim) dims are
-        anchor-error terms in physical units (m / rad) and must not be GMT-normalized.
+        In task-space FrontRES:
+          - First _frontres_gmt_obs_dim dims → GMT normalizer (frozen, matches GMT training)
+          - Remaining anchor-error dims       → Stage-1 empirical stats (loaded from checkpoint)
+            If those stats are not available, pass the anchor-error dims through unchanged.
         """
         if self._frontres_gmt_obs_dim is not None and obs.shape[-1] > self._frontres_gmt_obs_dim:
             gmt_dim = self._frontres_gmt_obs_dim
-            return torch.cat(
-                [self.obs_normalizer(obs[:, :gmt_dim]), obs[:, gmt_dim:]], dim=-1)
+            gmt_part   = self.obs_normalizer(obs[:, :gmt_dim])
+            extra      = obs[:, gmt_dim:]
+            _s1_mean = getattr(self, '_frontres_extra_mean', None)
+            _s1_std  = getattr(self, '_frontres_extra_std',  None)
+            if _s1_mean is not None and _s1_std is not None:
+                extra = (extra - _s1_mean) / (_s1_std + 1e-8)
+            return torch.cat([gmt_part, extra], dim=-1)
         return self.obs_normalizer(obs)
 
     def _move_normalizer_to_device(self, device):

@@ -13571,3 +13571,68 @@ valid_ratio:
 这样 `pos_pred_norm / pos_gt_norm` 趋近 1 就是幅度收敛的直接信号。
 
 ---
+
+
+**Claude**
+
+Let me also check what `motion_anchor_ori_b` returns (the comment in the runner cfg says 6 dims but I need to verify):
+
+---
+
+
+**Claude**
+
+现在我有了所有需要的信息，来总结检查结果。
+
+---
+
+## Stage 2 就绪检查报告
+
+### ✅ obs 帧数确认
+
+**历史帧：5 帧**（t-4, t-3, t-2, t-1, t），在 `ObservationsCfg.PolicyCfg.__post_init__` 中设置：
+```python
+self.history_length = 5  # tracking_env_cfg.py:208
+```
+
+**未来帧：0 帧**。`MultiMotionCommandsCfg` 未设置 `motion_horizon`，使用默认值 `motion_horizon=1`：
+```python
+motion_horizon: int = 1  # commands.py:1872
+```
+`_gather_future_by_motion` 的偏移量为 `[0]`，即只取当前帧 `time_steps + 0`，没有任何预览。
+
+---
+
+### ✅ Stage 1 → Stage 2 obs 布局完全一致
+
+| 段 | Term | 每帧维数 | ×5 | 范围 |
+|---|------|---------|-----|------|
+| 0 | `command` (q_ref_pos + q_ref_vel) | 58 | 290 | [0:290] |
+| 1 | `motion_anchor_ori_b` (旋转矩阵前2列) | 6 | 30 | [290:320] |
+| 2 | `base_ang_vel` | 3 | 15 | [320:335] |
+| 3 | `joint_pos_rel` | 29 | 145 | [335:480] |
+| 4 | `joint_vel_rel` | 29 | 145 | [480:625] |
+| 5 | `actions` | 29 | 145 | [625:770] |
+| 6 | `anchor_root_pos_error_w` | 3 | 15 | [770:785] |
+| 7 | `anchor_root_rpy_error_w` | 3 | 15 | [785:800] |
+
+两阶段 8 个 term、相同顺序、相同维数 → FrontRES 第一层权重 `Linear(800, hidden)` 可以直接迁移。
+
+---
+
+### ⚠️ 发现一个关键问题：anchor error 项在 Stage 2 未被归一化
+
+**根因**：Stage 2 的 `obs_normalizer` = GMT 冻结归一器（只管前 770 维），后 30 维（anchor error）直通 raw 值（米/弧度量级约 ±0.05–0.15）。但 Stage 1 用的是 800 维 `EmpiricalNormalization`，anchor error 在训练过程中被归一到 ~N(0,1)。
+
+**后果**：Stage 2 启动时 FrontRES 看到的 anchor error 信号约为 Stage 1 时的 **1/10–1/20**（物理值 vs 归一化值），初期对 anchor error 几乎没有响应，需要额外的梯度步才能自适应。
+
+**修复方案**：从 Stage 1 checkpoint 的 `obs_norm_state_dict` 中提取后 30 维的 mean/std，在 Stage 2 `_apply_obs_normalizer` 中对这 30 维单独归一化。让我实现这个修复：
+
+---
+
+
+**Claude**
+
+Now I'll implement the fix — load Stage 1's normalizer stats for dims [770:800] from the checkpoint and apply them in Stage 2:
+
+---
