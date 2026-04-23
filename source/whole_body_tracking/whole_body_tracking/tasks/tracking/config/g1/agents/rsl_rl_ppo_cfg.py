@@ -189,7 +189,7 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = _S1_CKPT_ITER + _STAGE2_EXTRA_ITERS  # 50000
     save_interval = 500
-    experiment_name = "g1_flat_frontres_finetune"
+    experiment_name = "g1_flat_finetune"
     empirical_normalization = True
     resume = True
 
