@@ -11,48 +11,84 @@ from torch.utils.tensorboard import SummaryWriter
 
 try:
     import wandb
+    _WANDB_INSTALLED = True
 except ModuleNotFoundError:
-    raise ModuleNotFoundError("Wandb is required to log to Weights and Biases.")
+    _WANDB_INSTALLED = False
 
 
 class WandbSummaryWriter(SummaryWriter):
-    """Summary writer for Weights and Biases."""
+    """Summary writer for Weights and Biases.
+
+    All wandb calls are best-effort: any connection failure, process error, or
+    API error only prints a one-time warning and training continues normally.
+    TensorBoard logging is always active regardless of wandb status.
+    """
 
     def __init__(self, log_dir: str, flush_secs: int, cfg):
         super().__init__(log_dir, flush_secs)
 
-        # Get the run name
+        self._wandb_ok = False  # set to True only when wandb.init() succeeds
+
+        if not _WANDB_INSTALLED:
+            print("[WandbWriter] wandb not installed — TensorBoard only.")
+            return
+
         run_name = os.path.split(log_dir)[-1]
 
         try:
             project = cfg["wandb_project"]
         except KeyError:
-            raise KeyError("Please specify wandb_project in the runner config, e.g. legged_gym.")
+            raise KeyError("Please specify wandb_project in the runner config.")
 
-        try:
-            entity = os.environ["WANDB_USERNAME"]
-        except KeyError:
-            entity = None
+        entity = os.environ.get("WANDB_USERNAME", None)
 
-        # Initialize wandb
-        wandb.init(project=project, entity=entity, name=run_name)
+        # Try init strategies in order of preference.
+        # Each failure falls through to the next without crashing.
+        _init_strategies = [
+            {"settings": wandb.Settings(start_method="fork")},
+            {"settings": wandb.Settings(start_method="thread")},
+            {"mode": "offline"},   # no network needed; syncs later with `wandb sync`
+        ]
 
-        # Add log directory to wandb
-        wandb.config.update({"log_dir": log_dir})
+        for kwargs in _init_strategies:
+            try:
+                wandb.init(project=project, entity=entity, name=run_name, **kwargs)
+                wandb.config.update({"log_dir": log_dir})
+                self._wandb_ok = True
+                mode = kwargs.get("mode", kwargs.get("settings", "default"))
+                print(f"[WandbWriter] wandb initialized (strategy={mode}).")
+                break
+            except Exception as e:
+                print(f"[WandbWriter] wandb.init attempt failed ({kwargs}): {e}")
+
+        if not self._wandb_ok:
+            print("[WandbWriter] All wandb init strategies failed — TensorBoard only.")
 
         self.name_map = {
             "Train/mean_reward/time": "Train/mean_reward_time",
             "Train/mean_episode_length/time": "Train/mean_episode_length_time",
         }
 
+    # ── wandb config ──────────────────────────────────────────────────────────
+
     def store_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg):
-        wandb.config.update({"runner_cfg": runner_cfg})
-        wandb.config.update({"policy_cfg": policy_cfg})
-        wandb.config.update({"alg_cfg": alg_cfg})
+        if not self._wandb_ok:
+            return
         try:
-            wandb.config.update({"env_cfg": env_cfg.to_dict()})
-        except Exception:
-            wandb.config.update({"env_cfg": asdict(env_cfg)})
+            wandb.config.update({"runner_cfg": runner_cfg})
+            wandb.config.update({"policy_cfg": policy_cfg})
+            wandb.config.update({"alg_cfg": alg_cfg})
+            try:
+                wandb.config.update({"env_cfg": env_cfg.to_dict()})
+            except Exception:
+                wandb.config.update({"env_cfg": asdict(env_cfg)})
+        except Exception as e:
+            print(f"[WandbWriter] store_config failed: {e}")
+
+    def log_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg):
+        self.store_config(env_cfg, runner_cfg, alg_cfg, policy_cfg)
+
+    # ── scalar logging ────────────────────────────────────────────────────────
 
     def add_scalar(self, tag, scalar_value, global_step=None, walltime=None, new_style=False):
         super().add_scalar(
@@ -62,26 +98,40 @@ class WandbSummaryWriter(SummaryWriter):
             walltime=walltime,
             new_style=new_style,
         )
-        wandb.log({self._map_path(tag): scalar_value}, step=global_step)
+        if not self._wandb_ok:
+            return
+        try:
+            wandb.log({self._map_path(tag): scalar_value}, step=global_step)
+        except Exception:
+            pass  # silent: wandb disconnect should not interrupt training
 
-    def stop(self):
-        wandb.finish()
-
-    def log_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg):
-        self.store_config(env_cfg, runner_cfg, alg_cfg, policy_cfg)
+    # ── file / model saving ───────────────────────────────────────────────────
 
     def save_model(self, model_path, iter):
-        wandb.save(model_path, base_path=os.path.dirname(model_path))
+        if not self._wandb_ok:
+            return
+        try:
+            wandb.save(model_path, base_path=os.path.dirname(model_path))
+        except Exception as e:
+            print(f"[WandbWriter] save_model failed: {e}")
 
     def save_file(self, path, iter=None):
-        wandb.save(path, base_path=os.path.dirname(path))
+        if not self._wandb_ok:
+            return
+        try:
+            wandb.save(path, base_path=os.path.dirname(path))
+        except Exception as e:
+            print(f"[WandbWriter] save_file failed: {e}")
 
-    """
-    Private methods.
-    """
+    def stop(self):
+        if not self._wandb_ok:
+            return
+        try:
+            wandb.finish()
+        except Exception:
+            pass
+
+    # ── internal ──────────────────────────────────────────────────────────────
 
     def _map_path(self, path):
-        if path in self.name_map:
-            return self.name_map[path]
-        else:
-            return path
+        return self.name_map.get(path, path)

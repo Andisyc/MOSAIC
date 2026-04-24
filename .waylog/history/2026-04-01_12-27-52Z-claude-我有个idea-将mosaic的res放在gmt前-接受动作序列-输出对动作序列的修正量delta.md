@@ -14211,3 +14211,55 @@ dr_deadband:          float = 0.05
 一行修复：`_dr_target_surv` → `locs.get("_dr_target_surv", 0.983)`，通过 `locs` 字典（即 `learn()` 的 `locals()`）访问该变量。
 
 ---
+
+
+**User**
+
+File "/home/yuxuancheng/MOSAIC/source/rsl_rl/rsl_rl/runners/on_policy_runner.py", line 343, in learn
+    self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+  File "/home/yuxuancheng/MOSAIC/source/rsl_rl/rsl_rl/utils/wandb_utils.py", line 38, in __init__
+    wandb.init(project=project, entity=entity, name=run_name)
+  File "/hdd0/yuxuancheng/miniconda3/envs/mosaic/lib/python3.10/site-packages/wandb/sdk/wandb_init.py", line 1043, in init
+    run = wi.init()
+  File "/hdd0/yuxuancheng/miniconda3/envs/mosaic/lib/python3.10/site-packages/wandb/sdk/wandb_init.py", line 691, in init
+    raise UsageError(error_message)
+wandb.errors.UsageError: Error communicating with wandb process
+try: wandb.init(settings=wandb.Settings(start_method='fork'))
+or:  wandb.init(settings=wandb.Settings(start_method='thread'))
+For more info see: https://docs.wandb.ai/library/init#init-start-error
+看起来是wandb更新的问题，有无什么方式能容忍wandb断连呢？
+
+---
+
+
+**Claude**
+
+让我看 `wandb_utils.py` 的当前实现：
+
+---
+
+
+**Claude**
+
+两个问题同时解决：`start_method` 兼容性 + 所有 wandb 调用变为容错（任何异常只打警告，训练继续）：
+
+---
+
+
+**Claude**
+
+三层容错逻辑：
+
+1. **`start_method` 自动降级**：依次尝试 `fork` → `thread` → `offline`（不需要网络，训练结束后用 `wandb sync <log_dir>` 手动上传）
+
+2. **`_wandb_ok` 标志**：只有 `init` 成功才设为 `True`。之后所有 wandb 调用都先检查此标志，失败时静默跳过，不抛异常
+
+3. **`add_scalar` 异常吞噬**：wandb 在训练过程中意外断连时（网络抖动、服务器重启），`wandb.log()` 可能抛异常。现在用 `try/except pass` 吞掉，TensorBoard 侧始终正常写入
+
+如果训练期间 wandb 断连，日志会保存到本地的 `offline-run-*` 目录，训练结束后运行：
+```bash
+wandb sync <wandb 离线目录>
+```
+即可补传。
+
+---
