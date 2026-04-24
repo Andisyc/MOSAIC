@@ -14197,3 +14197,17 @@ dr_deadband:          float = 0.05
 **wandb 新增指标**：`Curriculum/survival_ema`（PI 控制器的 EMA 平滑值）和 `Curriculum/dr_target_survival`（目标线），可以直观看到控制器是否正常调节。
 
 ---
+
+
+**Claude**
+
+`_dr_target_surv` 是 `learn()` 的局部变量，在 `log()` 里需要通过 `locs` 取，不能直接引用：
+
+---
+
+
+**Claude**
+
+一行修复：`_dr_target_surv` → `locs.get("_dr_target_surv", 0.983)`，通过 `locs` 字典（即 `learn()` 的 `locals()`）访问该变量。
+
+---

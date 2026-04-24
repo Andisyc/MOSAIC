@@ -1054,7 +1054,7 @@ class OnPolicyRunner:
                 self.writer.add_scalar("Curriculum/survival_ema",
                                        locs.get("_survival_ema", 1.0), locs["it"])
                 self.writer.add_scalar("Curriculum/dr_target_survival",
-                                       _dr_target_surv, locs["it"])
+                                       locs.get("_dr_target_surv", 0.983), locs["it"])
 
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
