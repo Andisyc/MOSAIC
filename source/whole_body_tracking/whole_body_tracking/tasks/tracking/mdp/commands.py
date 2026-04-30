@@ -355,7 +355,10 @@ class MotionCommand(CommandTerm):
     @property
     def anchor_quat_w(self) -> torch.Tensor:
         base_quat = self.motion.body_quat_w[self.time_steps, self.motion_anchor_body_index]
-        return quat_mul(self._frontres_quat_correction, base_quat)
+        # Right-multiply: apply correction in anchor's local frame.
+        # q_anchor_new = q_anchor * q_correction, so q_correction = q_anchor^{-1} * q_robot = q_rel
+        # which is exactly what anchor_root_rpy_error_w computes → Stage1 target consistent.
+        return quat_mul(base_quat, self._frontres_quat_correction)
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
@@ -1370,7 +1373,10 @@ class MultiMotionCommand(CommandTerm):
     def anchor_quat_w(self) -> torch.Tensor:
         quat = self._gather_by_motion("body_quat_w")
         root_quat = quat[:, self.motion_anchor_body_index]
-        return quat_mul(self._frontres_quat_correction, self.perturber.apply_quat_perturbation(root_quat))
+        # Right-multiply: apply correction in anchor's local frame.
+        # q_anchor_new = q_anchor * q_correction, so q_correction = q_anchor^{-1} * q_robot = q_rel
+        # which is exactly what anchor_root_rpy_error_w computes → Stage1 target consistent.
+        return quat_mul(self.perturber.apply_quat_perturbation(root_quat), self._frontres_quat_correction)
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:

@@ -326,6 +326,7 @@ class OnPolicyRunner:
         self.git_status_repos = [rsl_rl.__file__]
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
+        print("[Runner] learn() entered — initializing logger...", flush=True)
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
@@ -349,10 +350,11 @@ class OnPolicyRunner:
             else:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
 
+        print("[Runner] Logger initialized — starting training setup...", flush=True)
         # Pass writer and log_interval to algorithm for logging (needed by MOSAIC)
         if hasattr(self, 'writer') and self.writer is not None:
             self.alg.writer = self.writer
-            
+
         self.alg.log_interval = 1 # Default log interval
 
         # check if teacher is loaded

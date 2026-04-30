@@ -44,9 +44,13 @@ class WandbSummaryWriter(SummaryWriter):
 
         # Try init strategies in order of preference.
         # Each failure falls through to the next without crashing.
+        # NOTE: "thread" must come before "fork" — fork after CUDA initialization
+        # can deadlock the child process (CUDA contexts are not fork-safe).
+        # This is especially likely when optimizer state tensors are loaded to GPU
+        # before wandb.init() is called (e.g., is_full_resume=True in Stage 2).
         _init_strategies = [
-            {"settings": wandb.Settings(start_method="fork")},
             {"settings": wandb.Settings(start_method="thread")},
+            {"settings": wandb.Settings(start_method="fork")},
             {"mode": "offline"},   # no network needed; syncs later with `wandb sync`
         ]
 
