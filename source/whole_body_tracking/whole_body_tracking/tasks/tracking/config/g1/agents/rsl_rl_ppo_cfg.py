@@ -212,7 +212,7 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
         _S1_CKPT_P1 if _S1_CKPT_P1.exists() else
         _S1_CKPT_P2 if _S1_CKPT_P2.exists() else None
     )
-    is_full_resume: bool = False  # Stage 1→2 冷启动；续训改为 True
+    is_full_resume: bool = True  # Stage 1→2 冷启动；续训改为 True
 
     reset_lr_on_resume: bool = True   # fixed schedule 下确保 lr 从配置值 3e-5 开始
 
