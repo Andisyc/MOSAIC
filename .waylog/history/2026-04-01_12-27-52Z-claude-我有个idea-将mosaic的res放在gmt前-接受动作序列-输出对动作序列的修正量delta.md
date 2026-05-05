@@ -17284,3 +17284,727 @@ All changes are in place. Here's the complete diagnosis and what was done:
 - 若基线仍为 10，说明还有其他终止条件（可能是 `anchor_pos` 根节点 Z 高度差），需要继续排查
 
 ---
+
+
+**User**
+
+从概念上分析，FrontRES到底是否需要知道本体感知？因为FrontRES只需要检测参考帧的anchor是否合理就行，不需要关注机器人的执行情况
+
+---
+
+
+**Claude**
+
+你的直觉是对的。让我从第一性原理分析：
+
+---
+
+## FrontRES 的数学定义
+
+FrontRES 是一个函数：
+
+```
+f: (扰动后的运动参考) → (锚点修正量)
+```
+
+它回答的问题是：**"给我看的这个参考锚点，是不是合理的？如果不合理，偏了多少？"**
+
+它不回答的问题是："机器人跟踪得怎么样？"
+
+---
+
+## 本体感知（proprioception）是什么？
+
+当前观测中的本体感知分量：
+
+| 观测分量 | 内容 | 信息来源 |
+|----------|------|----------|
+| `base_ang_vel` | 机器人基座角速度 | **机器人** |
+| `joint_pos_rel` | 机器人关节位置 | **机器人** |
+| `joint_vel_rel` | 机器人关节速度 | **机器人** |
+| `actions` | 机器人上一帧动作 | **机器人** |
+| `anchor_root_pos/rpy_error_w` | 机器人锚点 vs 参考锚点 | **机器人 vs 参考** |
+
+全部是**机器人侧**的信息。
+
+---
+
+## 为什么不需要
+
+扰动施加在**参考帧**上，不涉及机器人：
+
+```
+q_original(t)  →  MotionPerturber  →  q_perturbed(t)  →  FrontRES  →  q_corrected(t)
+                                                    ↑
+                                          FrontRES 只需要看这一步
+                                          "参考帧的锚点是否合理？"
+```
+
+判断锚点是否合理的所有线索都在参考帧自身：
+
+| 线索 | 来源 | 能检测的扰动 |
+|------|------|-------------|
+| 锚点 Z 加速度（parabola fit） | 参考帧时序 | float/sink（浮空阶段 a_z≠-g） |
+| 相邻帧锚点 Z 跳变 | 参考帧时序 | float/sink（单帧突变） |
+| 相邻帧锚点 XY 位移 | 参考帧时序 | slip（足部接触时水平突变） |
+| 锚点姿态的时序变化 | 参考帧时序 | root_tilt（姿态突变） |
+| 关节噪声的统计特征 | 参考帧时序 | joint_noise（高频抖动） |
+
+**没有一个需要机器人状态。**
+
+---
+
+## 本体感知反而是噪声
+
+当 Stage 1 目标 = `q_robot - q_ref` 时：
+
+```
+输入中包含 base_ang_vel ≈ 0.02 rad/s  (机器人轻微晃动)
+目标中包含 Δz ≈ -0.03m               (重力下垂)
+      ↓
+FrontRES 学到: "base_ang_vel 有轻微晃动 → 输出 Δz=-0.03"
+      ↓
+这是一个伪相关。在推理时机器人不晃动，FrontRES 仍然输出负值。
+```
+
+移除本体感知后，FrontRES 只能学到：
+
+```
+输入: q_ref 锚点在 t 帧突然上浮 0.05m
+输出: Δz = -0.05
+      ↓
+纯扰动→逆扰动 的映射，没有伪相关的空间
+```
+
+---
+
+## Jump degree 的归属
+
+Jump degree 也是**从参考帧计算**的（parabola fit on motion anchor_z），与机器人完全无关。它可以：
+- 作为 FrontRES 的一个**输入特征**（告诉 FrontRES "当前在浮空阶段"）
+- 或者继续作为**后处理门控**（当前方案）
+
+两者都与本体感知无关。
+
+---
+
+## 结论
+
+```
+FrontRES 输入: 只需要参考帧信息
+  ✓ command (q_ref_pos + q_ref_vel) × 时序窗口
+  ✓ motion_anchor_ori_b × 时序窗口
+  ✓ (可选) jump_degree 作为输入特征
+
+FrontRES 不需要:
+  ✗ base_ang_vel
+  ✗ joint_pos_rel / joint_vel_rel
+  ✗ actions
+  ✗ anchor_root_pos_error_w / rpy_error_w  （这些都是机器人 vs 参考的差值）
+```
+
+简化后的含义：
+
+```
+Stage 1: 纯离线监督学习
+  输入: 扰动后的参考帧（纯 numpy，无需仿真）
+  目标: -(perturbed - original)
+  计算: 在 CPU 上跑几万轮，几分钟完成
+
+Stage 2: 在线 RL 微调
+  输入: 同 Stage 1（参考帧信息 + 仿真本体感知，本体感知仅用于 GMT）
+  FrontRES 观测缩减为纯参考帧信息
+  初始权重: Stage 1 离线训练的 checkpoint
+```
+
+输入维度从当前的 800 维（5帧×160）大幅缩减——移除 `motion_anchor_ori_b`、`base_ang_vel`、`joint_pos_rel`、`joint_vel_rel`、`actions`、`anchor_root_pos_error_w`、`anchor_root_rpy_error_w` 共约 180 维后，FrontRES 的真实输入只需要约 290 维（command 的 58 维×5 帧历史）。这个 290 维向量提供了足够的信息来判断锚点扰动。
+
+**你不需要重新训练 Stage 1**，但应该重新设计 Stage 1。当前 800 维的观测是在错误目标 `q_robot-q_ref` 下设计的——FrontRES 只需看参考帧就够了，不需要关注机器人执行层面的信息。
+
+是否需要我开始实现这个简化？
+
+---
+
+
+**Claude**
+
+The target is already `-(perturbed - original)`. Let me check the current Stage 1 observation config:
+
+---
+
+
+**Claude**
+
+Now I have the full picture. Here's the plan:
+
+---
+
+## 修改方案
+
+### 现状分析
+
+关键发现：**Stage 1 的监督目标已经是 `-(perturbed - original)`**（`get_supervision_target_task_space` 已修改为使用 `-anchor_dr_delta_pos` 和 `anchor_dr_delta_quat_correction`）。
+
+但**FrontRES 的观测输入**仍然包含机器人本体感知：
+
+| 当前观测项（Stage 1 PolicyCfg） | 信息来源 | FrontRES 需要？ |
+|---|---|---|
+| `command` (q_ref) | 参考帧 | ✓ |
+| `motion_anchor_ori_b` | 参考帧 | ✓ |
+| `base_ang_vel` | 机器人 | ✗ |
+| `joint_pos` / `joint_vel` | 机器人 | ✗ |
+| `actions` | 机器人 | ✗ |
+| `anchor_root_pos_error_w` | 机器人 vs 参考 | ✗ |
+| `anchor_root_rpy_error_w` | 机器人 vs 参考 | ✗ |
+
+当前 800 维中，只有 320 维（command 290 + anchor_ori 30）是 FrontRES 真正需要的。其余 480 维是噪音。
+
+---
+
+### 改什么
+
+#### 改动 1：新增 FrontRES 专用观测组
+
+在 `FrontRESFinetuneTrackingEnvCfg`（Stage 2 env config）中新增一个 `frontres_policy` 观测组，仅包含参考帧信息：
+
+```
+frontres_policy:
+  command           (q_ref_pos 29 + q_ref_vel 29) × 5 帧 = 290
+  motion_anchor_ori_b  (6) × 5 帧 = 30
+  ─────────────────────────────────────
+  总计: 320 维
+```
+
+不改动 GMT 的 `policy` 观测组（保持 800 维）。
+
+#### 改动 2：FrontRESActorCritic 接受独立观测
+
+`act()` 方法增加可选参数 `frontres_obs`。若提供，FrontRES 网络使用此观测；否则回退到从完整观测中截取。
+
+#### 改动 3：Runner 提取并传递 FrontRES 观测
+
+在 `learn()` 的 rollout 循环中，从 `obs_dict` 中提取 `frontres_policy` 观测，传递给 `self.alg.act()`。
+
+#### 改动 4：合并 Stage 1 → Stage 2 为单阶段 warmup
+
+在 `G1FlatFrontRESFinetuneRunnerCfg` 中新增 `supervised_warmup_iterations` 参数。在 `learn()` 中：
+
+```
+前 N 轮: 监督学习 warmup
+  观测: frontres_policy (320 维, 纯参考帧)
+  目标: get_supervision_target_task_space (6 维, = -(扰动增量))
+  损失: Huber(pred, target)
+  
+后 M 轮: RL PPO
+  观测: 同上
+  奖励: r_delta (FrontRES 修正带来的 GMT 跟踪改善)
+  初始化: warmup 阶段训练好的权重
+```
+
+#### 改动 5：Stage 1 配置文件清理
+
+`G1FlatSupervisedRunnerCfg` 和 `SupervisedObservationsCfg` 标记为 deprecated（或直接删除），因为 warmup 已在 Stage 2 内部完成。
+
+---
+
+### 不改什么
+
+- **GMT 的 policy 观测**（800 维）：GMT 是冻结的，需要完整的观测向量
+- **`get_supervision_target_task_space`**：已经是正确的 `-(perturbed - original)`
+- **`anchor_dr_delta_pos` / `anchor_dr_delta_quat_correction`**：已是正确的计算
+- **wrist termination / dr_min_scale 修复**：保留（上一轮改动）
+
+---
+
+### 影响范围
+
+| 文件 | 改动类型 |
+|------|----------|
+| `tracking_env_cfg.py` | 新增 `FrontRESObsCfg` 观测组 |
+| `flat_env_cfg.py` | Stage 2 env 引用新观测组 |
+| `front_residual_actor_critic.py` | `act()` 接受可选 `frontres_obs` |
+| `on_policy_runner.py` | 提取并传递 `frontres_obs`；warmup 逻辑 |
+| `rsl_rl_ppo_cfg.py` | 新增 `supervised_warmup_iterations` |
+| `supervise.py` | warmup 阶段的监督损失计算（复用现有 `SuperviseTrainer` 逻辑） |
+
+---
+
+### 预期效果
+
+1. **FrontRES 输入纯净化**：320 维只有参考帧信息，无机器人状态干扰
+2. **Stage 1 无需单独运行**：warmup 在 Stage 2 启动时自动完成，几分钟离线计算
+3. **网络更小、训练更快**：输入从 800→320 维，参数量显著减少
+4. **语义一致**：warmup 和 RL 优化同一目标 = 扰动的逆
+
+---
+
+是否同意这个方案？我开始逐文件执行修改。
+
+---
+
+
+**Claude**
+
+Now update the Stage 2 PPO config to use `num_frontres_obs=320` and add `supervised_warmup_iterations`:
+
+---
+
+
+**Claude**
+
+Now add `supervised_warmup_iterations` to the runner config:
+
+---
+
+
+**Claude**
+
+Now the core change in FrontRESActorCritic. First, add `num_frontres_obs` to the constructor:
+
+---
+
+
+**Claude**
+
+Now add `self.num_frontres_obs` to the constructor body:
+
+---
+
+
+**Claude**
+
+Now modify `_parse_observations` to support the frontres subset:
+
+---
+
+
+**Claude**
+
+Now modify the GMT callers to use the cached full observation. First, `_run_gmt_direct`:
+
+---
+
+
+**Claude**
+
+Now modify `_apply_delta_q_and_run_gmt` to use the full observation for GMT:
+
+---
+
+
+**Claude**
+
+There's a dimension mismatch — the residual_actor is built with `num_actor_obs` (800) but now receives 320 dims. Let me fix:
+
+---
+
+
+**Claude**
+
+Let me check how `num_actor_obs` is passed to FrontRESActorCritic:
+
+---
+
+
+**Claude**
+
+Now let me implement the supervised warmup in the runner. First, check what observation dict keys are available:
+
+---
+
+
+**Claude**
+
+I need to add a `target` observation group to the Stage 2 env config so warmup can access supervision targets. Let me read the G1FlatFrontRESFinetuneEnvCfg and add it:
+
+---
+
+
+**Claude**
+
+Let me implement the supervised warmup as a separate method in the runner. First, I need to find a good insertion point:
+
+---
+
+
+**Claude**
+
+The `learn()` method is already ~500 lines. I'll add the warmup as a compact helper method and call it before the main loop. Let me find where to insert the call and add the method.
+
+---
+
+
+**Claude**
+
+Now I'll add the supervised warmup phase before the main training loop. Let me insert it between the DR init and the training loop:
+
+---
+
+
+**Claude**
+
+Let me add the remaining warmup config parameters:
+
+---
+
+
+**Claude**
+
+Let me fix the warmup code to remove the redundant call and unused variable:
+
+---
+
+
+**Claude**
+
+Now let me do the final verification:
+
+---
+
+
+**Claude**
+
+Let me verify there are no issues with file consistency by checking the key edit points:
+
+---
+
+
+**Claude**
+
+The implementation is consistent. Let me do a final quick check on the warmup code to make sure there are no import issues:
+
+---
+
+
+**Claude**
+
+所有修改已完成。以下是改动总结：
+
+---
+
+## 改动总结
+
+### 修改的 5 个文件
+
+| 文件 | 改动 |
+|------|------|
+| [rsl_rl_cfg.py](source/whole_body_tracking/whole_body_tracking/utils/rsl_rl_cfg.py) | 新增 `num_frontres_obs: int = 0` 参数 |
+| [rsl_rl_ppo_cfg.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py) | `num_frontres_obs=320`；`supervised_warmup_iterations/lr/epochs` |
+| [front_residual_actor_critic.py](source/rsl_rl/rsl_rl/modules/front_residual_actor_critic.py) | `_parse_observations` 提取前320维；`residual_actor` 构建时使用320维输入；GMT始终使用完整观测 |
+| [on_policy_runner.py](source/rsl_rl/rsl_rl/runners/on_policy_runner.py) | 训练循环前的监督预热阶段；`_dr_min` 下限；`lenbuffer_gmt` |
+| [flat_env_cfg.py](source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/flat_env_cfg.py) | `ee_body_pos` 移除手腕 |
+
+### 数据流
+
+```
+观测 (800 维)
+├── [:320] → FrontRES residual_actor (纯参考帧: command + anchor_ori)
+│   └── 输出: [Δx, Δy, Δz, Δroll, Δpitch, Δyaw] (6 维)
+└── [全部 800] → GMT (冻结) → 关节位置指令 (29 维)
+```
+
+### 使用方式
+
+```python
+# 推荐: 监督预热 + RL (单阶段)
+num_frontres_obs = 320
+supervised_warmup_iterations = 2000  # 前2000轮Huber学习扰动检测
+is_full_resume = False                # 不加载旧checkpoint,预热从头训练
+
+# 向后兼容: 不改变观测结构
+num_frontres_obs = 0  # (默认) FrontRES看到完整800维
+supervised_warmup_iterations = 0  # 无预热,直接PPO
+```
+
+### 重要提示
+
+旧 Stage 1/Stage 2 checkpoint（800 维输入的 `residual_actor`）与 `num_frontres_obs=320` **不兼容**。使用新架构时必须启用 `supervised_warmup_iterations > 0` 或重新训练 Stage 1。
+
+---
+
+
+**Claude**
+
+让我从头到尾梳理完整的函数调用链。
+
+---
+
+
+**Claude**
+
+Now let me read the PPO/MOSAIC `act()` to trace FrontRES-specific logic:
+
+---
+
+
+**Claude**
+
+Now I have enough to write the complete trace. Let me also quickly check `process_env_step` for FrontRES:
+
+---
+
+
+**Claude**
+
+Now I have all the pieces. Here's the complete function-level flow:
+
+---
+
+## FrontRES 训练流程——函数级链路
+
+### 阶段 0：初始化
+
+```
+train.py: main()
+├── gym.make(task, cfg)                           → env (RslRlVecEnvWrapper)
+├── MotionOnPolicyRunner(env, cfg, log_dir, device)
+│   └── OnPolicyRunner.__init__()                  [on_policy_runner.py:40]
+│       ├── env.get_observations()                 → obs, extras
+│       │   └── obs_dict = {"policy": (N,800), "critic": (N,800)}
+│       ├── num_actor_obs = 800  (obs.shape[1])
+│       ├── eval("FrontRESActorCritic")            → policy_class
+│       ├── policy_class(num_actor_obs=800, num_privileged_obs=800,
+│       │                num_actions=29, num_frontres_obs=320, ...)
+│       │   └── FrontRESActorCritic.__init__()     [front_residual_actor_critic.py:121]
+│       │       ├── 加载 frozen GMT checkpoint     → gmt_policy, gmt_normalizer
+│       │       ├── 计算 gmt_actor_input_dim=800
+│       │       ├── _frontres_input_dim = max(num_frontres_obs, num_actor_obs) = 320
+│       │       ├── _build_residual_actor(input_dim=320, output_dim=6, ...)
+│       │       │   └── MLP(320 → 1024 → 1024 → 512 → 256 → 6)  ← 关键: 只看到前320维
+│       │       └── _build_critic(input_dim=800, ...)
+│       │
+│       ├── eval("PPO")(policy, ...)               → self.alg (PPO instance)
+│       │   └── PPO.__init__()
+│       │       ├── self.transition = RolloutStorage(num_envs, num_steps, obs_shape=(800,), action_shape=(6,))
+│       │       └── self.optimizer = Adam(policy.parameters(), lr=3e-5)
+│       │           ↑ 包含 residual_actor + critic 的所有参数
+│       │
+│       ├── self.obs_normalizer = policy.gmt_normalizer  (GMT的冻结归一化器)
+│       └── self._frontres_gmt_obs_dim = 770   (GMT归一化器覆盖的维度)
+│
+├── runner.load(resume_path)                      [on_policy_runner.py:1228]
+│   └── 若 is_full_resume=False, dr_init_scale=1.0 → self._dr_scale = 1.0
+│       (否则从checkpoint恢复 dr_scale)
+│
+└── runner.learn(num_learning_iterations)          [on_policy_runner.py:328]
+```
+
+### 阶段 1：监督预热（新增，`supervised_warmup_iterations > 0` 时执行）
+
+```
+OnPolicyRunner.learn()
+├── print("learn() entered — initializing logger...")
+├── WandbSummaryWriter.__init__()                  → wandb.init(start_method="thread")
+│
+├── env.get_observations()                         → obs (800维)
+├── obs_normalizer(obs)                            → obs_norm (GMT归一化)
+│
+├── ─── 监督预热 ───                              [on_policy_runner.py:545]
+│   ├── _warmup_opt = Adam(residual_actor.parameters(), lr=1e-4)
+│   ├── _warmup_loss_fn = HuberLoss(delta=1.0)
+│   │
+│   │   for _wu in range(warmup_iters):            # 外层: 预热轮次
+│   │       for _ in range(num_steps_per_env):     # 内层: rollout (同RL)
+│   │   │   ├── env.get_observations()             → obs (800维)
+│   │   │   ├── policy.get_env_action(obs, zeros(6))
+│   │   │   │   └── FrontRESActorCritic.get_env_action()
+│   │   │   │       ├── _parse_observations(obs)   → (obs[:,:320], ref_vel=None, vel_obs=None)
+│   │   │   │       │   └── self._cached_full_policy_obs = obs  (完整800维)
+│   │   │   │       ├── self.last_task_correction = zeros(6)   (delta_q_sample)
+│   │   │   │       └── _run_gmt_direct(policy_obs, None, None)
+│   │   │   │           └── gmt_input = self._cached_full_policy_obs  (完整800维)
+│   │   │   │               gmt_policy.act_inference(gmt_input)  → robot_actions (29维)
+│   │   │   │               ↑ GMT始终用完整观测
+│   │   │   │
+│   │   │   ├── env.step(robot_actions)            → next_obs, rewards, dones
+│   │   │   │   └── 内部: _update_command()
+│   │   │   │       ├── MotionPerturber 施加随机扰动到锚点
+│   │   │   │       ├── _compute_jump_degree()     (parabola fit, 无本体感知)
+│   │   │   │       └── anchor_dr_delta_pos = perturbed - clean
+│   │   │   │
+│   │   │   ├── _wo_list.append(next_obs[:, :320])  (收集FrontRES输入)
+│   │   │   └── _wt_list.append(get_supervision_target_task_space(env, "motion"))
+│   │   │       └── = [-(perturbed-clean)_pos, rpy_from(quat_inv(perturbed)*clean)]
+│   │   │           = 扰动的逆 (6维)
+│   │   │
+│   │   ├── _all_obs = cat(_wo_list)               (S*E, 320)
+│   │   ├── _all_tgt = cat(_wt_list)               (S*E, 6)
+│   │   │
+│   │   │   for epoch in range(5):                 # 监督SGD
+│   │   │       for batch in minibatches(4096):
+│   │   │   │   ├── pred = residual_actor(batch_obs)   (320 → 6)
+│   │   │   │   ├── loss = Huber(pred, batch_tgt)
+│   │   │   │   ├── loss.backward()
+│   │   │   │   └── _warmup_opt.step()             # 仅更新 residual_actor
+│   │   │
+│   │   └── print(f"warmup {_wu+1}/{warmup_iters}: loss={loss:.6f}")
+│   │
+│   └── print("=== Supervised warmup complete ===")
+│
+├── ─── RL 训练 ───
+    ...
+```
+
+### 阶段 2：RL 训练 (PPO rollout + update)
+
+```
+for it in range(start_iter, tot_iter):
+│
+├── ─── DR PI 控制器 ───                          [on_policy_runner.py:614]
+│   ├── _survival_ema = α * _survival_ema + (1-α) * _last_survival_rate
+│   ├── if _survival_ema > _dr_target_surv + deadband:
+│   │       _dr_scale = min(_dr_scale + speed, dr_max)
+│   │   elif _survival_ema < _dr_target_surv - deadband:
+│   │       _dr_scale = max(_dr_scale - speed, dr_min)  ← dr_min = 0.3
+│   └── 将 _dr_scale 应用到 perturber.cfg.*_ratio (缩放扰动幅度)
+│
+├── ─── Rollout (推理模式, 无梯度) ────────────────
+│   for _ in range(self.num_steps_per_env):         # 24步
+│   │
+│   │   ├── self.alg.act(obs, privileged_obs)      [ppo.py]
+│   │   │   └── policy.act(observations)           [front_residual_actor_critic.py:817]
+│   │   │       ├── update_distribution(observations)  [line:709]
+│   │   │       │   ├── _parse_observations(obs)   [line:586]
+│   │   │       │   │   ├── full_policy_obs = obs[:, :800]
+│   │   │       │   │   ├── self._cached_full_policy_obs = full_policy_obs  ← GMT用
+│   │   │       │   │   └── policy_obs = full_policy_obs[:, :320]          ← FrontRES用
+│   │   │       │   │       ↑ 仅 command(290) + motion_anchor_ori_b(30)
+│   │   │       │   │
+│   │   │       │   ├── raw = residual_actor(policy_obs)  [320 → 6]
+│   │   │       │   │   ↑ 不包含 base_ang_vel, joint_pos/vel, actions, anchor errors
+│   │   │       │   │
+│   │   │       │   ├── frontres_mean = [tanh(raw[:3])*max_pos, tanh(raw[3:])*max_rpy]
+│   │   │       │   │                  = [Δx, Δy, Δz, Δroll, Δpitch, Δyaw] (6维, 有界)
+│   │   │       │   ├── self.last_task_correction = frontres_mean.detach()
+│   │   │       │   └── self.distribution = Normal(frontres_mean, std)
+│   │   │       │       ↑ PPO的动作分布建立在 ΔSE(3) 空间上
+│   │   │       │
+│   │   │       └── return self.distribution.sample()    → actions (N, 6)
+│   │   │           ↑ 采样带噪声的修正量 → 存入rollout buffer
+│   │   │
+│   │   ├── ─── B1 Split: 将 env 分为两组 ───
+│   │   │   ├── env[:N_train]: FrontRES修正 + GMT
+│   │   │   │   env_actions_fr = policy.get_env_action(obs[:N_train], actions[:N_train])
+│   │   │   └── env[N_train:]:  零修正 + GMT (基线)
+│   │   │       env_actions_gmt = policy.get_env_action(obs[N_train:], zeros)
+│   │   │
+│   │   ├── ─── 应用 task-space 修正到 command term ───
+│   │   │   ├── _jd = cmd_term.jump_degree[:N_train]       ← parabola fit: a_z≈-g?
+│   │   │   ├── _gate = (1 - _jd).clamp(0,1)               ← 跳跃时关小门
+│   │   │   ├── _pos_corr = _task_corr[:,:3] * _gate       ← Δpos × gate
+│   │   │   ├── _rpy = _task_corr[:,3:] * _gate             ← Δrpy × gate
+│   │   │   ├── _quat_corr = quat_from_euler_xyz(_rpy)
+│   │   │   ├── cmd_term._frontres_pos_correction[:N_train] = _pos_corr
+│   │   │   ├── cmd_term._frontres_quat_correction[:N_train] = _quat_corr
+│   │   │   └── cmd_term._frontres_*correction[N_train:] = 0, identity
+│   │   │       ↑ 基线env: 零修正 → 纯GMT
+│   │   │
+│   │   ├── env.step(env_actions)                         → next_obs, rewards, dones, infos
+│   │   │   └── 内部:
+│   │   │       ├── GMT 执行 env_actions → 机器人移动
+│   │   │       ├── _update_command()
+│   │   │       │   ├── MotionPerturber 施加下一帧扰动
+│   │   │       │   ├── _compute_jump_degree()
+│   │   │       │   └── anchor_quat_w = quat_mul(anchor, correction)  ← FrontRES修正
+│   │   │       │       ↑ 修正后的锚点 → 影响下一帧的 anchor_root_pos_error_w
+│   │   │       ├── reward 计算 (tracking + foot contact + safety)
+│   │   │       └── termination 检查 (anchor_pos |Zerr|>0.25m, ee_body Zerr>0.25m, etc.)
+│   │   │
+│   │   ├── ─── B1 Delta Reward ───
+│   │   │   ├── r_base = rewards[N_train:].mean()          ← 基线GMT奖励
+│   │   │   └── rewards[:N_train] += r_base - rewards[:N_train]  (在下次更新前)
+│   │   │       (实际 r_delta 在 process_env_step 后计算)
+│   │   │
+│   │   ├── alg.process_env_step(rewards, dones, infos)     [ppo.py:187]
+│   │   │   └── self.transition.rewards = rewards.clone()   (存储到rollout buffer)
+│   │   │       self.transition.dones = dones
+│   │   │       ↑ 注意: GMT env 的 rewards 已被 zero → V(s) 不学 GMT reward
+│   │   │
+│   │   ├── 累积 logging: _frontres_delta_z_abs_sum, jump_degree, term_count...
+│   │   │
+│   │   └── obs = next_obs  → 下一轮迭代
+│   │
+│   ├── alg.compute_returns(privileged_obs)                [ppo.py]
+│   │   └── GAE: 基于存储的 rewards (r_delta) 计算 advantages
+│   │
+│   ├── ─── PPO Update ───
+│   │   loss_dict = alg.update()                           [ppo.py]
+│   │   ├── for epoch in range(5):
+│   │   │   for batch in minibatches(4):
+│   │   │   │   ├── actions = transition.actions[batch]     (ΔSE(3) samples)
+│   │   │   │   ├── values  = critic(critic_obs[batch])     (V(s) 估计)
+│   │   │   │   ├── log_prob = policy.get_actions_log_prob(actions)
+│   │   │   │   │   └── = Normal(mean, std).log_prob(actions).sum(dim=-1)
+│   │   │   │   ├── ratio = exp(log_prob - old_log_prob)   (IS ratio)
+│   │   │   │   ├── surr1 = ratio * advantage
+│   │   │   │   ├── surr2 = clip(ratio, 0.8, 1.2) * advantage
+│   │   │   │   ├── actor_loss = -min(surr1, surr2)
+│   │   │   │   ├── critic_loss = (returns - values)^2
+│   │   │   │   ├── entropy_bonus = distribution.entropy()
+│   │   │   │   ├── reg_loss = λ_reg * ||frontres_mean||^2  (若 dr_scale ≥ 1.0)
+│   │   │   │   └── total_loss = actor_loss + vf_coef*critic_loss
+│   │   │   │                     - entropy_coef*entropy + reg_loss
+│   │   │   │       loss.backward() → optimizer.step()
+│   │   │   │       ↑ 梯度仅流过 residual_actor + critic，不流过 frozen GMT
+│   │   │
+│   │   └── return {"actor_loss": ..., "critic_loss": ..., ...}
+│   │
+│   └── self.log(locals())                                 → wandb
+│       ├── Train/mean_r_delta (FrontRES env reward delta)
+│       ├── Train/mean_reward_gmt (baseline env reward)
+│       ├── Train/mean_episode_length_gmt (baseline env 回合长度) ← 新增
+│       ├── Train/mean_episode_length (FrontRES env)
+│       ├── FrontRES/delta_z_abs_mean
+│       ├── FrontRES/jump_degree_mean
+│       ├── Curriculum/dr_scale, training_survival_rate, dr_target_survival
+│       └── ...
+```
+
+### 关键函数速查
+
+| 函数 | 文件:行 | 作用 |
+|------|---------|------|
+| `FrontRESActorCritic.__init__` | front_residual_actor_critic.py:121 | 构建 320→6 的 residual_actor |
+| `_parse_observations` | front_residual_actor_critic.py:586 | 提取 obs[:,:320] 给FrontRES, 缓存完整 obs 给 GMT |
+| `update_distribution` | front_residual_actor_critic.py:709 | FrontRES forward → Normal(mean, std) |
+| `get_env_action` | front_residual_actor_critic.py:828 | 零修正时: 直接跑GMT; 有修正时: 应用到q_ref再跑GMT |
+| `_run_gmt_direct` | front_residual_actor_critic.py:649 | GMT前向(完整观测), 任务空间模式 |
+| `get_supervision_target_task_space` | observations.py:215 | 预热目标 = `-(perturbed-original)` |
+| `anchor_dr_delta_pos` | commands.py:1372 | `perturbed_pos - clean_pos` |
+| `learn()` warmup | on_policy_runner.py:545 | 收集(obs[:320], target) → Huber SGD |
+| `learn()` rollout | on_policy_runner.py:614+ | PPO rollout + DR PI + B1 split |
+| `learn()` B1 reward | on_policy_runner.py:768 | r_delta = r_frontres - r_baseline |
+| `log()` | on_policy_runner.py:981 | wandb 指标上报 |
+
+### 数据维度总结
+
+```
+                    FrontRES 输入          FrontRES 输出        GMT 输入
+                    ────────────          ─────────────        ───────
+监督预热 (warmup):   obs[:, :320]          6-dim ΔSE(3)         obs[:800] (完整)
+RL 训练 (rollout):   obs[:, :320]          6-dim ΔSE(3)         obs[:800] (完整)
+RL 推理 (deploy):    obs[:, :320]          6-dim ΔSE(3)         obs[:800] (完整)
+```
+
+---
+
+
+**Claude**
+
+API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.9.content.0: Invalid `signature` in `thinking` block"},"request_id":"req_011CajqGZM7mDYCChDmX2kZK"}
+
+---
+
+
+**User**
+
+对话记录能否跨端同步？
+
+---
+
+
+**Claude**
+
+API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.9.content.0: Invalid `signature` in `thinking` block"},"request_id":"req_011CajqUuB4NPLZE89btNoLt"}
+
+---

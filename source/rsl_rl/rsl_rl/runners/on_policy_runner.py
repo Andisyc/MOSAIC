@@ -542,6 +542,75 @@ class OnPolicyRunner:
             else:
                 print("[Runner] WARNING: FrontRES DR enabled but env.cfg.motion_perturbations not found")
 
+        # ── FrontRES supervised warmup (Stage 1 → Stage 2 merge) ──────────────────
+        # Runs BEFORE the PPO loop. Teaches FrontRES to detect perturbations via
+        # supervised learning on the anti-DR target:  target = -(perturbed - original).
+        # After warmup, PPO fine-tunes with r_delta reward (same architecture, same obs).
+        _warmup_iters = int(self.cfg.get("supervised_warmup_iterations", 0))
+        if _is_frontres and _warmup_iters > 0:
+            _warmup_lr     = float(self.cfg.get("supervised_warmup_lr", 1e-4))
+            _warmup_epochs = int(self.cfg.get("supervised_warmup_epochs", 5))
+            _warmup_opt = torch.optim.Adam(
+                self.alg.policy.residual_actor.parameters(), lr=_warmup_lr)
+            _warmup_loss_fn = torch.nn.HuberLoss(delta=1.0)
+
+            # Import once to avoid per-step overhead
+            from whole_body_tracking.tasks.tracking.mdp.observations import \
+                get_supervision_target_task_space as _get_warmup_target
+
+            _env_raw = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+            _nfo = self.alg.policy.num_frontres_obs
+
+            print(f"[Runner] === Supervised warmup: {_warmup_iters} iters "
+                  f"(lr={_warmup_lr}, epochs={_warmup_epochs}, "
+                  f"frontres_input={_nfo} dims) ===")
+
+            for _wu in range(_warmup_iters):
+                _wo_list: list[torch.Tensor] = []
+                _wt_list: list[torch.Tensor] = []
+
+                with torch.inference_mode():
+                    for _ in range(self.num_steps_per_env):
+                        obs, extras = self.env.get_observations()
+                        obs_dict = extras.get("observations", {})
+                        _p_obs = obs_dict.get(self.policy_obs_type, obs).to(self.device)
+
+                        # GMT-only actions (FrontRES correction = zero during warmup)
+                        env_actions = self.alg.policy.get_env_action(
+                            _p_obs,
+                            torch.zeros(_p_obs.shape[0], self.alg.policy.total_output_dim,
+                                        device=self.device))
+
+                        obs, _, dones, extras = self.env.step(env_actions.to(self.env.device))
+                        obs_dict = extras.get("observations", {})
+                        _p_obs = obs_dict.get(self.policy_obs_type, obs).to(self.device)
+
+                        # Both obs and target reflect the perturbation applied this step
+                        _wo_list.append(_p_obs[:, :_nfo])
+                        _wt_list.append(_get_warmup_target(_env_raw, "motion"))
+
+                # Supervised SGD over collected rollout data
+                _all_obs = torch.cat(_wo_list, dim=0)      # (S*E, _nfo)
+                _all_tgt = torch.cat(_wt_list, dim=0)      # (S*E, 6)
+                _N = _all_obs.shape[0]
+
+                for epoch in range(_warmup_epochs):
+                    perm = torch.randperm(_N, device=self.device)
+                    for i in range(0, _N, 4096):
+                        idx = perm[i:i + 4096]
+                        pred = self.alg.policy.residual_actor(_all_obs[idx])
+                        loss = _warmup_loss_fn(pred, _all_tgt[idx])
+                        _warmup_opt.zero_grad()
+                        loss.backward()
+                        _warmup_opt.step()
+
+                if (_wu + 1) % max(1, _warmup_iters // 5) == 0:
+                    print(f"[Runner]   warmup {_wu + 1}/{_warmup_iters}: "
+                          f"loss={loss.item():.6f}")
+
+            print(f"[Runner] === Supervised warmup complete (final loss={loss.item():.6f}) ===")
+        # ── END supervised warmup ─────────────────────────────────────────────────
+
         for it in range(start_iter, tot_iter):
             start = time.time()
 

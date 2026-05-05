@@ -156,6 +156,10 @@ class FrontRESActorCritic(nn.Module):
         num_task_corrections: int = 0,
         max_delta_pos: float = 0.3,     # tanh clip for position correction (metres)
         max_delta_rpy: float = 0.3,     # tanh clip for orientation correction (radians)
+        # FrontRES-specific observation subset: when >0, FrontRES only processes the
+        # first num_frontres_obs dims of policy_obs (reference-frame data only).
+        # GMT continues to receive the full policy_obs. 0 = legacy (full obs for both).
+        num_frontres_obs: int = 0,
         **kwargs,
     ):
         if kwargs:
@@ -178,6 +182,9 @@ class FrontRESActorCritic(nn.Module):
             self.total_output_dim = num_task_corrections
         else:
             self.total_output_dim = num_actions + num_z_outputs  # FrontRES output (e.g. 30)
+        # FrontRES observation subset: when >0, residual_actor only sees first N dims
+        # (reference-frame data). GMT always sees the full observation.
+        self.num_frontres_obs = num_frontres_obs
         self.q_ref_start_idx = q_ref_start_idx
         self.noise_std_type = noise_std_type
         self.max_delta_q = max_delta_q          # tanh clip for Δq (rad)
@@ -342,10 +349,11 @@ class FrontRESActorCritic(nn.Module):
             print("[ResidualActorCritic] WARNING: No ref_vel estimator provided, will use zero padding for GMT policy")
         
         # ========== Build Fron-End Residual Network ==========
-        
+
         # FrontRES outputs [Δq (num_actions), Δz (num_z_outputs)] = total_output_dim dims
+        _frontres_input_dim = num_frontres_obs if num_frontres_obs > 0 else num_actor_obs
         self.residual_actor = self._build_residual_actor(
-            input_dim=num_actor_obs,
+            input_dim=_frontres_input_dim,
             output_dim=self.total_output_dim,
             hidden_dims=residual_hidden_dims,
             activation=activation_fn,
@@ -356,7 +364,8 @@ class FrontRESActorCritic(nn.Module):
         else:
             print(f"[FrontEndResidualActorCritic] FrontRES output: "
                   f"{num_actions} Δq + {num_z_outputs} Δz = {self.total_output_dim} dims")
-        print(f"[FrontEndResidualActorCritic] FrontRES network: {self.residual_actor}")
+        print(f"[FrontEndResidualActorCritic] FrontRES network: {self.residual_actor} "
+              f"(input_dim={_frontres_input_dim}, output_dim={self.total_output_dim})")
 
         # ========== Build Critic ==========
 
@@ -585,26 +594,30 @@ class FrontRESActorCritic(nn.Module):
 
     def _parse_observations(self, observations):
         """
-        Parse raw observation tensor (or dict) into (policy_obs, ref_vel).
+        Parse raw observation tensor (or dict) into (policy_obs, ref_vel, ref_vel_estimator_obs).
+
+        When num_frontres_obs > 0, policy_obs is trimmed to the first num_frontres_obs dims
+        (reference-frame only: command + motion_anchor_ori_b). The FULL observation is
+        stored as self._cached_full_policy_obs so GMT callers can still access it.
 
         Returns:
-            policy_obs (Tensor): observations for residual_actor  [N, num_actor_obs]
-            ref_vel    (Tensor | None): reference velocity suffix  [N, ref_vel_dim] or None
-            ref_vel_estimator_obs (Tensor | None): observations for vel estimator
+            policy_obs (Tensor): obs for residual_actor  [N, num_frontres_obs or num_actor_obs]
+            ref_vel    (Tensor | None): reference velocity suffix
+            ref_vel_estimator_obs (Tensor | None): obs for vel estimator
         """
         if isinstance(observations, dict):
-            policy_obs            = observations["policy"]
+            full_policy_obs       = observations["policy"]
             ref_vel               = None
             ref_vel_estimator_obs = observations.get("ref_vel_estimator", None)
         elif isinstance(observations, torch.Tensor):
             obs_dim = observations.shape[-1]
             if obs_dim == self.num_actor_obs:
-                policy_obs            = observations
+                full_policy_obs       = observations
                 ref_vel               = None
                 ref_vel_estimator_obs = None
             elif obs_dim == self.gmt_actor_input_dim:
                 ref_vel_dim           = self.gmt_actor_input_dim - self.num_actor_obs
-                policy_obs            = observations[:, :-ref_vel_dim]
+                full_policy_obs       = observations[:, :-ref_vel_dim]
                 ref_vel               = observations[:, -ref_vel_dim:]
                 ref_vel_estimator_obs = None
             else:
@@ -615,6 +628,17 @@ class FrontRESActorCritic(nn.Module):
                 )
         else:
             raise TypeError(f"Unexpected observation type: {type(observations)}")
+
+        # Cache full policy obs for GMT callers
+        self._cached_full_policy_obs = full_policy_obs
+
+        # FrontRES subset: when num_frontres_obs > 0, residual_actor only sees
+        # reference-frame data (first N dims), not proprioception.
+        if self.num_frontres_obs > 0:
+            policy_obs = full_policy_obs[:, :self.num_frontres_obs]
+        else:
+            policy_obs = full_policy_obs
+
         return policy_obs, ref_vel, ref_vel_estimator_obs
 
     def _apply_delta_q_and_run_gmt(self, policy_obs, delta_q, ref_vel, ref_vel_estimator_obs):
@@ -624,12 +648,19 @@ class FrontRESActorCritic(nn.Module):
         Always called inside torch.no_grad() – no gradient needed here because
         FrontRES distributes over Δq directly (see update_distribution).
 
+        When num_frontres_obs > 0, policy_obs is trimmed (reference-only subset).
+        GMT always receives the FULL observation so it can access proprioception.
+        q_ref indices are within the trimmed prefix, so patching works either way.
+
         Returns:
             robot_actions (Tensor): motor commands output by GMT  [N, num_actions]
         """
+        # Use the FULL (untrimmed) policy obs for GMT.
+        # policy_obs may be a FrontRES-specific subset; the full obs is cached.
+        full_obs = getattr(self, '_cached_full_policy_obs', policy_obs)
+        obs_modified = full_obs.clone()
         # delta_q here is already the Δq-only slice (first num_actions dims).
         # Δz is stored separately in last_delta_z by the callers.
-        obs_modified = policy_obs.clone()
         q_ref_end_idx = self.q_ref_start_idx + self.num_actions
         obs_modified[:, self.q_ref_start_idx:q_ref_end_idx] = (
             obs_modified[:, self.q_ref_start_idx:q_ref_end_idx] + self.delta_q_alpha * delta_q
@@ -649,12 +680,11 @@ class FrontRESActorCritic(nn.Module):
     def _run_gmt_direct(self, policy_obs, ref_vel, ref_vel_estimator_obs):
         """Run GMT without q_ref patching (task-space mode).
 
-        policy_obs may have extra anchor-error dims appended after the GMT's base obs.
-        The runner applies composite normalization: first gmt_dim dims are GMT-normalized,
-        the rest pass through raw.  We therefore slice to gmt_dim before feeding to GMT.
+        policy_obs may be a FrontRES-specific subset (when num_frontres_obs > 0).
+        GMT always receives the FULL observation from self._cached_full_policy_obs.
         """
-        # Strip any extra dims beyond the GMT's expected input size.
-        gmt_input = policy_obs
+        # Use the FULL (untrimmed) policy obs for GMT; policy_obs may be a subset.
+        gmt_input = getattr(self, '_cached_full_policy_obs', policy_obs)
         if self.gmt_normalizer is not None:
             _gmt_mean = getattr(self.gmt_normalizer, '_mean', None)
             if _gmt_mean is not None and gmt_input.shape[-1] > _gmt_mean.shape[-1]:
