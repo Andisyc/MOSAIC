@@ -683,7 +683,9 @@ class OnPolicyRunner:
             _frontres_baseline_sum:       float = 0.0
             _frontres_smooth_penalty_sum: float = 0.0
             _frontres_reg_penalty_sum:    float = 0.0
-            _frontres_delta_z_abs_sum:    float = 0.0   # mean |task correction| per step
+            _frontres_delta_pos_abs_sum:  float = 0.0   # mean |Δpos[:3]| per step (task-space mode)
+            _frontres_delta_rpy_abs_sum:  float = 0.0   # mean |Δrpy[3:]| per step (task-space mode)
+            _frontres_delta_z_abs_sum:    float = 0.0   # mean |Δz| per step (joint-space mode only)
             _frontres_jump_degree_sum:    float = 0.0   # mean jump_degree (gate activation monitor)
             _frontres_shaping_steps:      int   = 0
             # Termination tracking for training envs (used to compute survival_rate this rollout)
@@ -907,11 +909,12 @@ class OnPolicyRunner:
                         # Logging accumulators
                         _frontres_rdelta_sum   += r_delta.mean().item()
                         _frontres_baseline_sum += r_base.mean().item()
-                        # Task-space mode: log mean correction magnitude; else log Δz
+                        # Task-space mode: split into Δpos and Δrpy; joint-space mode: log Δz
                         if _is_task_space_mode:
                             _tc = getattr(self.alg.policy, 'last_task_correction', None)
                             if _tc is not None:
-                                _frontres_delta_z_abs_sum += _tc.abs().mean().item()
+                                _frontres_delta_pos_abs_sum += _tc[:N_train, :3].abs().mean().item()
+                                _frontres_delta_rpy_abs_sum += _tc[:N_train, 3:].abs().mean().item()
                             # Accumulate jump_degree for gate activation monitoring
                             for _cmd_term in (self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env).command_manager._terms.values():
                                 if hasattr(_cmd_term, 'jump_degree'):
@@ -1050,8 +1053,12 @@ class OnPolicyRunner:
                                             if _is_frontres and _frontres_shaping_steps > 0 else None)
             frontres_survival_rate       = (1.0 - _frontres_term_count / _frontres_step_count
                                             if _is_frontres and _frontres_step_count > 0 else None)
+            frontres_delta_pos_abs_mean  = (_frontres_delta_pos_abs_sum / _frontres_shaping_steps
+                                            if _is_frontres and _is_task_space_mode and _frontres_shaping_steps > 0 else None)
+            frontres_delta_rpy_abs_mean  = (_frontres_delta_rpy_abs_sum / _frontres_shaping_steps
+                                            if _is_frontres and _is_task_space_mode and _frontres_shaping_steps > 0 else None)
             frontres_delta_z_abs_mean    = (_frontres_delta_z_abs_sum / _frontres_shaping_steps
-                                            if _is_frontres and _frontres_shaping_steps > 0 else None)
+                                            if _is_frontres and not _is_task_space_mode and _frontres_shaping_steps > 0 else None)
             frontres_jump_degree_mean    = (_frontres_jump_degree_sum / _frontres_shaping_steps
                                             if _is_frontres and _frontres_shaping_steps > 0 else None)
 
@@ -1144,14 +1151,25 @@ class OnPolicyRunner:
         mean_std = self.alg.policy.action_std.mean()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
-        # -- Losses (reclassify FrontRES diagnostics out of Loss/ into FrontRES/)
+        # -- Losses
+        # Keys suppressed when their controlling lambda is 0 (avoids clutter for unused modes).
+        _suppress_if_zero = {"bc_off_policy", "bc_teacher", "lambda_off_policy", "lambda_teacher"}
+        # Keys reclassified out of Loss/ for clarity.
+        _to_frontres  = {"supervised_cos_sim"}      # diagnostic, not a loss
+        _to_curriculum = {"lambda_supervised"}       # scheduler state, not a loss
         _frontres_diag_keys = {"delta_q_norm_mean", "delta_q_norm_std", "smooth_metric", "lambda_reg"}
         _stage1_dz_keys     = {"loss_dz", "dz_pred_abs", "dz_gt_abs", "dz_mae"}
         for key, value in locs["loss_dict"].items():
+            if key in _suppress_if_zero and value == 0.0:
+                continue
             if self.training_type == "supervise" and key in _stage1_dz_keys:
                 self.writer.add_scalar(f"Stage1/DeltaZ/{key}", value, locs["it"])
             elif isinstance(self.alg.policy, FrontRESActorCritic) and key in _frontres_diag_keys:
                 self.writer.add_scalar(f"FrontRES/{key}", value, locs["it"])
+            elif key in _to_frontres:
+                self.writer.add_scalar(f"FrontRES/{key}", value, locs["it"])
+            elif key in _to_curriculum:
+                self.writer.add_scalar(f"Curriculum/{key}", value, locs["it"])
             else:
                 self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
@@ -1160,44 +1178,60 @@ class OnPolicyRunner:
         if self.training_type != "supervise":
             self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
 
-        # -- FrontRES Δq curriculum + B1 delta-reward diagnostics (wandb)
+        # -- FrontRES B1 delta-reward + curriculum diagnostics
         if isinstance(self.alg.policy, FrontRESActorCritic):
-            self.writer.add_scalar("Curriculum/delta_q_alpha",
-                                   locs.get("frontres_alpha", self.alg.policy.delta_q_alpha), locs["it"])
-            if locs.get("frontres_warmup_active") is not None:
-                self.writer.add_scalar("Curriculum/critic_warmup_active",
-                                       locs["frontres_warmup_active"], locs["it"])
-            # -- B1 delta-reward: r_delta and GMT baseline per step
+            _ts_mode = getattr(self.alg.policy, 'num_task_corrections', 0) > 0
+
+            # B1 delta-reward
             if locs.get("frontres_rdelta_mean") is not None:
                 self.writer.add_scalar("FrontRES/r_delta_per_step",
                                        locs["frontres_rdelta_mean"], locs["it"])
             if locs.get("frontres_baseline_mean") is not None:
                 self.writer.add_scalar("FrontRES/baseline_per_step",
                                        locs["frontres_baseline_mean"], locs["it"])
-            if locs.get("frontres_smooth_penalty_mean") is not None:
+
+            # Correction magnitude (task-space: split Δpos/Δrpy; joint-space: Δz)
+            if _ts_mode:
+                if locs.get("frontres_delta_pos_abs_mean") is not None:
+                    self.writer.add_scalar("FrontRES/delta_pos_abs_mean",
+                                           locs["frontres_delta_pos_abs_mean"], locs["it"])
+                if locs.get("frontres_delta_rpy_abs_mean") is not None:
+                    self.writer.add_scalar("FrontRES/delta_rpy_abs_mean",
+                                           locs["frontres_delta_rpy_abs_mean"], locs["it"])
+            else:
+                if locs.get("frontres_delta_z_abs_mean") is not None:
+                    self.writer.add_scalar("FrontRES/delta_z_abs_mean",
+                                           locs["frontres_delta_z_abs_mean"], locs["it"])
+
+            # Optional shaping penalties (only log when non-zero)
+            if locs.get("frontres_smooth_penalty_mean") not in (None, 0.0):
                 self.writer.add_scalar("FrontRES/smooth_penalty_per_step",
                                        locs["frontres_smooth_penalty_mean"], locs["it"])
-            if locs.get("frontres_reg_penalty_mean") is not None:
+            if locs.get("frontres_reg_penalty_mean") not in (None, 0.0):
                 self.writer.add_scalar("FrontRES/reg_penalty_per_step",
                                        locs["frontres_reg_penalty_mean"], locs["it"])
+
+            # Jump-degree gate
+            if locs.get("frontres_jump_degree_mean") is not None:
+                self.writer.add_scalar("FrontRES/jump_degree_mean",
+                                       locs["frontres_jump_degree_mean"], locs["it"])
+
+            # Curriculum / DR schedule
             if locs.get("frontres_dr_scale") is not None:
                 self.writer.add_scalar("Curriculum/dr_scale",
                                        locs["frontres_dr_scale"], locs["it"])
-            if locs.get("frontres_delta_z_abs_mean") is not None:
-                self.writer.add_scalar("FrontRES/delta_z_abs_mean",
-                                       locs["frontres_delta_z_abs_mean"], locs["it"])
             if locs.get("frontres_survival_rate") is not None:
                 self.writer.add_scalar("Curriculum/training_survival_rate",
                                        locs["frontres_survival_rate"], locs["it"])
-            # Log PI controller state
-            if isinstance(self.alg.policy, FrontRESActorCritic):
-                self.writer.add_scalar("Curriculum/survival_ema",
-                                       locs.get("_survival_ema", 1.0), locs["it"])
-                self.writer.add_scalar("Curriculum/dr_target_survival",
-                                       locs.get("_dr_target_surv", 0.983), locs["it"])
-                if locs.get("frontres_jump_degree_mean") is not None:
-                    self.writer.add_scalar("FrontRES/jump_degree_mean",
-                                           locs["frontres_jump_degree_mean"], locs["it"])
+            self.writer.add_scalar("Curriculum/survival_ema",
+                                   locs.get("_survival_ema", 1.0), locs["it"])
+            self.writer.add_scalar("Curriculum/dr_target_survival",
+                                   locs.get("_dr_target_surv", 0.983), locs["it"])
+
+            # Δq alpha ramp (joint-space mode only)
+            if not _ts_mode:
+                self.writer.add_scalar("Curriculum/delta_q_alpha",
+                                       locs.get("frontres_alpha", self.alg.policy.delta_q_alpha), locs["it"])
 
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
