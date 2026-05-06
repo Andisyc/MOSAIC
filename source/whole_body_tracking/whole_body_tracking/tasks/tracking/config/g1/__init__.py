@@ -170,22 +170,32 @@ gym.register( # GMT & Adapt训练
     },
 )
 
-gym.register( # FrontRES训练 (阶段1)
-    id="FrontRES-Supervised-Tracking-Flat-G1-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1SupervisedTrackingEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化 (阶段一需要 target 监督信号)
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatSupervisedRunnerCfg", # 网络结构 & 训练算法
-    },
-)
+# ── Deprecated two-stage registrations (Runner classes are commented out) ──
+# gym.register( # FrontRES训练 (阶段1) — replaced by unified training
+#     id="FrontRES-Supervised-Tracking-Flat-G1-v0",
+#     entry_point="isaaclab.envs:ManagerBasedRLEnv",
+#     disable_env_checker=True,
+#     kwargs={
+#         "env_cfg_entry_point": flat_env_cfg.G1SupervisedTrackingEnvCfg,
+#         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatSupervisedRunnerCfg",
+#     },
+# )
+# gym.register( # FrontRES训练 (阶段2) — replaced by unified training
+#     id="FrontRES-RLFinetune-Tracking-Flat-G1-v0",
+#     entry_point="isaaclab.envs:ManagerBasedRLEnv",
+#     disable_env_checker=True,
+#     kwargs={
+#         "env_cfg_entry_point": flat_env_cfg.G1FlatFrontRESFinetuneEnvCfg,
+#         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatFrontRESFinetuneRunnerCfg",
+#     },
+# )
 
-gym.register( # FrontRES训练 (阶段2)
-    id="FrontRES-RLFinetune-Tracking-Flat-G1-v0",
+gym.register( # FrontRES统一训练 (Stage 1 warmup + Stage 2 RL 合并为单次训练)
+    id="FrontRES-Unified-Tracking-Flat-G1-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": flat_env_cfg.G1FlatFrontRESFinetuneEnvCfg, # 仿真环境 & 观测量 & 奖励项 & 域随机化 (阶段二RL需要 Critic)
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatFrontRESFinetuneRunnerCfg", # 网络结构 & 训练算法 (supervise_learning.py & supervise.py)
+        "env_cfg_entry_point": flat_env_cfg.G1FlatFrontRESFinetuneEnvCfg, # Stage 2 env cfg 同样适用于统一训练
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_mosaic_cfg:G1FlatFrontRESUnifiedRunnerCfg",
     },
 )

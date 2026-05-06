@@ -884,6 +884,8 @@ class SupervisedTrackingEnvCfg(GeneralTrackingEnvCfg):
         sink_ratio       = 0.04,   # max ≈ 4 cm
         foot_slip_prob   = 0.2,
         foot_slip_ratio  = 0.008,
+        lateral_drift_prob = 0.3,
+        lateral_drift_std  = 0.02,  # max ≈ 2 cm std (covers Δpos[1] supervision)
         root_tilt_prob   = 0.3,
         root_tilt_max_rad = 0.05,  # max ≈ 2.9°
         joint_noise_prob = 0.4,
@@ -1174,6 +1176,8 @@ class FrontRESFinetuneTrackingEnvCfg(GeneralTrackingEnvCfg):
         self.motion_perturbations.sink_ratio       = 0.04   # 4× → 0.16 m
         self.motion_perturbations.foot_slip_prob   = 0.2
         self.motion_perturbations.foot_slip_ratio  = 0.008  # 4× → 0.032 m
+        self.motion_perturbations.lateral_drift_prob = 0.3
+        self.motion_perturbations.lateral_drift_std  = 0.02  # 4× → 0.08 m side-to-side drift
         self.motion_perturbations.root_tilt_prob   = 0.3
         self.motion_perturbations.root_tilt_max_rad = 0.05  # 4× → 0.20 rad (~11.5°)
         self.motion_perturbations.joint_noise_prob = 0.4

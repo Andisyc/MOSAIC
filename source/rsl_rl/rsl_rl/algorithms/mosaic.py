@@ -1025,6 +1025,10 @@ class MOSAIC:
                         param_group["lr"] = self.learning_rate
 
             # ========== PPO Losses ==========
+            # frontres_mask_batch: 1 for FrontRES envs, 0 for GMT baseline envs.
+            # Masking prevents GMT envs (zeroed rewards → returns≈0) from pulling V(s)
+            # toward 0 for early-episode states shared with FrontRES envs.
+            _has_mask = frontres_mask_batch is not None
             if self.use_ppo: # 计算PPO Loss
                 # Surrogate loss 截断代理Loss防止更新步幅太大
                 # 计算新旧策略比值 (若ratio>1则新网络更倾向执行这个动作)
@@ -1037,14 +1041,10 @@ class MOSAIC:
                 # 截断限制: 若某动作特别好, 容易对网络产生巨大影响导致崩溃, 因此施加截断; 若某动作特别坏, 则不加限制得惩罚
                 surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                     ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
-                
+
                 surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
                 # Value function loss 训练Critic使得评分更准
-                # frontres_mask_batch: 1 for FrontRES envs, 0 for GMT baseline envs.
-                # Masking prevents GMT envs (zeroed rewards → returns≈0) from pulling V(s)
-                # toward 0 for early-episode states shared with FrontRES envs.
-                _has_mask = frontres_mask_batch is not None
                 if self.use_clipped_value_loss: # 截断限制: 防止更新过大导致网络崩溃
                     value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
                         -self.clip_param, self.clip_param)

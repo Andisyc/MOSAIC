@@ -282,13 +282,16 @@ class OnPolicyRunner:
 
         # init storage and model
         if self.training_type == "mosaic":
+            # For FrontRESActorCritic in task-space mode, the "action" stored in the
+            # rollout buffer is 6-dim SE(3) correction [Δpos, Δrpy], NOT 29-dim robot joints.
+            _mosaic_action_dim = getattr(policy, 'total_output_dim', None) or self.env.num_actions
             self.alg.init_storage(
                 self.training_type,
                 self.env.num_envs,
                 self.num_steps_per_env,
                 [num_obs],
                 [num_privileged_obs],
-                [self.env.num_actions],
+                [_mosaic_action_dim],
                 teacher_obs_shape=[num_teacher_obs] if num_teacher_obs is not None else None,
                 ref_vel_estimator_obs_shape=[num_ref_vel_estimator_obs] if self.ref_vel_estimator_obs_type is not None else None,)
         elif self.training_type == "supervise":
@@ -732,6 +735,24 @@ class OnPolicyRunner:
                             env_actions = self.alg.policy.get_env_action(obs, actions)
                         else:
                             env_actions = actions
+
+                        # B1 split-env: override stored actions/log_probs for GMT baseline envs
+                        # and set frontres_mask so the critic update is masked correctly.
+                        # This mirrors the else-branch B1 logic but skips env_actions split
+                        # (task-space mode: env_actions are pure GMT for all envs anyway;
+                        # the FrontRES corrections reach the env via _frontres_pos/quat_correction).
+                        if _is_frontres:
+                            _zeros_gmt = torch.zeros(N_base, self.alg.transition.actions.shape[-1],
+                                                     device=self.device)
+                            self.alg.transition.actions[N_train:] = _zeros_gmt
+                            _mean_gmt = self.alg.policy.action_mean[N_train:].clone()
+                            _std_gmt  = self.alg.policy.action_std[N_train:]
+                            _logp_zeros = torch.distributions.Normal(_mean_gmt, _std_gmt) \
+                                              .log_prob(_zeros_gmt).sum(dim=-1)
+                            self.alg.transition.actions_log_prob[N_train:] = _logp_zeros
+                            _frontres_mask = torch.zeros(self.env.num_envs, 1, device=self.device)
+                            _frontres_mask[:N_train] = 1.0
+                            self.alg.transition.frontres_mask = _frontres_mask
 
                     elif self.training_type == "supervise":
                         # Stage 1 Supervised Learning rollout:
