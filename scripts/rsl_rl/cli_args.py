@@ -48,7 +48,7 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     arg_group.add_argument(
         "--run_name", 
         type=str, 
-        default="FrontRES_Stage_2_finetune", 
+        default="FrontRES_Merged_Training", 
         help="Run name suffix to the log directory."
     )
 
