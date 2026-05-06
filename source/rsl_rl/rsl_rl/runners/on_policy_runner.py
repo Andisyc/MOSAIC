@@ -814,6 +814,19 @@ class OnPolicyRunner:
                                     _cmd_term._frontres_quat_correction[N_train:].zero_()
                                     _cmd_term._frontres_quat_correction[N_train:, 0] = 1.0
 
+                    # Read supervised target BEFORE env.step: the command term's cache holds
+                    # the perturbation that generated the CURRENT obs (used by FrontRES this step).
+                    # After env.step, _update_command() overwrites the cache for the next step.
+                    if _is_task_space_mode and getattr(self.alg, 'lambda_supervised', 0.0) > 0:
+                        # Use a local env reference to avoid relying on _env_raw which is only
+                        # assigned inside the _task_corr is not None branch above.
+                        _env_for_sup = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+                        for _cmd_sup in _env_for_sup.command_manager._terms.values():
+                            if hasattr(_cmd_sup, 'supervised_target'):
+                                self.alg.transition.supervised_target = \
+                                    _cmd_sup.supervised_target.clone().to(self.device)
+                                break
+
                     # Step the environment 仿真环境更新观测量/动作评分/序列结束与否/监控数据
                     # NOTE: This is where the environment computes the *next* observation internally.
                     # The result is returned here and then used in the next loop iteration.

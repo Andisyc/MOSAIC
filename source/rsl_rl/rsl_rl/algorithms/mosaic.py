@@ -88,6 +88,12 @@ class MOSAIC:
         use_estimate_ref_vel: bool = False,
         ref_vel_estimator_checkpoint_path: Optional[str] = None,
         ref_vel_estimator_type: str = "mlp",
+        # Unified Stage 1+2: supervised auxiliary loss weight schedule
+        lambda_supervised: float = 0.0,           # initial weight (0 = disabled)
+        lambda_supervised_min: float = 0.05,       # floor after decay (acts as regulariser)
+        lambda_supervised_decay: float = 0.997,    # per-iteration multiplier after trigger
+        supervised_trigger_cosine_sim: float = 0.85,  # EMA cosine_sim threshold to start decay
+        supervised_rpy_loss_weight: float = 1.0,   # weight for Δrpy vs Δpos in L_sup
     ):
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
@@ -528,6 +534,21 @@ class MOSAIC:
         if self.use_off_policy_bc:
             self._load_expert_trajectories()
 
+        # ── Unified Stage 1+2: supervised auxiliary loss ─────────────────────
+        self.lambda_supervised            = lambda_supervised
+        self.lambda_supervised_min        = lambda_supervised_min
+        self.lambda_supervised_decay_rate = lambda_supervised_decay
+        self.supervised_trigger_cosine_sim = supervised_trigger_cosine_sim
+        self.supervised_rpy_loss_weight   = supervised_rpy_loss_weight
+        self._supervised_decay_triggered  = False
+        self._supervised_cosine_ema       = 0.0   # exponential moving average of cos_sim
+        self._supervised_ema_alpha        = 0.05  # EMA smoothing factor
+        if lambda_supervised > 0:
+            print(f"[MOSAIC] Unified training: λ_sup={lambda_supervised}, "
+                  f"trigger_cos={supervised_trigger_cosine_sim}, "
+                  f"decay={lambda_supervised_decay}, min={lambda_supervised_min}")
+        # ─────────────────────────────────────────────────────────────────────
+
         self._print_init_summary()
 
     def _print_init_summary(self):
@@ -771,7 +792,32 @@ class MOSAIC:
         if not self.hybrid:
             return self._update_pure_bc()
         else:
-            return self._update_hybrid()
+            loss_dict = self._update_hybrid()
+            self._step_supervised_lambda(loss_dict.get("supervised_cos_sim", 0.0))
+            return loss_dict
+
+    def _step_supervised_lambda(self, cos_sim: float):
+        """Update λ_sup EMA and trigger exponential decay when cos_sim threshold is crossed."""
+        if self.lambda_supervised <= self.lambda_supervised_min:
+            return
+        # EMA update
+        self._supervised_cosine_ema = (
+            (1.0 - self._supervised_ema_alpha) * self._supervised_cosine_ema
+            + self._supervised_ema_alpha * cos_sim
+        )
+        # Trigger (one-shot)
+        if not self._supervised_decay_triggered:
+            if self._supervised_cosine_ema >= self.supervised_trigger_cosine_sim:
+                self._supervised_decay_triggered = True
+                print(f"[MOSAIC] λ_sup decay triggered: "
+                      f"cos_sim_ema={self._supervised_cosine_ema:.3f} ≥ "
+                      f"{self.supervised_trigger_cosine_sim:.3f}")
+        # Decay
+        if self._supervised_decay_triggered:
+            self.lambda_supervised = max(
+                self.lambda_supervised * self.lambda_supervised_decay_rate,
+                self.lambda_supervised_min,
+            )
 
     def _update_pure_bc(self):
         """Pure BC update (exactly like Distillation): sequential data traversal + gradient accumulation
@@ -882,6 +928,8 @@ class MOSAIC:
         mean_entropy = 0
         mean_bc_off_policy_loss = 0
         mean_bc_teacher_loss = 0
+        mean_supervised_loss = 0
+        mean_supervised_cos_sim = 0.0
 
         if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -907,6 +955,7 @@ class MOSAIC:
             ref_vel_estimator_obs_batch,
             motion_groups_batch,
             frontres_mask_batch,
+            supervised_target_batch,
         ) in generator:
             # 使用generator提取一个mini-batch的数据
             original_batch_size = obs_batch.shape[0]
@@ -1300,14 +1349,35 @@ class MOSAIC:
                         if target_actions is not None:
                             bc_off_policy_loss = nn.functional.mse_loss(student_mu_batch, target_actions.detach())
 
+            # ========== Supervised Auxiliary Loss (Unified Stage 1+2) ==========
+            supervised_loss = torch.tensor(0.0, device=self.device)
+            _sup_cos_sim    = 0.0
+            if (self.lambda_supervised > 0 and supervised_target_batch is not None
+                    and mu_batch.shape[-1] == supervised_target_batch.shape[-1]):
+                pred   = mu_batch[:original_batch_size]          # [B, 6] FrontRES ΔSE3 prediction
+                target = supervised_target_batch[:original_batch_size]
+                # Clamp target to FrontRES tanh output range to avoid unreachable supervision
+                if hasattr(self.policy, 'max_delta_pos') and hasattr(self.policy, 'max_delta_rpy'):
+                    target = torch.cat([
+                        target[:, :3].clamp(-self.policy.max_delta_pos, self.policy.max_delta_pos),
+                        target[:, 3:].clamp(-self.policy.max_delta_rpy, self.policy.max_delta_rpy),
+                    ], dim=-1)
+                pos_sup = nn.functional.huber_loss(pred[:, :3], target[:, :3].detach())
+                rpy_sup = nn.functional.huber_loss(pred[:, 3:], target[:, 3:].detach())
+                supervised_loss = pos_sup + self.supervised_rpy_loss_weight * rpy_sup
+                with torch.no_grad():
+                    _sup_cos_sim = nn.functional.cosine_similarity(
+                        pred, target, dim=-1).mean().item()
+
             # ========== MOSAIC Combined Loss ==========
             # Loss相加与反向传播
             loss = torch.tensor(0.0, device=self.device)
 
-            # L = L_PPO + λ_off * L_BC_expert + λ_teacher * L_BC_teacher
+            # L = L_PPO + λ_off * L_BC_expert + λ_teacher * L_BC_teacher + λ_sup * L_supervised
             if self.use_ppo:
                 loss = loss + surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
             loss = loss + self.lambda_off_policy_current * bc_off_policy_loss + self.lambda_teacher_current * bc_teacher_loss
+            loss = loss + self.lambda_supervised * supervised_loss
 
             # 反向传播三部曲: 清空梯度, 计算梯度, 更新权重
             self.optimizer.zero_grad() # 清空梯度
@@ -1326,6 +1396,8 @@ class MOSAIC:
             mean_entropy += entropy_batch.mean().item()
             mean_bc_off_policy_loss += bc_off_policy_loss.item()
             mean_bc_teacher_loss += bc_teacher_loss.item()
+            mean_supervised_loss += supervised_loss.item()
+            mean_supervised_cos_sim += _sup_cos_sim
 
         # Average losses
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -1334,6 +1406,8 @@ class MOSAIC:
         mean_entropy /= num_updates
         mean_bc_off_policy_loss /= num_updates
         mean_bc_teacher_loss /= num_updates
+        mean_supervised_loss /= num_updates
+        mean_supervised_cos_sim /= num_updates
 
         # Clear the storage
         self.storage.clear()
@@ -1351,6 +1425,9 @@ class MOSAIC:
             "bc_teacher": mean_bc_teacher_loss,
             "lambda_off_policy": self.lambda_off_policy_current,
             "lambda_teacher": self.lambda_teacher_current,
+            "supervised_loss": mean_supervised_loss,
+            "supervised_cos_sim": mean_supervised_cos_sim,
+            "lambda_supervised": self.lambda_supervised,
         }
 
         return loss_dict
