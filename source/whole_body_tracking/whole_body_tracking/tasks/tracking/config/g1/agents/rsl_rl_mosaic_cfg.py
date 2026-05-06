@@ -1,5 +1,3 @@
-from dataclasses import MISSING
-
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg
 from whole_body_tracking.utils.rsl_rl_cfg import (
@@ -456,7 +454,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
       root_tilt_prob=0.3,    root_tilt_max_rad=0.08, # Δroll, Δpitch
     """
     num_steps_per_env = 24
-    max_iterations    = 10000
+    max_iterations    = 30000
     save_interval     = 500
     experiment_name   = "g1_flat_frontres_unified"
     empirical_normalization = True
@@ -475,10 +473,10 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         max_delta_pos          = 0.3,      # tanh clip (metres)
         max_delta_rpy          = 0.3,      # tanh clip (radians ≈ 17°)
         # ── GMT (frozen) ─────────────────────────────────────────────────────
-        gmt_checkpoint_path    = MISSING,  # ← FILL IN before training
+        gmt_checkpoint_path    = "/home/yuxuancheng/MOSAIC/model/model_27000.pt",
         init_critic_from_gmt   = False,
         # ── Observation layout ───────────────────────────────────────────────
-        q_ref_start_idx        = MISSING,  # ← FILL IN (index of q_ref in policy obs)
+        q_ref_start_idx        = 232,      # q_ref offset in 800-dim policy obs
         num_frontres_obs       = 0,        # 0 = FrontRES sees full obs
         # ── Δq / Δz unused in task-space mode ────────────────────────────────
         num_z_outputs          = 0,
