@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import asdict
 from torch.utils.tensorboard import SummaryWriter
 
@@ -46,24 +47,41 @@ class WandbSummaryWriter(SummaryWriter):
         # Each failure falls through to the next without crashing.
         # NOTE: "thread" must come before "fork" — fork after CUDA initialization
         # can deadlock the child process (CUDA contexts are not fork-safe).
-        # This is especially likely when optimizer state tensors are loaded to GPU
-        # before wandb.init() is called (e.g., is_full_resume=True in Stage 2).
-        _init_strategies = [
-            {"settings": wandb.Settings(start_method="thread")},
-            {"settings": wandb.Settings(start_method="fork")},
-            {"mode": "offline"},   # no network needed; syncs later with `wandb sync`
-        ]
+        # WANDB_MODE=offline skips all network attempts immediately.
+        _TIMEOUT = 30  # seconds per attempt before giving up
+
+        if os.environ.get("WANDB_MODE", "").lower() == "offline":
+            _init_strategies = [{"mode": "offline"}]
+        else:
+            _init_strategies = [
+                {"settings": wandb.Settings(start_method="thread")},
+                {"mode": "offline"},   # fallback: no network needed; sync later with `wandb sync`
+            ]
 
         for kwargs in _init_strategies:
-            try:
-                wandb.init(project=project, entity=entity, name=run_name, **kwargs)
+            _result = {"ok": False, "err": None}
+
+            def _do_init(kw=kwargs, res=_result):
+                try:
+                    wandb.init(project=project, entity=entity, name=run_name, **kw)
+                    res["ok"] = True
+                except Exception as e:
+                    res["err"] = e
+
+            t = threading.Thread(target=_do_init, daemon=True)
+            t.start()
+            t.join(timeout=_TIMEOUT)
+
+            if t.is_alive():
+                print(f"[WandbWriter] wandb.init timed out after {_TIMEOUT}s ({kwargs}) — trying next strategy.")
+                continue
+            if _result["ok"]:
                 wandb.config.update({"log_dir": log_dir})
                 self._wandb_ok = True
                 mode = kwargs.get("mode", kwargs.get("settings", "default"))
                 print(f"[WandbWriter] wandb initialized (strategy={mode}).")
                 break
-            except Exception as e:
-                print(f"[WandbWriter] wandb.init attempt failed ({kwargs}): {e}")
+            print(f"[WandbWriter] wandb.init attempt failed ({kwargs}): {_result['err']}")
 
         if not self._wandb_ok:
             print("[WandbWriter] All wandb init strategies failed — TensorBoard only.")

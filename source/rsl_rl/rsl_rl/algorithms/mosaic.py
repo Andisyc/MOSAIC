@@ -552,26 +552,78 @@ class MOSAIC:
         self._print_init_summary()
 
     def _print_init_summary(self):
-        """Print initialization summary"""
-        print("=" * 80)
-        print("MOSAIC: PPO + BC Hybrid Learning")
-        print("=" * 80)
-        print("Optimizer:")
-        print(f"  Learning Rate: {self.learning_rate}")
-        print(f"  Gradient Accumulation: {self.gradient_accumulation_steps} steps{' (DISABLED)' if self.gradient_accumulation_steps == 1 else ''}")
-        print()
-        print("Off-policy BC:")
-        print(f"  Enabled: {self.use_off_policy_bc}")
-        if self.use_off_policy_bc:
-            print(f"  Lambda: {self.lambda_off_policy_current} (decay: {self.lambda_off_policy_decay}, min: {self.lambda_off_policy_min})")
-            print(f"  Loss type: {self.expert_loss_type}")
-        print()
-        print("Teacher BC:")
-        print(f"  Enabled: {self.use_teacher_bc}")
-        if self.use_teacher_bc:
-            print(f"  Lambda: {self.lambda_teacher_current} (decay: {self.lambda_teacher_decay}, min: {self.lambda_teacher_min})")
-            print(f"  Loss type: {self.teacher_loss_type} ({['KL divergence (matches mean+variance)', 'MSE (matches mean only)'][self.teacher_loss_type == 'mse']})")
-        print("=" * 80)
+        """Print initialization summary with active-branch identification."""
+        W = 80
+
+        # ── Determine active branch name ──────────────────────────────────────
+        _sup   = self.lambda_supervised > 0
+        _teach = self.use_teacher_bc
+        _off   = self.use_off_policy_bc
+        _ppo   = self.use_ppo
+
+        if _sup and _ppo and not _teach and not _off:
+            branch = "FrontRES Unified  (PPO + Supervised ΔSE3 warmup)"
+        elif _ppo and _teach and not _off:
+            branch = "Hybrid            (PPO + Teacher BC)"
+        elif _ppo and _off and not _teach:
+            branch = "Hybrid            (PPO + Off-policy Expert BC)"
+        elif _ppo and _teach and _off:
+            branch = "Hybrid            (PPO + Teacher BC + Expert BC)"
+        elif _ppo and not _teach and not _off:
+            branch = "Pure PPO"
+        elif not _ppo and _teach:
+            branch = "Pure Distillation (Teacher BC only)"
+        else:
+            branch = "MOSAIC (custom)"
+
+        # ── Active loss equation ──────────────────────────────────────────────
+        _terms = []
+        if _ppo:
+            _terms.append("L_PPO")
+        if _sup:
+            _terms.append(f"λ_sup({self.lambda_supervised:.2f})·L_supervised")
+        if _teach:
+            _terms.append(f"λ_teacher({self.lambda_teacher_current:.2f})·L_BC_teacher")
+        if _off:
+            _terms.append(f"λ_off({self.lambda_off_policy_current:.2f})·L_BC_expert")
+        loss_eq = "L = " + " + ".join(_terms) if _terms else "L = 0 (no active loss!)"
+
+        print("=" * W)
+        print(f"  MOSAIC ▸ {branch}")
+        print(f"  {loss_eq}")
+        print("=" * W)
+
+        # ── Optimizer ─────────────────────────────────────────────────────────
+        print(f"  LR={self.learning_rate}  "
+              f"grad_accum={self.gradient_accumulation_steps}{'(off)' if self.gradient_accumulation_steps == 1 else ''}")
+
+        # ── PPO ──────────────────────────────────────────────────────────────
+        if _ppo:
+            print(f"  PPO  clip={self.clip_param}  ent_coef={self.entropy_coef}"
+                  f"  epochs={self.num_learning_epochs}  mini_batches={self.num_mini_batches}")
+
+        # ── Supervised auxiliary loss (FrontRES unified) ──────────────────────
+        if _sup:
+            print(f"  Supervised  λ={self.lambda_supervised:.3f} → {self.lambda_supervised_min}"
+                  f"  decay={self.lambda_supervised_decay_rate}"
+                  f"  trigger_cos={self.supervised_trigger_cosine_sim}"
+                  f"  rpy_w={self.supervised_rpy_loss_weight}")
+
+        # ── Teacher BC ────────────────────────────────────────────────────────
+        if _teach:
+            mt = "multi-teacher" if self.use_multi_teacher else "single-teacher"
+            print(f"  Teacher BC  [{mt}]  loss={self.teacher_loss_type}"
+                  f"  λ={self.lambda_teacher_current:.3f}→{self.lambda_teacher_min}"
+                  f"  decay={self.lambda_teacher_decay}")
+
+        # ── Off-policy expert BC ──────────────────────────────────────────────
+        if _off:
+            print(f"  Expert BC  loss={self.expert_loss_type}"
+                  f"  λ={self.lambda_off_policy_current:.3f}→{self.lambda_off_policy_min}"
+                  f"  decay={self.lambda_off_policy_decay}"
+                  f"  batch={self.off_policy_batch_size}")
+
+        print("=" * W)
 
     def _load_expert_trajectories(self):
         """Load pre-collected expert trajectories for off-policy BC"""

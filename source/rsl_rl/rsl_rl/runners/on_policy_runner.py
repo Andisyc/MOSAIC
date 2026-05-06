@@ -196,7 +196,7 @@ class OnPolicyRunner:
             # Use GMT's frozen normalizer for observations
             if policy.gmt_normalizer is not None:
                 self.obs_normalizer = policy.gmt_normalizer
-                print("[Runner] Using GMT's frozen normalizer for ResidualActorCritic")
+                print(f"[Runner] Using GMT's frozen normalizer for {type(policy).__name__}")
                 # Task-space mode: student obs may have extra anchor-error dims beyond
                 # what the GMT normalizer expects.  Detect and store the split point.
                 if (isinstance(policy, FrontRESActorCritic)
