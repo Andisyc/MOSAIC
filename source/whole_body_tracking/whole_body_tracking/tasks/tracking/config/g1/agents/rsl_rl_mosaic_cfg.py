@@ -1,8 +1,11 @@
+from dataclasses import MISSING
+
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg
 from whole_body_tracking.utils.rsl_rl_cfg import (
     RslRlMOSAICAlgorithmCfg,
     RslRlResidualActorCriticCfg,
+    RslRlFrontResidualActorCriticCfg,
     RslRlPpoActorCriticWithRefVelSkipCfg,
 )
 
@@ -422,4 +425,108 @@ class G1FlatMOSAICMultiTeacherResidualRunnerCfg(RslRlOnPolicyRunnerCfg):
         teacher_critic_checkpoint_path=None,
         teacher_critic_frozen=False,
         train_critic_during_distillation=False,)
-    
+
+
+# ========== FrontRES Unified Training (Stage 1 + Stage 2 merged) ==========
+
+@configclass
+class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
+    """
+    Unified FrontRES training: supervised ΔSE3 warmup + B1 delta-reward RL in one run.
+
+    Architecture:
+      FrontRES (trainable) → ΔSE3 [Δpos(3), Δrpy(3)]
+      → patch anchor root pose → frozen GMT → robot actions
+
+    Loss:
+      L = L_PPO(B1 delta-reward) + λ_sup(t) * L_supervised(ΔSE3)
+
+    λ_sup decays from lambda_supervised → lambda_supervised_min once
+    cosine_similarity_ema(pred, target) ≥ supervised_trigger_cosine_sim.
+
+    Mandatory fields to fill before training:
+      policy.gmt_checkpoint_path        — path to frozen GMT .pt checkpoint
+      policy.q_ref_start_idx            — index of q_ref in the flattened policy obs
+
+    Recommended MotionPerturbationCfg (all dims covered):
+      float_prob=0.3,        float_ratio=0.15,      # Δpos[2]+
+      sink_prob=0.3,         sink_ratio=0.15,       # Δpos[2]-
+      foot_slip_prob=0.2,    foot_slip_ratio=0.05,  # Δpos[0]
+      lateral_drift_prob=0.3, lateral_drift_std=0.05, # Δpos[1]
+      root_tilt_prob=0.3,    root_tilt_max_rad=0.08, # Δroll, Δpitch
+    """
+    num_steps_per_env = 24
+    max_iterations    = 10000
+    save_interval     = 500
+    experiment_name   = "g1_flat_frontres_unified"
+    empirical_normalization = True
+
+    policy = RslRlFrontResidualActorCriticCfg(
+        class_name             = "FrontRESActorCritic",
+        # ── Network ──────────────────────────────────────────────────────────
+        residual_hidden_dims   = [512, 256, 128],
+        residual_last_layer_gain = 0.01,
+        critic_hidden_dims     = [1024, 1024, 512, 256],
+        activation             = "elu",
+        init_noise_std         = 0.5,
+        noise_std_type         = "scalar",
+        # ── Task-space SE(3) correction mode ─────────────────────────────────
+        num_task_corrections   = 6,        # output = [Δpos(3), Δrpy(3)]
+        max_delta_pos          = 0.3,      # tanh clip (metres)
+        max_delta_rpy          = 0.3,      # tanh clip (radians ≈ 17°)
+        # ── GMT (frozen) ─────────────────────────────────────────────────────
+        gmt_checkpoint_path    = MISSING,  # ← FILL IN before training
+        init_critic_from_gmt   = False,
+        # ── Observation layout ───────────────────────────────────────────────
+        q_ref_start_idx        = MISSING,  # ← FILL IN (index of q_ref in policy obs)
+        num_frontres_obs       = 0,        # 0 = FrontRES sees full obs
+        # ── Δq / Δz unused in task-space mode ────────────────────────────────
+        num_z_outputs          = 0,
+        max_delta_q            = 0.5,
+    )
+
+    algorithm = RslRlMOSAICAlgorithmCfg(
+        # ── Mode ─────────────────────────────────────────────────────────────
+        hybrid  = True,
+        use_ppo = True,
+
+        # ── PPO ──────────────────────────────────────────────────────────────
+        value_loss_coef      = 1.0,
+        use_clipped_value_loss = True,
+        clip_param           = 0.2,
+        entropy_coef         = 0.005,
+        num_learning_epochs  = 5,
+        num_mini_batches     = 4,
+        learning_rate        = 1.0e-3,
+        schedule             = "adaptive",
+        gamma                = 0.99,
+        lam                  = 0.95,
+        desired_kl           = 0.01,
+        max_grad_norm        = 1.0,
+
+        # ── Supervised auxiliary loss (λ_sup schedule) ────────────────────────
+        lambda_supervised             = 1.0,   # initial weight
+        lambda_supervised_min         = 0.05,  # floor (regulariser)
+        lambda_supervised_decay       = 0.997, # per-iter decay after trigger
+        supervised_trigger_cosine_sim = 0.85,  # EMA threshold to start decay
+        supervised_rpy_loss_weight    = 1.0,
+
+        # ── Teacher / off-policy BC (disabled by default) ────────────────────
+        teacher_checkpoint_path  = None,
+        lambda_teacher_init      = 0.0,
+        lambda_teacher_decay     = 1.0,
+        lambda_teacher_min       = 0.0,
+        expert_trajectory_path   = None,
+        lambda_off_policy        = 0.0,
+        lambda_off_policy_decay  = 1.0,
+        lambda_off_policy_min    = 0.0,
+
+        # ── Misc ─────────────────────────────────────────────────────────────
+        gradient_accumulation_steps    = 1,
+        teacher_critic_checkpoint_path = None,
+        teacher_critic_frozen          = False,
+        train_critic_during_distillation = False,
+        use_estimate_ref_vel           = False,
+        ref_vel_estimator_checkpoint_path = None,
+        ref_vel_estimator_type         = "mlp",
+    )

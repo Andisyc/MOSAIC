@@ -188,6 +188,18 @@ class RslRlMOSAICAlgorithmCfg(RslRlPpoAlgorithmCfg):
     ref_vel_estimator_type: str = "mlp"
     """Type of velocity estimator: 'mlp' or 'transformer'."""
 
+    # Unified Stage 1+2: supervised auxiliary loss (FrontRES task-space mode)
+    lambda_supervised: float = 0.0
+    """Initial weight for supervised ΔSE3 auxiliary loss. 0 = disabled (legacy behaviour)."""
+    lambda_supervised_min: float = 0.05
+    """Floor for lambda_supervised after decay. Acts as regulariser preventing drift."""
+    lambda_supervised_decay: float = 0.997
+    """Per-iteration decay multiplier once the trigger threshold is crossed."""
+    supervised_trigger_cosine_sim: float = 0.85
+    """EMA cosine-similarity threshold that starts the decay (FrontRES has learned direction)."""
+    supervised_rpy_loss_weight: float = 1.0
+    """Weight for Δrpy component relative to Δpos in the supervised loss."""
+
 
 @configclass
 class RslRlKLDistillationAlgorithmCfg:

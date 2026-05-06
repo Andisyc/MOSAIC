@@ -40,6 +40,14 @@ class MotionPerturbationCfg:
     root_tilt_max_rad: float = 0.0
     """Maximum tilt angle in radians applied to root pitch/roll. GMT fails around 3-5 deg (~0.05-0.09 rad)."""
 
+    # -- Lateral drift perturbation (Y direction)
+    lateral_drift_prob: float = 0.0
+    """Probability of applying lateral (Y-axis) drift perturbation."""
+    lateral_drift_std: float = 0.0
+    """Standard deviation of Gaussian Y displacement (metres). Covers side-to-side body drift
+    artifacts absent from foot_slip (X-only) and float/sink (Z-only). Gives FrontRES a
+    supervised training signal for the Δpos[1] output dimension."""
+
     # -- Joint angle noise perturbation
     joint_noise_prob: float = 0.0
     """Probability of applying joint angle noise perturbation."""
@@ -90,15 +98,19 @@ class MotionPerturber:
         """
         perturbed_root_pos = root_pos_ref.clone()
 
-        # Apply foot slip
+        # Apply foot slip (X direction)
         if self.cfg.foot_slip_prob > 0.0:
             perturbed_root_pos = self._apply_foot_slip(perturbed_root_pos, left_foot_pos_ref, right_foot_pos_ref)
 
-        # Apply float
+        # Apply lateral drift (Y direction)
+        if self.cfg.lateral_drift_prob > 0.0:
+            perturbed_root_pos = self._apply_lateral_drift(perturbed_root_pos)
+
+        # Apply float (Z positive)
         if self.cfg.float_prob > 0.0:
             perturbed_root_pos = self._apply_float(perturbed_root_pos)
 
-        # Apply sink
+        # Apply sink (Z negative)
         if self.cfg.sink_prob > 0.0:
             perturbed_root_pos = self._apply_sink(perturbed_root_pos)
 
@@ -139,6 +151,22 @@ class MotionPerturber:
         slip_magnitude = self.cfg.foot_slip_ratio * torch.randn_like(root_pos[:, 0])
         root_pos[can_slip, 0] += slip_magnitude[can_slip] * slip_dir[can_slip, 0]
 
+        return root_pos
+
+    def _apply_lateral_drift(self, root_pos: torch.Tensor) -> torch.Tensor:
+        """Apply Gaussian Y-axis lateral drift to the root position.
+
+        Simulates side-to-side body position artifacts (e.g., lateral sway in
+        motion capture data) that are orthogonal to the forward direction.
+        Provides FrontRES with a supervised training signal for the Δpos[1] output.
+        """
+        drift_envs = torch.rand(self.num_envs, device=self.device) < self.cfg.lateral_drift_prob
+        if not torch.any(drift_envs):
+            return root_pos
+
+        drift = torch.zeros_like(root_pos)
+        drift[:, 1] = torch.randn(self.num_envs, device=self.device) * self.cfg.lateral_drift_std
+        root_pos[drift_envs] += drift[drift_envs]
         return root_pos
 
     def _apply_float(self, root_pos: torch.Tensor) -> torch.Tensor:
