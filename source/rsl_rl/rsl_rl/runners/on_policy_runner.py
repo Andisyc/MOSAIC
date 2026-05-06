@@ -426,9 +426,10 @@ class OnPolicyRunner:
         # Book keeping
         ep_infos = []
         rewbuffer = deque(maxlen=100)  # FrontRES envs: r_delta per episode; others: raw reward
-        lenbuffer = deque(maxlen=100)
+        lenbuffer = deque(maxlen=100)  # FrontRES training envs episode lengths
         # B1: separate GMT baseline reward buffer (only populated when _is_frontres)
-        rewbuffer_gmt = deque(maxlen=100)  # GMT-only envs: raw GMT reward per episode
+        rewbuffer_gmt    = deque(maxlen=100)  # GMT-only envs: raw GMT reward per episode
+        lenbuffer_gmt    = deque(maxlen=100)  # GMT-only envs: episode lengths (key diagnostic)
 
         # self.env.num_envs: 仿真中同时运行的机器人数量
         # cur_reward_sum & cur_episode_length: 每个机器人的总得分与存活时间
@@ -500,11 +501,13 @@ class OnPolicyRunner:
         _dr_target_surv = 1.0 - 1.0 / max(1, _dr_target_ep)  # per-step survival target
         _dr_speed       = float(self.cfg.get("dr_adapt_speed",  0.0005))
         _dr_max         = float(self.cfg.get("dr_max_scale",    4.0))
+        _dr_min         = float(self.cfg.get("dr_min_scale",    0.0))
         _dr_ema_alpha   = float(self.cfg.get("dr_ema_alpha",    0.95))
         _dr_deadband    = float(self.cfg.get("dr_deadband",     0.005))
 
         # Restore dr_scale from checkpoint (set by load()); start at 0 for fresh runs.
         _dr_scale     = float(getattr(self, '_dr_scale', 0.0))
+        _dr_scale     = max(_dr_scale, _dr_min)  # enforce floor on resume
         _survival_ema = 1.0  # optimistic initial estimate; warms up quickly via EMA
 
         # Read base perturbation values from env config (scaled by dr_scale each iteration).
@@ -538,6 +541,75 @@ class OnPolicyRunner:
                 )
             else:
                 print("[Runner] WARNING: FrontRES DR enabled but env.cfg.motion_perturbations not found")
+
+        # ── FrontRES supervised warmup (Stage 1 → Stage 2 merge) ──────────────────
+        # Runs BEFORE the PPO loop. Teaches FrontRES to detect perturbations via
+        # supervised learning on the anti-DR target:  target = -(perturbed - original).
+        # After warmup, PPO fine-tunes with r_delta reward (same architecture, same obs).
+        _warmup_iters = int(self.cfg.get("supervised_warmup_iterations", 0))
+        if _is_frontres and _warmup_iters > 0:
+            _warmup_lr     = float(self.cfg.get("supervised_warmup_lr", 1e-4))
+            _warmup_epochs = int(self.cfg.get("supervised_warmup_epochs", 5))
+            _warmup_opt = torch.optim.Adam(
+                self.alg.policy.residual_actor.parameters(), lr=_warmup_lr)
+            _warmup_loss_fn = torch.nn.HuberLoss(delta=1.0)
+
+            # Import once to avoid per-step overhead
+            from whole_body_tracking.tasks.tracking.mdp.observations import \
+                get_supervision_target_task_space as _get_warmup_target
+
+            _env_raw = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+            _nfo = self.alg.policy.num_frontres_obs
+
+            print(f"[Runner] === Supervised warmup: {_warmup_iters} iters "
+                  f"(lr={_warmup_lr}, epochs={_warmup_epochs}, "
+                  f"frontres_input={_nfo} dims) ===")
+
+            for _wu in range(_warmup_iters):
+                _wo_list: list[torch.Tensor] = []
+                _wt_list: list[torch.Tensor] = []
+
+                with torch.inference_mode():
+                    for _ in range(self.num_steps_per_env):
+                        obs, extras = self.env.get_observations()
+                        obs_dict = extras.get("observations", {})
+                        _p_obs = obs_dict.get(self.policy_obs_type, obs).to(self.device)
+
+                        # GMT-only actions (FrontRES correction = zero during warmup)
+                        env_actions = self.alg.policy.get_env_action(
+                            _p_obs,
+                            torch.zeros(_p_obs.shape[0], self.alg.policy.total_output_dim,
+                                        device=self.device))
+
+                        obs, _, dones, extras = self.env.step(env_actions.to(self.env.device))
+                        obs_dict = extras.get("observations", {})
+                        _p_obs = obs_dict.get(self.policy_obs_type, obs).to(self.device)
+
+                        # Both obs and target reflect the perturbation applied this step
+                        _wo_list.append(_p_obs[:, :_nfo])
+                        _wt_list.append(_get_warmup_target(_env_raw, "motion"))
+
+                # Supervised SGD over collected rollout data
+                _all_obs = torch.cat(_wo_list, dim=0)      # (S*E, _nfo)
+                _all_tgt = torch.cat(_wt_list, dim=0)      # (S*E, 6)
+                _N = _all_obs.shape[0]
+
+                for epoch in range(_warmup_epochs):
+                    perm = torch.randperm(_N, device=self.device)
+                    for i in range(0, _N, 4096):
+                        idx = perm[i:i + 4096]
+                        pred = self.alg.policy.residual_actor(_all_obs[idx])
+                        loss = _warmup_loss_fn(pred, _all_tgt[idx])
+                        _warmup_opt.zero_grad()
+                        loss.backward()
+                        _warmup_opt.step()
+
+                if (_wu + 1) % max(1, _warmup_iters // 5) == 0:
+                    print(f"[Runner]   warmup {_wu + 1}/{_warmup_iters}: "
+                          f"loss={loss.item():.6f}")
+
+            print(f"[Runner] === Supervised warmup complete (final loss={loss.item():.6f}) ===")
+        # ── END supervised warmup ─────────────────────────────────────────────────
 
         for it in range(start_iter, tot_iter):
             start = time.time()
@@ -582,7 +654,7 @@ class OnPolicyRunner:
                 if _survival_ema > _dr_target_surv + _dr_deadband:
                     _dr_scale = min(_dr_scale + _dr_speed, _dr_max)
                 elif _survival_ema < _dr_target_surv - _dr_deadband:
-                    _dr_scale = max(_dr_scale - _dr_speed, 0.0)
+                    _dr_scale = max(_dr_scale - _dr_speed, _dr_min)
                 # Persist for resume
                 self._dr_scale = _dr_scale
                 # Apply dr_scale to perturber (prob fields unchanged; only ratio/magnitude fields)
@@ -693,6 +765,10 @@ class OnPolicyRunner:
                             _logp_zeros = torch.distributions.Normal(_mean_gmt, _std_gmt) \
                                               .log_prob(_zeros_gmt).sum(dim=-1)
                             self.alg.transition.actions_log_prob[N_train:] = _logp_zeros
+                            # Mark which envs are FrontRES (1) vs GMT baseline (0) for critic masking.
+                            _frontres_mask = torch.zeros(self.env.num_envs, 1, device=self.device)
+                            _frontres_mask[:N_train] = 1.0
+                            self.alg.transition.frontres_mask = _frontres_mask
                             # Build split env_actions (one physics step covers both groups)
                             env_actions_fr  = self.alg.policy.get_env_action(obs[:N_train], actions[:N_train])
                             env_actions_gmt = self.alg.policy.get_env_action(obs[N_train:], _zeros_gmt)
@@ -738,6 +814,19 @@ class OnPolicyRunner:
                                     _cmd_term._frontres_quat_correction[N_train:].zero_()
                                     _cmd_term._frontres_quat_correction[N_train:, 0] = 1.0
 
+                    # Read supervised target BEFORE env.step: the command term's cache holds
+                    # the perturbation that generated the CURRENT obs (used by FrontRES this step).
+                    # After env.step, _update_command() overwrites the cache for the next step.
+                    if _is_task_space_mode and getattr(self.alg, 'lambda_supervised', 0.0) > 0:
+                        # Use a local env reference to avoid relying on _env_raw which is only
+                        # assigned inside the _task_corr is not None branch above.
+                        _env_for_sup = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+                        for _cmd_sup in _env_for_sup.command_manager._terms.values():
+                            if hasattr(_cmd_sup, 'supervised_target'):
+                                self.alg.transition.supervised_target = \
+                                    _cmd_sup.supervised_target.clone().to(self.device)
+                                break
+
                     # Step the environment 仿真环境更新观测量/动作评分/序列结束与否/监控数据
                     # NOTE: This is where the environment computes the *next* observation internally.
                     # The result is returned here and then used in the next loop iteration.
@@ -749,12 +838,16 @@ class OnPolicyRunner:
                     # ── FrontRES B1 delta-reward ────────────────────────────────────────
                     # GMT baseline envs [N_train:] ran with delta_q=0 → rewards ≈ GMT-only.
                     # r_delta = r_total[:N_train] − r_baseline isolates FrontRES contribution.
-                    # GMT envs keep raw rewards; their advantage → 0 in steady state
-                    # (V converges to GMT level) so their policy gradient vanishes.
+                    # GMT env rewards are zeroed → returns ≈ 0 → advantage ≈ 0 → no policy gradient.
                     if _is_frontres:
                         r_raw_gmt = rewards[N_train:].view(-1).clone()  # [N_base] save before zeroing
                         r_total   = rewards[:N_train].view(-1)          # [N_train]
-                        r_base    = r_raw_gmt.mean()                    # scalar: per-step GMT baseline
+                        # Per-env paired baseline: env i vs env i+N_train on the same motion context.
+                        # Falls back to scalar mean only when N_train != N_base (odd num_envs).
+                        if N_train == N_base:
+                            r_base = r_raw_gmt                          # [N_base] element-wise pairing
+                        else:
+                            r_base = r_raw_gmt.mean()                   # scalar fallback
                         r_delta   = r_total - r_base                    # [N_train]
 
                         rewards_mod = rewards.clone()
@@ -792,7 +885,7 @@ class OnPolicyRunner:
 
                         # Logging accumulators
                         _frontres_rdelta_sum   += r_delta.mean().item()
-                        _frontres_baseline_sum += r_base.item()
+                        _frontres_baseline_sum += r_base.mean().item()
                         # Task-space mode: log mean correction magnitude; else log Δz
                         if _is_task_space_mode:
                             _tc = getattr(self.alg.policy, 'last_task_correction', None)
@@ -881,21 +974,21 @@ class OnPolicyRunner:
                         # -- common
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         if _is_frontres and len(new_ids) > 0:
-                            # B1: split done envs into FrontRES (r_delta) and GMT (raw reward)
+                            # B1: split done envs into FrontRES (r_delta) and GMT (raw reward + length)
                             _env_idx  = new_ids[:, 0]
                             _fr_done  = new_ids[_env_idx < N_train]
                             _gmt_done = new_ids[_env_idx >= N_train]
                             if len(_fr_done) > 0:
-                                # cur_reward_sum[:N_train] accumulates r_delta (correct)
                                 rewbuffer.extend(cur_reward_sum[_fr_done][:, 0].cpu().numpy().tolist())
+                                lenbuffer.extend(cur_episode_length[_fr_done][:, 0].cpu().numpy().tolist())
                             if len(_gmt_done) > 0:
-                                # cur_reward_sum_gmt accumulates raw GMT reward (pre-zeroing)
-                                _gmt_local = _gmt_done[:, 0] - N_train  # local index within [0, N_base)
+                                _gmt_local = _gmt_done[:, 0] - N_train
                                 rewbuffer_gmt.extend(cur_reward_sum_gmt[_gmt_local].cpu().numpy().tolist())
+                                lenbuffer_gmt.extend(cur_episode_length[_gmt_done][:, 0].cpu().numpy().tolist())
                                 cur_reward_sum_gmt[_gmt_local] = 0
                         elif len(new_ids) > 0:
                             rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                            lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
 
@@ -1104,6 +1197,9 @@ class OnPolicyRunner:
                 self.writer.add_scalar("Train/mean_r_delta",   statistics.mean(locs["rewbuffer"]),     locs["it"])
                 if len(locs.get("rewbuffer_gmt", [])) > 0:
                     self.writer.add_scalar("Train/mean_reward_gmt", statistics.mean(locs["rewbuffer_gmt"]), locs["it"])
+                if len(locs.get("lenbuffer_gmt", [])) > 0:
+                    self.writer.add_scalar("Train/mean_episode_length_gmt",
+                                           statistics.mean(locs["lenbuffer_gmt"]), locs["it"])
             else:
                 self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
@@ -1134,6 +1230,8 @@ class OnPolicyRunner:
                 log_string += f"""{'Mean r_delta (FrontRES):':>{pad}} {statistics.mean(locs['rewbuffer']):.4f}\n"""
                 if len(locs.get("rewbuffer_gmt", [])) > 0:
                     log_string += f"""{'Mean reward_GMT (baseline):':>{pad}} {statistics.mean(locs['rewbuffer_gmt']):.4f}\n"""
+                if len(locs.get("lenbuffer_gmt", [])) > 0:
+                    log_string += f"""{'Mean ep_len_GMT (baseline):':>{pad}} {statistics.mean(locs['lenbuffer_gmt']):.1f}\n"""
             else:
                 log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
             # -- Velocity estimator error (if available)

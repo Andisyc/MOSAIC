@@ -5,7 +5,19 @@
       "Bash(python -c \"from isaaclab.utils.math import euler_xyz_from_quat; print\\('found'\\)\")",
       "Bash(python -c \"import isaaclab.utils.math as m; print\\([x for x in dir\\(m\\) if 'euler' in x.lower\\(\\) or 'quat_to' in x.lower\\(\\)]\\)\")",
       "Bash(python3 -c ' *)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Read(//c/Users/ChengYuxuan/OneDrive/ClaudeConfig/sessions/**)",
+      "Read(//c/Users/ChengYuxuan/OneDrive/ClaudeConfig/**)",
+      "Bash(cmd /c \"dir C:\\\\Users\\\\ChengYuxuan\\\\.claude\\\\sessions 2>nul\")",
+      "Bash(cmd /c \"dir C:\\\\Users\\\\ChengYuxuan\\\\OneDrive\\\\ClaudeConfig\\\\sessions 2>nul\")",
+      "Bash(cmd *)",
+      "Bash(set)",
+      "Bash(python3 *)",
+      "Bash(Get-ChildItem -Path \"d:\\\\ArtiIntComVis\\\\MOSAIC\" -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Sort-Object)",
+      "Bash(find /d/ArtiIntComVis/MOSAIC/source/whole_body_tracking -name \"commands.py\" | head -5)",
+      "Read(//d/ArtiIntComVis/MOSAIC/source/**)"
     ]
   }
 }

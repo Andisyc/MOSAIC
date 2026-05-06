@@ -17,6 +17,7 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
+    euler_xyz_from_quat,
     quat_apply,
     quat_error_magnitude,
     quat_from_euler_xyz,
@@ -359,6 +360,23 @@ class MotionCommand(CommandTerm):
         # q_anchor_new = q_anchor * q_correction, so q_correction = q_anchor^{-1} * q_robot = q_rel
         # which is exactly what anchor_root_rpy_error_w computes → Stage1 target consistent.
         return quat_mul(base_quat, self._frontres_quat_correction)
+
+    @property
+    def anchor_dr_delta_pos(self) -> torch.Tensor:
+        """DR-induced anchor position delta (perturbed - original). Zero when no perturber."""
+        return torch.zeros(self.num_envs, 3, device=self.device)
+
+    @property
+    def anchor_dr_delta_quat_correction(self) -> torch.Tensor:
+        """The quaternion correction that undoes DR tilt (identity when no perturber).
+
+        Computed as quat_inv(perturbed) * original → right-multiply this onto
+        perturbed_quat to recover the original anchor orientation.
+        Stored as (w,x,y,z).
+        """
+        identity = torch.zeros(self.num_envs, 4, device=self.device)
+        identity[:, 0] = 1.0  # w = 1
+        return identity
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
@@ -1166,6 +1184,15 @@ class MultiMotionCommand(CommandTerm):
         self._frontres_quat_correction = torch.zeros(self.num_envs, 4, device=self.device)
         self._frontres_quat_correction[:, 0] = 1.0  # identity quaternion (w=1)
 
+        # Per-step perturbation cache: computed once in _update_command() so that all
+        # properties (anchor_pos_w, anchor_quat_w, anchor_dr_delta_*) share the SAME
+        # random draw and the runner can read a consistent supervised_target.
+        self._cached_perturbed_pos  = torch.zeros(self.num_envs, 3, device=self.device)
+        self._cached_perturbed_quat = torch.zeros(self.num_envs, 4, device=self.device)
+        self._cached_perturbed_quat[:, 0] = 1.0  # identity
+        # ΔSE3 supervised target: correction to UNDO current DR perturbation [Δpos(3), Δrpy(3)]
+        self._dr_supervised_target  = torch.zeros(self.num_envs, 6, device=self.device)
+
     # ------------- properties (gathered across envs/motions) -------------
     def _gather_future_by_motion(self, getter: str, horizon: int) -> torch.Tensor:
         if horizon <= 0:
@@ -1352,31 +1379,39 @@ class MultiMotionCommand(CommandTerm):
         return self._gather_by_motion("body_ang_vel_w")
 
     @property
-    def anchor_pos_w(self) -> torch.Tensor:
-        # Use body_pos_w then index anchor across bodies
-        pos = self._gather_by_motion("body_pos_w")
-        
-        # apply perturbation
-        root_pos_ref = pos[:, self.motion_anchor_body_index]
-        left_foot_pos_ref = pos[:, self.left_foot_idx]
-        right_foot_pos_ref = pos[:, self.right_foot_idx]
+    def anchor_dr_delta_pos(self) -> torch.Tensor:
+        """DR-induced anchor position delta: perturbed_pos - clean_pos (world frame)."""
+        root_pos_ref = self._gather_by_motion("body_pos_w")[:, self.motion_anchor_body_index]
+        return self._cached_perturbed_pos - root_pos_ref
 
-        perturbed_pos = self.perturber.apply_perturbations(
-            root_pos_ref,
-            left_foot_pos_ref,
-            right_foot_pos_ref
-        )
-        
-        return perturbed_pos + self._env.scene.env_origins + self._frontres_pos_correction
+    @property
+    def anchor_dr_delta_quat_correction(self) -> torch.Tensor:
+        """Quaternion correction that undoes DR tilt (anchor local frame, wxyz).
+
+        perturbed_quat = tilt * clean_quat   (left-multiply, world-frame tilt)
+        We want:  quat_mul(perturbed_quat, correction) = clean_quat
+        → correction = quat_mul(quat_inv(perturbed_quat), clean_quat)
+        """
+        root_quat = self._gather_by_motion("body_quat_w")[:, self.motion_anchor_body_index]
+        return quat_mul(quat_inv(self._cached_perturbed_quat), root_quat)
+
+    @property
+    def anchor_pos_w(self) -> torch.Tensor:
+        return self._cached_perturbed_pos + self._env.scene.env_origins + self._frontres_pos_correction
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
-        quat = self._gather_by_motion("body_quat_w")
-        root_quat = quat[:, self.motion_anchor_body_index]
         # Right-multiply: apply correction in anchor's local frame.
-        # q_anchor_new = q_anchor * q_correction, so q_correction = q_anchor^{-1} * q_robot = q_rel
-        # which is exactly what anchor_root_rpy_error_w computes → Stage1 target consistent.
-        return quat_mul(self.perturber.apply_quat_perturbation(root_quat), self._frontres_quat_correction)
+        return quat_mul(self._cached_perturbed_quat, self._frontres_quat_correction)
+
+    @property
+    def supervised_target(self) -> torch.Tensor:
+        """ΔSE3 = [Δpos(3), Δrpy(3)] that UNDOES the current DR perturbation.
+
+        Cached once per step in _update_command(). All zeros when perturber is disabled.
+        Used by on_policy_runner to store supervised training targets for FrontRES.
+        """
+        return self._dr_supervised_target
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
@@ -1829,6 +1864,29 @@ class MultiMotionCommand(CommandTerm):
     def _update_command(self):
         self._global_sim_step += 1
         self.time_steps += 1
+
+        # ── Cache perturbation samples once per step ──────────────────────────
+        # All properties using MotionPerturber must read from this cache to
+        # guarantee the SAME random draw within one step, and to expose a
+        # consistent supervised_target to the runner.
+        _pos_data = self._gather_by_motion("body_pos_w")
+        _root_pos_ref = _pos_data[:, self.motion_anchor_body_index]
+        self._cached_perturbed_pos = self.perturber.apply_perturbations(
+            _root_pos_ref,
+            _pos_data[:, self.left_foot_idx],
+            _pos_data[:, self.right_foot_idx],
+        )
+        _quat_data = self._gather_by_motion("body_quat_w")
+        _root_quat_ref = _quat_data[:, self.motion_anchor_body_index]
+        self._cached_perturbed_quat = self.perturber.apply_quat_perturbation(_root_quat_ref)
+        # ΔSE3 supervised target: correction that UNDOES the DR perturbation.
+        self._dr_supervised_target[:, :3] = _root_pos_ref - self._cached_perturbed_pos
+        _corr_quat = quat_mul(quat_inv(self._cached_perturbed_quat), _root_quat_ref)
+        _r, _p, _y = euler_xyz_from_quat(_corr_quat)
+        self._dr_supervised_target[:, 3] = _r
+        self._dr_supervised_target[:, 4] = _p
+        self._dr_supervised_target[:, 5] = _y
+        # ─────────────────────────────────────────────────────────────────────
 
         # Per-motion episode end detection and resampling
         motion_lengths = self.motion_lengths[self.env_motion_indices]

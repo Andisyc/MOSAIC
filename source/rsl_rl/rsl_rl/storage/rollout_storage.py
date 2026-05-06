@@ -32,6 +32,10 @@ class RolloutStorage:
             self.teacher_action_sigma = None
             # For multi-teacher MOSAIC: motion group information
             self.motion_groups = None
+            # B1 split-env: 1.0 for FrontRES envs, 0.0 for GMT baseline envs
+            self.frontres_mask = None
+            # Unified training: ΔSE3 supervised target [Δpos(3), Δrpy(3)] per env per step
+            self.supervised_target = None
 
         def clear(self):
             self.__init__()
@@ -116,6 +120,10 @@ class RolloutStorage:
             self.teacher_sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             # Multi-teacher MOSAIC: motion group indices for each environment
             self.motion_groups = torch.zeros(num_transitions_per_env, num_envs, dtype=torch.long, device=self.device)
+            # B1 split-env critic mask: 1 for FrontRES envs, 0 for GMT baseline envs (default all 1)
+            self.frontres_mask = torch.ones(num_transitions_per_env, num_envs, 1, device=self.device)
+            # Unified training: ΔSE3 supervised target [Δpos(3), Δrpy(3)] (default zeros = no supervision)
+            self.supervised_target = torch.zeros(num_transitions_per_env, num_envs, 6, device=self.device)
 
         # For RNN networks
         self.saved_hidden_states_a = None
@@ -170,6 +178,12 @@ class RolloutStorage:
             # Store motion groups for multi-teacher support
             if hasattr(transition, 'motion_groups') and transition.motion_groups is not None:
                 self.motion_groups[self.step].copy_(transition.motion_groups)
+            # Store B1 split-env critic mask (all ones when not in B1 mode)
+            if hasattr(transition, 'frontres_mask') and transition.frontres_mask is not None:
+                self.frontres_mask[self.step].copy_(transition.frontres_mask)
+            # Store ΔSE3 supervised target (zeros when not in unified training mode)
+            if hasattr(transition, 'supervised_target') and transition.supervised_target is not None:
+                self.supervised_target[self.step].copy_(transition.supervised_target)
 
         # For RND
         if self.rnd_state_shape is not None:
@@ -276,6 +290,10 @@ class RolloutStorage:
             teacher_sigma = self.teacher_sigma.flatten(0, 1)
             # Multi-teacher: motion groups
             motion_groups = self.motion_groups.flatten(0, 1)
+            # B1 split-env critic mask
+            frontres_mask = self.frontres_mask.flatten(0, 1)
+            # ΔSE3 supervised target
+            supervised_target = self.supervised_target.flatten(0, 1)
             # For velocity estimator
             if self.ref_vel_estimator_observations is not None:
                 ref_vel_estimator_observations = self.ref_vel_estimator_observations.flatten(0, 1)
@@ -320,6 +338,8 @@ class RolloutStorage:
                     teacher_sigma_batch = teacher_sigma[batch_idx]
                     # Multi-teacher: motion groups
                     motion_groups_batch = motion_groups[batch_idx]
+                    frontres_mask_batch = frontres_mask[batch_idx]
+                    supervised_target_batch = supervised_target[batch_idx]
                     # For velocity estimator
                     if ref_vel_estimator_observations is not None:
                         ref_vel_estimator_obs_batch = ref_vel_estimator_observations[batch_idx]
@@ -337,7 +357,7 @@ class RolloutStorage:
                     yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                         None,
                         None,
-                    ), None, rnd_state_batch, teacher_obs_batch, teacher_mu_batch, teacher_sigma_batch, ref_vel_estimator_obs_batch, motion_groups_batch
+                    ), None, rnd_state_batch, teacher_obs_batch, teacher_mu_batch, teacher_sigma_batch, ref_vel_estimator_obs_batch, motion_groups_batch, frontres_mask_batch, supervised_target_batch
                 else:
                     yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                         None,
@@ -427,7 +447,7 @@ class RolloutStorage:
                     yield obs_batch, privileged_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                         hid_a_batch,
                         hid_c_batch,
-                    ), masks_batch, rnd_state_batch, teacher_obs_batch, teacher_mu_batch, teacher_sigma_batch
+                    ), masks_batch, rnd_state_batch, teacher_obs_batch, teacher_mu_batch, teacher_sigma_batch, None, None, None, None
                 else:
                     yield obs_batch, privileged_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                         hid_a_batch,

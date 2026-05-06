@@ -286,6 +286,14 @@ class RslRlFrontResidualActorCriticCfg(RslRlPpoActorCriticCfg):
     max_delta_z: float = 0.3
     """tanh clip for Δz output (metres). 0.3 m covers typical float/sink artifacts."""
 
+    # FrontRES-specific observation: number of leading dims of the full policy obs
+    # that are reference-frame only (command + motion_anchor_ori_b).
+    # When set, FrontRES processes only this subset; GMT continues to use the full obs.
+    # 320 = (58 command + 6 anchor_ori) × 5 history frames.
+    # Default 0 = use full policy obs (backward compatible).
+    num_frontres_obs: int = 0
+    """FrontRES observation subset dims. 0 = use full policy_obs (legacy). 320 = ref-only."""
+
     # Task-space correction mode: replaces Δq+Δz with [Δpos(3), Δrpy(3)]
     num_task_corrections: int = 0
     """When >0, FrontRES outputs SE(3) anchor corrections instead of joint Δq. Set to 6."""

@@ -247,9 +247,23 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
     #   在 Stage2 初期仍然适用，避免干净参考上修正有害导致的即时崩溃。
     #   断点续训（is_full_resume=True）时该值被忽略，直接从 checkpoint 恢复。
     dr_init_scale:   float = 1.0
+    #
+    # dr_min_scale: dr_scale 下限（PI 控制器不会将 dr_scale 降至此值以下）。
+    #   0.3 保证始终存在 Level 0.3 扰动，防止 FrontRES 滑入"零修正"无效果捷径，
+    #   同时不给 GMT 施加过大的负担使 episode 崩溃。
+    #   若生存率在 dr_min 处仍低于目标，说明 GMT 无法跟踪该运动，需从根本修复。
+    dr_min_scale:    float = 0.3
 
     # Critic 预热：禁用。actor-frozen warmup 会制造 V 估计分布错配，PPO 自然处理 OOD 冷启动。
     critic_warmup_iterations = 0
+
+    # FrontRES 监督预热：训练的前 N 轮使用监督损失（Huber）而非 PPO。
+    # 目标 = -(perturbed - original)，来源 = command term 的 anchor_dr_delta_*。
+    # 0 = 禁用（纯 PPO）；>0 = 先监督预热再切 PPO。
+    # 例如 2000：前 2000 轮用 Huber 学习扰动检测，之后切换 PPO 微调。
+    supervised_warmup_iterations: int = 0
+    supervised_warmup_lr:        float = 1e-4  # warmup 阶段的学习率
+    supervised_warmup_epochs:    int   = 5     # 每次 rollout 后监督学习的 epoch 数
 
     # Δq alpha 课程：禁用。alpha=0.1 会使 Critic 学到 V≈0，与后续 alpha=1.0 严重错配。
     delta_q_alpha_init         = 1.0
@@ -298,6 +312,11 @@ class G1FlatFrontRESFinetuneRunnerCfg(RslRlOnPolicyRunnerCfg):
         num_task_corrections=6,
         max_delta_pos=0.3,
         max_delta_rpy=0.3,
+
+        # FrontRES 只处理参考帧信息（前 320 维 = command + motion_anchor_ori_b），
+        # 移除 proprioception（base_ang_vel, joint_pos/vel, actions, anchor errors）。
+        # GMT 继续使用完整 800 维观测。
+        num_frontres_obs=320,
     )
 
     algorithm = RslRlPpoFrontRESAlgorithmCfg(

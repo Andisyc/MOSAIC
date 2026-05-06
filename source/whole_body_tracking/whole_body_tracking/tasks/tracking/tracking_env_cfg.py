@@ -862,10 +862,34 @@ class MultiDistillationTrackingEnvCfg(GeneralTrackingEnvCfg): # 多专家蒸馏,
 class SupervisedTrackingEnvCfg(GeneralTrackingEnvCfg):
     """
     Configuration for Stage 1 Supervised Learning environment.
-    Used to train FrontRES to predict delta_q_gt = q_ref - q_sim.
+
+    Trains FrontRES to output the anti-DR SE(3) correction using perturber
+    deltas as ground-truth labels.  The supervision target is:
+
+        target = -(perturbed_anchor - original_anchor) → "undo the DR"
+
+    This replaces the old identity mapping (robot - anchor) which taught
+    FrontRES to chase the DR-perturbed robot state.
     """
 
     commands: MultiMotionCommandsCfg = MultiMotionCommandsCfg()
+
+    # -- Motion-level DR applied to the reference for Stage 1 training data --
+    # Mild base values so FrontRES learns the anti-DR mapping without
+    # destabilising GMT during supervised data collection.
+    motion_perturbations: MotionPerturbationCfg = MotionPerturbationCfg(
+        float_prob       = 0.3,
+        float_ratio      = 0.05,   # max ≈ 5 cm
+        sink_prob        = 0.3,
+        sink_ratio       = 0.04,   # max ≈ 4 cm
+        foot_slip_prob   = 0.2,
+        foot_slip_ratio  = 0.008,
+        root_tilt_prob   = 0.3,
+        root_tilt_max_rad = 0.05,  # max ≈ 2.9°
+        joint_noise_prob = 0.4,
+        joint_noise_std  = 0.04,   # rad
+        joint_noise_joint_indices = list(range(12)),
+    )
 
     @configclass
     class SupervisedObservationsCfg:
@@ -916,7 +940,9 @@ class SupervisedTrackingEnvCfg(GeneralTrackingEnvCfg):
         super().__post_init__()
         self.commands = MultiMotionCommandsCfg()
 
-        # Disable domain randomization for stage 1 supervised learning
+        # Disable physics-level DR (material, mass, etc.) for Stage 1.
+        # Motion-level DR is enabled via self.motion_perturbations above
+        # to generate supervision targets.
         self.events = None
         self.curriculum = None
 

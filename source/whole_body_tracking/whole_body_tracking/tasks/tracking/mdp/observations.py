@@ -217,9 +217,27 @@ def get_supervision_target_task_space(env: ManagerBasedEnv, command_name: str) -
     6-dim task-space supervision target for FrontRES Stage 1.
     [Δx, Δy, Δz, Δroll, Δpitch, Δyaw] — SE(3) ordering.
 
-    FrontRES learns to output this correction so that the corrected anchor converges to
-    the robot root pose. This is an identity mapping: output ≈ input error signal.
+    Target = anti-DR correction: the SE(3) delta that UNDOES the DR perturbation.
+    Uses the perturber's known delta as ground truth (available because we control
+    the simulation).  When no perturber is active the delta is zero (identity).
+
+    Position:  target_pos = -(perturbed_pos - clean_pos)  = clean_pos - perturbed_pos
+    Orientation: quat_inv(perturbed_quat) * clean_quat → convert to RPY
+
+    This replaces the old identity-mapping target (robot - anchor) which taught
+    FrontRES to "chase the DR-perturbed robot" rather than "undo the DR".
     """
-    delta_pos = anchor_root_pos_error_w(env, command_name)  # (N, 3)
-    delta_rpy = anchor_root_rpy_error_w(env, command_name)  # (N, 3)
-    return torch.cat([delta_pos, delta_rpy], dim=-1)         # (N, 6)
+    command: MotionCommand = env.command_manager.get_term(command_name)
+
+    # Position: undo DR perturbation (world-frame delta)
+    delta_pos = -command.anchor_dr_delta_pos  # (N, 3)  anti-DR
+
+    # Orientation: convert the quaternion correction to RPY
+    q_corr = command.anchor_dr_delta_quat_correction  # (N, 4) wxyz
+    w, x, y, z = q_corr[:, 0], q_corr[:, 1], q_corr[:, 2], q_corr[:, 3]
+    roll  = torch.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = torch.asin((2.0 * (w * y - z * x)).clamp(-1.0, 1.0))
+    yaw   = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    delta_rpy = torch.stack([roll, pitch, yaw], dim=-1)  # (N, 3)
+
+    return torch.cat([delta_pos, delta_rpy], dim=-1)     # (N, 6)

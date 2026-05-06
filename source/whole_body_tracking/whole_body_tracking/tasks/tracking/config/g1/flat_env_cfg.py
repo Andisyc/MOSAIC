@@ -306,6 +306,15 @@ class G1FlatFrontRESFinetuneEnvCfg(FrontRESFinetuneTrackingEnvCfg):
             func=mdp.anchor_root_rpy_error_w, params={"command_name": "motion"},
             noise=Unoise(n_min=-0.01, n_max=0.01))
 
+        # FrontRES corrects the global motion anchor (root-level perturbations), not
+        # individual joint targets.  Wrist Z-tracking errors from fast dance arm gestures
+        # are NOT fall indicators — they reflect PD-controller bandwidth limits and should
+        # not terminate episodes.  Keep only ankle bodies for foot-contact quality check.
+        self.terminations.ee_body_pos.params["body_names"] = [
+            "left_ankle_roll_link",
+            "right_ankle_roll_link",
+        ]
+
         self.commands.motion.anchor_body_name = "torso_link"
         self.commands.motion.body_names = [
             "pelvis", 
