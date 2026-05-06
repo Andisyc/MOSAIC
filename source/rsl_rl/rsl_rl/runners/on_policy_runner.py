@@ -665,16 +665,18 @@ class OnPolicyRunner:
                 if hasattr(_env_raw, 'command_manager') and 'motion' in _env_raw.command_manager._terms:
                     _mcmd = _env_raw.command_manager._terms['motion']
                     if hasattr(_mcmd, 'perturber'):
-                        _mcmd.perturber.cfg.float_prob        = _perturb_target.float_prob
-                        _mcmd.perturber.cfg.float_ratio       = _perturb_target.float_ratio       * _dr_scale
-                        _mcmd.perturber.cfg.sink_prob         = _perturb_target.sink_prob
-                        _mcmd.perturber.cfg.sink_ratio        = _perturb_target.sink_ratio        * _dr_scale
-                        _mcmd.perturber.cfg.foot_slip_prob    = _perturb_target.foot_slip_prob
-                        _mcmd.perturber.cfg.foot_slip_ratio   = _perturb_target.foot_slip_ratio   * _dr_scale
-                        _mcmd.perturber.cfg.root_tilt_prob    = _perturb_target.root_tilt_prob
-                        _mcmd.perturber.cfg.root_tilt_max_rad = _perturb_target.root_tilt_max_rad * _dr_scale
-                        _mcmd.perturber.cfg.joint_noise_prob  = _perturb_target.joint_noise_prob
-                        _mcmd.perturber.cfg.joint_noise_std   = _perturb_target.joint_noise_std   * _dr_scale
+                        _mcmd.perturber.cfg.float_prob          = _perturb_target.float_prob
+                        _mcmd.perturber.cfg.float_ratio         = _perturb_target.float_ratio         * _dr_scale
+                        _mcmd.perturber.cfg.sink_prob           = _perturb_target.sink_prob
+                        _mcmd.perturber.cfg.sink_ratio          = _perturb_target.sink_ratio          * _dr_scale
+                        _mcmd.perturber.cfg.foot_slip_prob      = _perturb_target.foot_slip_prob
+                        _mcmd.perturber.cfg.foot_slip_ratio     = _perturb_target.foot_slip_ratio     * _dr_scale
+                        _mcmd.perturber.cfg.lateral_drift_prob  = _perturb_target.lateral_drift_prob
+                        _mcmd.perturber.cfg.lateral_drift_std   = _perturb_target.lateral_drift_std   * _dr_scale
+                        _mcmd.perturber.cfg.root_tilt_prob      = _perturb_target.root_tilt_prob
+                        _mcmd.perturber.cfg.root_tilt_max_rad   = _perturb_target.root_tilt_max_rad   * _dr_scale
+                        _mcmd.perturber.cfg.joint_noise_prob    = _perturb_target.joint_noise_prob
+                        _mcmd.perturber.cfg.joint_noise_std     = _perturb_target.joint_noise_std     * _dr_scale
 
             # FrontRES reward-shaping state: reset at the start of each rollout.
             _frontres_prev_delta_q: torch.Tensor | None = None  # [N, A] for smoothness penalty

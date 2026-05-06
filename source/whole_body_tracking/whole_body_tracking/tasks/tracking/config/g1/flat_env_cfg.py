@@ -292,13 +292,20 @@ class G1FlatFrontRESFinetuneEnvCfg(FrontRESFinetuneTrackingEnvCfg):
         self.scene.robot = G1_CYLINDER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.actions.joint_pos.scale = G1_ACTION_SCALE
 
-        # Match Stage 1 (SupervisedObservationsCfg.PolicyCfg) observation space → 800 dims.
-        # Stage 1 was trained WITHOUT motion_anchor_pos_b (3 dims) and base_lin_vel (3 dims)
-        # but WITH anchor_root_pos_error_w (3 dims) and anchor_root_rpy_error_w (3 dims).
-        # Both stages therefore share a common 800-dim obs layout.
-        self.observations.policy.motion_anchor_pos_b = None
-        self.observations.policy.base_lin_vel = None
-        # Add task-space anchor error observations (3 + 3 dims, history × 5 = +30 dims total)
+        # Obs layout (800 dims total):
+        #   [0:770]  = GMT-compatible prefix:
+        #              [cmd(58), ori(6), ang(3), jpos(29), jvel(29), act(29)] × 5
+        #              = 154/frame × 5 = 770 dims — identical to the layout GMT was
+        #              trained on (DistillationTrackingEnvCfg removes motion_anchor_pos_b
+        #              and base_lin_vel, giving 154 dims/frame × 5 = 770).
+        #   [770:800] = FrontRES-only anchor error signals (3+3 dims × 5 frames = 30):
+        #              pass-through in the runner's partial normaliser.
+        #
+        # Removing motion_anchor_pos_b and base_lin_vel (from the 160-dim base) is
+        # intentional: keeping them would make the prefix 160×5=800 dims, shifting
+        # every subsequent index and corrupting GMT's fixed ONNX weight alignment.
+        self.observations.policy.motion_anchor_pos_b = None   # keep 154-dim/frame GMT prefix
+        self.observations.policy.base_lin_vel = None          # keep 154-dim/frame GMT prefix
         self.observations.policy.anchor_root_pos_error_w = ObsTerm(
             func=mdp.anchor_root_pos_error_w, params={"command_name": "motion"},
             noise=Unoise(n_min=-0.01, n_max=0.01))
