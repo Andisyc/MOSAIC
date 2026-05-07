@@ -801,13 +801,18 @@ class FrontRESActorCritic(nn.Module):
         raw = self.residual_actor(policy_obs)
 
         if self.num_task_corrections > 0:
-            # Task-space mode: output = [Δpos(3), Δrpy(3)]
-            delta_pos_mean = torch.tanh(raw[:, :3]) * self.max_delta_pos
-            delta_rpy_mean = torch.tanh(raw[:, 3:]) * self.max_delta_rpy
-            frontres_mean  = torch.cat([delta_pos_mean, delta_rpy_mean], dim=-1)
-            self.last_task_correction  = frontres_mean.detach()
+            # TanhNormal: distribution is over raw (unbounded) space; act() squashes
+            # samples via tanh → bounded output in [-max_delta, max_delta].
+            # The deterministic correction (mean) uses tanh(raw)*max_delta.
+            raw_pos = raw[:, :3]
+            raw_rpy = raw[:, 3:]
+            frontres_mean = torch.cat([raw_pos, raw_rpy], dim=-1)
+            self.last_task_correction = torch.cat([
+                torch.tanh(raw_pos) * self.max_delta_pos,
+                torch.tanh(raw_rpy) * self.max_delta_rpy,
+            ], dim=-1).detach()
             self.last_delta_z          = None
-            self.last_residual_actions = frontres_mean.detach()
+            self.last_residual_actions = self.last_task_correction
         else:
             # Joint-space mode: output = [Δq (num_actions), Δz (num_z_outputs)]
             delta_q_mean = torch.tanh(raw[:, :self.num_actions]) * self.max_delta_q
@@ -853,7 +858,14 @@ class FrontRESActorCritic(nn.Module):
         The rollout buffer stores Δq_sample so that PPO can compute log π(Δq|obs).
         """
         self.update_distribution(observations)
-        return self.distribution.sample()
+        raw_sample = self.distribution.sample()
+        if self.num_task_corrections > 0:
+            # TanhNormal: squash raw sample → bounded task-space correction
+            return torch.cat([
+                torch.tanh(raw_sample[:, :3]) * self.max_delta_pos,
+                torch.tanh(raw_sample[:, 3:]) * self.max_delta_rpy,
+            ], dim=-1)
+        return raw_sample
 
     def get_env_action(self, observations, delta_q_sample: torch.Tensor) -> torch.Tensor:
         """
@@ -898,6 +910,19 @@ class FrontRESActorCritic(nn.Module):
 
         `actions` here are full frontres_output values stored during rollout (NOT robot actions).
         """
+        if self.num_task_corrections > 0:
+            # TanhNormal: actions are tanh-squashed bounded values.
+            # Invert squashing, then apply change-of-variables Jacobian correction.
+            max_d = torch.cat([
+                torch.full((3,), self.max_delta_pos, device=actions.device),
+                torch.full((3,), self.max_delta_rpy, device=actions.device),
+            ])
+            normalized = (actions / max_d).clamp(-1 + 1e-6, 1 - 1e-6)
+            raw_sample = torch.atanh(normalized)
+            log_prob = self.distribution.log_prob(raw_sample).sum(dim=-1)
+            # Jacobian: ∂(tanh(x)*max)/∂x = max*(1 - tanh²(x)) = max*(1 - (a/max)²)
+            log_jacobian = (torch.log(max_d) + torch.log(1.0 - normalized.pow(2) + 1e-6)).sum(dim=-1)
+            return log_prob - log_jacobian
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations):

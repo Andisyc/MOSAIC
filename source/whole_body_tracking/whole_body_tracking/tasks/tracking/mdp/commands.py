@@ -525,10 +525,11 @@ class MotionCommand(CommandTerm):
             torch.cat([root_pos[env_ids], root_ori[env_ids], root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1),
             env_ids=env_ids,
         )
-        # Reset FrontRES anchor corrections for resampled envs
+        # Reset FrontRES anchor corrections and OU perturbation states for resampled envs
         self._frontres_pos_correction[env_ids] = 0.0
         self._frontres_quat_correction[env_ids] = 0.0
         self._frontres_quat_correction[env_ids, 0] = 1.0
+        self.perturber.reset_envs(env_ids)
 
     def _update_command(self):
         self.time_steps += 1
@@ -1795,10 +1796,11 @@ class MultiMotionCommand(CommandTerm):
             torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1),
             env_ids=env_ids,
         )
-        # Reset FrontRES anchor corrections for resampled envs
+        # Reset FrontRES anchor corrections and OU perturbation states for resampled envs
         self._frontres_pos_correction[env_ids] = 0.0
         self._frontres_quat_correction[env_ids] = 0.0
         self._frontres_quat_correction[env_ids, 0] = 1.0
+        self.perturber.reset_envs(env_ids)
 
     def _update_metrics(self):
         self.metrics["error_anchor_pos"].copy_(torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1))

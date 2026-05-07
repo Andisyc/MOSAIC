@@ -466,7 +466,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         residual_last_layer_gain = 0.01,
         critic_hidden_dims     = [1024, 1024, 512, 256],
         activation             = "elu",
-        init_noise_std         = 0.5,
+        init_noise_std         = 0.1,
         noise_std_type         = "scalar",
         # ── Task-space SE(3) correction mode ─────────────────────────────────
         num_task_corrections   = 6,        # output = [Δpos(3), Δrpy(3)]

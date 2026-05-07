@@ -1406,7 +1406,16 @@ class MOSAIC:
             _sup_cos_sim    = 0.0
             if (self.lambda_supervised > 0 and supervised_target_batch is not None
                     and mu_batch.shape[-1] == supervised_target_batch.shape[-1]):
-                pred   = mu_batch[:original_batch_size]          # [B, 6] FrontRES ΔSE3 prediction
+                raw_pred = mu_batch[:original_batch_size]        # [B, 6] raw FrontRES mean
+                # TanhNormal: mu_batch is in raw (unbounded) space; convert to bounded correction
+                # space before comparing against the physical-units supervised target.
+                if hasattr(self.policy, 'num_task_corrections') and self.policy.num_task_corrections > 0:
+                    pred = torch.cat([
+                        torch.tanh(raw_pred[:, :3]) * self.policy.max_delta_pos,
+                        torch.tanh(raw_pred[:, 3:]) * self.policy.max_delta_rpy,
+                    ], dim=-1)
+                else:
+                    pred = raw_pred
                 target = supervised_target_batch[:original_batch_size]
                 # Clamp target to FrontRES tanh output range to avoid unreachable supervision
                 if hasattr(self.policy, 'max_delta_pos') and hasattr(self.policy, 'max_delta_rpy'):

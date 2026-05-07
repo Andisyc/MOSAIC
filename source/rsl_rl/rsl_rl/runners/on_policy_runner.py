@@ -522,16 +522,18 @@ class OnPolicyRunner:
                 from types import SimpleNamespace as _NS
                 _pt = _env_raw.cfg.motion_perturbations
                 _perturb_target = _NS(
-                    float_prob        = float(_pt.float_prob),
-                    float_ratio       = float(_pt.float_ratio),
-                    sink_prob         = float(_pt.sink_prob),
-                    sink_ratio        = float(_pt.sink_ratio),
-                    foot_slip_prob    = float(_pt.foot_slip_prob),
-                    foot_slip_ratio   = float(_pt.foot_slip_ratio),
-                    root_tilt_prob    = float(getattr(_pt, 'root_tilt_prob',    0.0)),
-                    root_tilt_max_rad = float(getattr(_pt, 'root_tilt_max_rad', 0.0)),
-                    joint_noise_prob  = float(getattr(_pt, 'joint_noise_prob',  0.0)),
-                    joint_noise_std   = float(getattr(_pt, 'joint_noise_std',   0.0)),
+                    float_prob           = float(_pt.float_prob),
+                    float_ratio          = float(_pt.float_ratio),
+                    sink_prob            = float(_pt.sink_prob),
+                    sink_ratio           = float(_pt.sink_ratio),
+                    foot_slip_prob       = float(_pt.foot_slip_prob),
+                    foot_slip_ratio      = float(_pt.foot_slip_ratio),
+                    lateral_drift_prob   = float(getattr(_pt, 'lateral_drift_prob',   0.0)),
+                    lateral_drift_std    = float(getattr(_pt, 'lateral_drift_std',    0.0)),
+                    root_tilt_prob       = float(getattr(_pt, 'root_tilt_prob',       0.0)),
+                    root_tilt_max_rad    = float(getattr(_pt, 'root_tilt_max_rad',    0.0)),
+                    joint_noise_prob     = float(getattr(_pt, 'joint_noise_prob',     0.0)),
+                    joint_noise_std      = float(getattr(_pt, 'joint_noise_std',      0.0)),
                 )
                 print(
                     f"[Runner] Adaptive DR (PI controller): "
@@ -755,6 +757,14 @@ class OnPolicyRunner:
                             _std_gmt  = self.alg.policy.action_std[N_train:]
                             _logp_zeros = torch.distributions.Normal(_mean_gmt, _std_gmt) \
                                               .log_prob(_zeros_gmt).sum(dim=-1)
+                            # TanhNormal Jacobian correction for zero action:
+                            # bounded=0 → raw=atanh(0)=0, Jacobian = Σlog(max_d)
+                            # so TanhNormal.log_prob(0) = Normal.log_prob(0) - Σlog(max_d)
+                            # This ensures IS ratio = 1 for GMT envs (zero correction taken).
+                            if _is_task_space_mode:
+                                _logp_zeros = _logp_zeros - (
+                                    3 * math.log(self.alg.policy.max_delta_pos)
+                                    + 3 * math.log(self.alg.policy.max_delta_rpy))
                             self.alg.transition.actions_log_prob[N_train:] = _logp_zeros
                             _frontres_mask = torch.zeros(self.env.num_envs, 1, device=self.device)
                             _frontres_mask[:N_train] = 1.0
