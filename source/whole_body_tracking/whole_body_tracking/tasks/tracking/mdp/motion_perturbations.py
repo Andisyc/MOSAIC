@@ -94,7 +94,26 @@ class MotionPerturber:
         self._pitch_state = torch.zeros(num_envs, device=device)   # root pitch (rad)
         self._joint_state: torch.Tensor | None = None              # (num_envs, num_joints)
 
+        # Baseline env mask: these envs always receive zero perturbation.
+        # Set once by set_baseline_envs(); enforced inside _ou_step().
+        self._baseline_mask: torch.Tensor | None = None  # bool [num_envs]
+
     # ── public API ────────────────────────────────────────────────────────────
+
+    def set_baseline_envs(self, env_ids: torch.Tensor) -> None:
+        """Permanently disable perturbation for designated baseline envs.
+
+        Must be called once during runner setup (before the first env.step).
+        Unlike reset_envs(), this cannot be undone by the OU process — _ou_step()
+        forces the state to zero for these envs on every physics step.
+
+        This is the fix for ep_len_gmt ≈ 10: even after reset_envs() zeros the
+        OU state, the very next _ou_step() produces noise = sqrt(1-β²)*max_mag*randn.
+        At dr_scale=4, this single-step noise (std ≈ 0.085 m) has ~43% chance of
+        triggering ee_body_pos termination (threshold 0.25 m) within 10 steps.
+        """
+        self._baseline_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._baseline_mask[env_ids] = True
 
     def reset_envs(self, env_ids: torch.Tensor) -> None:
         """Zero OU states for terminated or resampled environments."""
@@ -180,6 +199,8 @@ class MotionPerturber:
 
         noise_std = self.cfg.joint_noise_std * math.sqrt(1.0 - self._beta ** 2)
         self._joint_state = self._beta * self._joint_state + noise_std * torch.randn_like(self._joint_state)
+        if self._baseline_mask is not None:
+            self._joint_state[self._baseline_mask] = 0.0
 
         perturbed = joint_pos.clone()
         if self.cfg.joint_noise_joint_indices is not None:
@@ -192,6 +213,13 @@ class MotionPerturber:
     # ── internal ──────────────────────────────────────────────────────────────
 
     def _ou_step(self, state: torch.Tensor, max_magnitude: float) -> torch.Tensor:
-        """Single OU update; steady-state std of the process = max_magnitude."""
+        """Single OU update; steady-state std of the process = max_magnitude.
+
+        Baseline envs (set via set_baseline_envs) are always returned as zero,
+        regardless of max_magnitude or the previous state.
+        """
         noise_std = max_magnitude * math.sqrt(1.0 - self._beta ** 2)
-        return self._beta * state + noise_std * torch.randn_like(state)
+        new_state = self._beta * state + noise_std * torch.randn_like(state)
+        if self._baseline_mask is not None:
+            new_state[self._baseline_mask] = 0.0
+        return new_state

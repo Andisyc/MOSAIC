@@ -459,6 +459,20 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name   = "g1_flat_frontres_unified"
     empirical_normalization = True
 
+    # ── Task-space correction ramp ────────────────────────────────────────────
+    # FrontRES corrections are multiplied by delta_q_alpha before being applied
+    # to the anchor.  Starting from 0 prevents early random PPO gradients from
+    # saturating tanh (0.3m) and causing immediate termination (episode_length=1),
+    # which would make the B1 comparison invalid and stall training.
+    #
+    # Schedule:
+    #   [0, critic_warmup_iterations):      alpha = delta_q_alpha_init (≈ 0)
+    #   [critic_warmup_iterations, +ramp):  alpha ramps linearly to 1.0
+    #   [critic_warmup + ramp, ∞):          alpha = 1.0 (full corrections)
+    critic_warmup_iterations       = 500   # critic learns V(s) before actor moves
+    delta_q_alpha_init             = 0.0   # start with zero correction magnitude
+    delta_q_alpha_ramp_iterations  = 5000  # ramp to 1.0 over 5000 iterations
+
     policy = RslRlFrontResidualActorCriticCfg(
         class_name             = "FrontRESActorCritic",
         # ── Network ──────────────────────────────────────────────────────────

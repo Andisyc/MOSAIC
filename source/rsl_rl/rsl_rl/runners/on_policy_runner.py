@@ -491,6 +491,20 @@ class OnPolicyRunner:
             # GMT raw rewards must be tracked separately before they are zeroed.
             cur_reward_sum_gmt = torch.zeros(N_base, dtype=torch.float, device=self.device)
 
+            # Permanently disable OU perturbation for GMT baseline envs [N_train:].
+            # Must be done once here (before the first env.step) rather than per-step:
+            # per-step reset_envs() zeros the state, but the very next _ou_step() adds
+            # noise = sqrt(1-β²)*max_mag*randn. At dr_scale=4 this single-step noise
+            # (std ≈ 0.085 m z-float) has ~43% chance of triggering ee_body_pos
+            # termination (threshold 0.25 m) within 10 steps → ep_len_gmt ≈ 10.
+            # set_baseline_envs() forces _ou_step() to return 0 for those envs permanently.
+            _gmt_ids_setup = torch.arange(N_train, self.env.num_envs, device=self.device)
+            _env_setup = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+            _mcmd_setup = _env_setup.command_manager._terms.get('motion')
+            if _mcmd_setup is not None and hasattr(_mcmd_setup, 'perturber'):
+                _mcmd_setup.perturber.set_baseline_envs(_gmt_ids_setup)
+                print(f"[Runner] OU perturber: baseline mask set for envs [{N_train}, {self.env.num_envs})")
+
         # ── Adaptive DR: target-survival-rate PI controller ───────────────────
         # Maintains training_survival_rate ≈ dr_target_survival by continuously
         # adjusting dr_scale ∈ [0, dr_max_scale].  Replaces the old exp-ramp +
@@ -834,6 +848,13 @@ class OnPolicyRunner:
                                         _gate = (1.0 - _jd).clamp(0.0, 1.0).unsqueeze(-1)
                                         _pos_corr = _pos_corr * _gate
                                     # ── end gate ──────────────────────────────────────────
+                                    # Alpha ramp: scale corrections by delta_q_alpha so that
+                                    # early-training random corrections cannot saturate tanh
+                                    # (0.3 m) and immediately trigger anchor_pos termination.
+                                    # This keeps episode_length > 1 so B1 comparison is valid
+                                    # and the supervised signal can establish direction first.
+                                    _alpha = getattr(self.alg.policy, 'delta_q_alpha', 1.0)
+                                    _pos_corr = _pos_corr * _alpha
                                     _cmd_term._frontres_pos_correction[:N_train].copy_(_pos_corr)
                                     # Gate Δrpy with the same jump_degree.
                                     # During free flight (jump_degree≈1), orientation correction
@@ -843,6 +864,7 @@ class OnPolicyRunner:
                                     _rpy = _task_corr[:N_train, 3:]
                                     if hasattr(_cmd_term, 'jump_degree'):
                                         _rpy = _rpy * _gate  # _gate already (N_train, 1)
+                                    _rpy = _rpy * _alpha    # alpha ramp for orientation
                                     _quat_corr = quat_from_euler_xyz(
                                         _rpy[:, 0], _rpy[:, 1], _rpy[:, 2])
                                     _cmd_term._frontres_quat_correction[:N_train].copy_(_quat_corr)
@@ -872,20 +894,10 @@ class OnPolicyRunner:
                     # Move to device
                     rewards, dones = rewards.to(self.device), dones.to(self.device)
 
-                    # ── GMT baseline: keep OU states at zero every step ─────────────────
-                    # GMT baseline envs [N_train:] must track an UNPERTURBED reference so
-                    # they provide a stable, long-surviving baseline for the B1 delta reward.
-                    # If they also see the OU-perturbed reference, they fail in ~12 steps
-                    # (OOD input), making r_base meaningless after those 12 steps because
-                    # GMT envs reset to fresh episodes while FrontRES envs continue running.
-                    # Zeroing OU states after each env.step() ensures the perturber sees
-                    # clean zero states for baseline envs on the next _update_command call.
-                    if _is_frontres:
-                        _env_raw_ou = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
-                        _mcmd_ou = _env_raw_ou.command_manager._terms.get('motion')
-                        if _mcmd_ou is not None and hasattr(_mcmd_ou, 'perturber'):
-                            _gmt_ids = torch.arange(N_train, self.env.num_envs, device=self.device)
-                            _mcmd_ou.perturber.reset_envs(_gmt_ids)
+                    # ── GMT baseline: OU zeroing now handled by set_baseline_envs() ─────
+                    # Baseline envs [N_train:] are registered once at runner start via
+                    # perturber.set_baseline_envs(). _ou_step() enforces zero state for
+                    # them on every physics step, so no per-step reset_envs() is needed.
 
                     # ── FrontRES B1 delta-reward ────────────────────────────────────────
                     # GMT baseline envs [N_train:] ran with delta_q=0 → rewards ≈ GMT-only.
