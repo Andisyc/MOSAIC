@@ -42,7 +42,7 @@ OU_TAU = 0.5   # seconds
 TASK = "Tracking-Flat-G1-Wo-State-Estimation-v0"
 
 # Output directory (timestamped sub-folder created automatically)
-OUTPUT_DIR = "results/robustness_validation"
+OUTPUT_DIR = "verify/robustness_validation"
 
 # ════════════════════════════════════════════════════════════════════════════
 #  ISAAC SIM BOOTSTRAP  — must come before any other isaaclab imports
