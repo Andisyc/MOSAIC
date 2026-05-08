@@ -389,5 +389,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
-    simulation_app.close()
+    try:
+        main()
+    finally:
+        simulation_app.close()
+        # Isaac Sim background GPU threads don't exit on simulation_app.close().
+        # os._exit() bypasses Python cleanup and terminates the process immediately,
+        # allowing batch scripts to launch the next motion without getting stuck.
+        import os as _os
+        _os._exit(0)
