@@ -321,26 +321,24 @@ class G1FlatFrontRESFinetuneEnvCfg(FrontRESFinetuneTrackingEnvCfg):
             func=mdp.anchor_root_rpy_error_w, params={"command_name": "motion"},
             noise=Unoise(n_min=-0.01, n_max=0.01))
 
-        # FrontRES corrects the global motion anchor (root-level perturbations), not
-        # individual joint targets.  Wrist Z-tracking errors from fast dance arm gestures
-        # are NOT fall indicators — they reflect PD-controller bandwidth limits and should
-        # not terminate episodes.  Keep only ankle bodies for foot-contact quality check.
+        # ee_body_pos uses bad_motion_body_pos_z_only with threshold=0.25m.
+        # During walking, the reference ankle Z oscillates from ~0.05m (stance)
+        # to ~0.30m (swing peak). When the reference ankle is at its swing apex
+        # while the robot is still in stance, |ref_z - robot_z| ≈ 0.25m →
+        # termination fires at step ~10-12 regardless of tracking quality.
+        # This was the root cause of ep_len_gmt ≈ 10 that persisted through
+        # every previous fix (Physics DR, OU, start_from_beginning).
+        #
+        # Fix: raise threshold to 0.5m.  This still catches real falls (robot
+        # collapses → ankle drops far below reference) while allowing normal
+        # gait swing-phase height variation (< 0.35m peak).
+        # Also keep wrist links excluded — arm swing in dance motions should
+        # not terminate episodes.
         self.terminations.ee_body_pos.params["body_names"] = [
             "left_ankle_roll_link",
             "right_ankle_roll_link",
         ]
-
-        # Force all episodes to start from frame 0 of the motion.
-        # Without this, _resample_command() picks a random start frame (adaptive
-        # sampling). When the robot resets to its default standing pose but the
-        # reference is at a mid-stride / turning / dynamic frame, the initial pose
-        # mismatch causes tracking error to accumulate and hit the termination
-        # threshold (0.25 m) within ~12 steps — both FrontRES training envs and
-        # GMT baseline envs fail equally, collapsing r_delta and the training signal.
-        # Frame 0 of each motion is always a near-neutral standing pose that closely
-        # matches the robot's default reset configuration, giving GMT a fair start.
-        self.commands.motion.start_from_beginning = True
-        self.commands.motion.start_frame = 0
+        self.terminations.ee_body_pos.params["threshold"] = 0.5
 
         self.commands.motion.anchor_body_name = "torso_link"
         self.commands.motion.body_names = [
