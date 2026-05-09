@@ -1657,20 +1657,27 @@ class OnPolicyRunner:
     def _apply_obs_normalizer(self, obs: torch.Tensor) -> torch.Tensor:
         """Apply obs_normalizer, with partial pass-through for FrontRES task-space mode.
 
-        In task-space FrontRES:
-          - First _frontres_gmt_obs_dim dims → GMT normalizer (frozen, matches GMT training)
-          - Remaining anchor-error dims       → Stage-1 empirical stats (loaded from checkpoint)
-            If those stats are not available, pass the anchor-error dims through unchanged.
+        IsaacLab places Optional obs terms (anchor_root_pos_error_w, anchor_root_rpy_error_w)
+        BEFORE regular terms in the concatenated obs tensor, so the layout is:
+          [0 : num_extra]           = anchor-error dims  (FrontRES-only, NOT in GMT training)
+          [num_extra : num_extra+gmt_dim] = GMT-compatible dims (match GMT training obs exactly)
+
+        where num_extra = obs_dim - gmt_dim  (= 30 = 6 dims/frame × 5 frames).
+
+        We therefore normalize the LAST gmt_dim dims with the frozen GMT normalizer and
+        optionally normalize the FIRST num_extra dims with Stage-1 empirical stats.
+        Output shape is unchanged (800 dims); structure: [extra | gmt_part].
         """
         if self._frontres_gmt_obs_dim is not None and obs.shape[-1] > self._frontres_gmt_obs_dim:
-            gmt_dim = self._frontres_gmt_obs_dim
-            gmt_part   = self.obs_normalizer(obs[:, :gmt_dim])
-            extra      = obs[:, gmt_dim:]
+            gmt_dim   = self._frontres_gmt_obs_dim
+            num_extra = obs.shape[-1] - gmt_dim          # = 30 (anchor errors at front)
+            extra     = obs[:, :num_extra]               # [0:30]   anchor errors
+            gmt_part  = self.obs_normalizer(obs[:, num_extra:])  # [30:800] GMT-compatible → normalize
             _s1_mean = getattr(self, '_frontres_extra_mean', None)
             _s1_std  = getattr(self, '_frontres_extra_std',  None)
             if _s1_mean is not None and _s1_std is not None:
                 extra = (extra - _s1_mean) / (_s1_std + 1e-8)
-            return torch.cat([gmt_part, extra], dim=-1)
+            return torch.cat([extra, gmt_part], dim=-1)  # [anchor_errors | normalized_gmt]
         return self.obs_normalizer(obs)
 
     def _move_normalizer_to_device(self, device):

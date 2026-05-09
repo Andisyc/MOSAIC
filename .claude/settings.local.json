@@ -22,7 +22,10 @@
       "Bash(python test_metrics_offline.py)",
       "Bash(git -C D:/ArtiIntComVis/MOSAIC show cc7ed73:source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/flat_env_cfg.py)",
       "Bash(Select-String -Pattern \"G1FlatFrontRESFinetuneEnvCfg|events|termination|ee_body|anchor_ori|anchor_pos|start_from\")",
-      "Bash(Head -40)"
+      "Bash(Head -40)",
+      "Bash(python -c \"import isaaclab; import os; print\\(os.path.dirname\\(isaaclab.__file__\\)\\)\")",
+      "PowerShell(pip show isaaclab 2>&1)",
+      "PowerShell(python -c \"import isaaclab.managers; print\\(isaaclab.managers.__file__\\)\" 2>&1)"
     ]
   }
 }

@@ -688,7 +688,11 @@ class FrontRESActorCritic(nn.Module):
         if self.gmt_normalizer is not None:
             _gmt_mean = getattr(self.gmt_normalizer, '_mean', None)
             if _gmt_mean is not None and gmt_input.shape[-1] > _gmt_mean.shape[-1]:
-                gmt_input = gmt_input[:, :_gmt_mean.shape[-1]]
+                # IsaacLab places Optional obs terms (anchor errors) at the BEGINNING.
+                # GMT-compatible dims are therefore at the END: obs[:, num_extra:].
+                # num_extra = total_dims - gmt_dims (e.g. 800 - 770 = 30).
+                num_extra = gmt_input.shape[-1] - _gmt_mean.shape[-1]
+                gmt_input = gmt_input[:, num_extra:]  # [30:800] = 770 normalized GMT dims
 
         if ref_vel is not None:
             gmt_obs = torch.cat([gmt_input, ref_vel], dim=-1)
