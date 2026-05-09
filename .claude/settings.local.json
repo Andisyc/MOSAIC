@@ -19,7 +19,10 @@
       "Bash(find /d/ArtiIntComVis/MOSAIC/source/whole_body_tracking -name \"commands.py\" | head -5)",
       "Read(//d/ArtiIntComVis/MOSAIC/source/**)",
       "Bash(pip install *)",
-      "Bash(python test_metrics_offline.py)"
+      "Bash(python test_metrics_offline.py)",
+      "Bash(git -C D:/ArtiIntComVis/MOSAIC show cc7ed73:source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/flat_env_cfg.py)",
+      "Bash(Select-String -Pattern \"G1FlatFrontRESFinetuneEnvCfg|events|termination|ee_body|anchor_ori|anchor_pos|start_from\")",
+      "Bash(Head -40)"
     ]
   }
 }

@@ -340,19 +340,13 @@ class G1FlatFrontRESFinetuneEnvCfg(FrontRESFinetuneTrackingEnvCfg):
         ]
         self.terminations.ee_body_pos.params["threshold"] = 0.5
 
-        # anchor_ori threshold 0.20 (≈37°) fires for all dynamic motions where GMT
-        # tracks orientation with normal lag, causing 560+ terminations/iter and
-        # ep_len_gmt ≈ 12.  Raise to 0.5 (≈53° diff) which only fires on real falls.
-        # anchor_pos threshold 0.25m fires when the robot's torso drops 25 cm from the
-        # reference — too tight for dynamic motions.  Raise to 0.5m to match ee_body_pos.
+        # anchor_ori 0.20 (≈37°) was too tight: fired 560+/iter even for normal GMT
+        # tracking lag on dynamic motions → ep_len_gmt ≈ 12.  Raise to 0.5 (≈53°).
+        # anchor_pos 0.25m similarly too tight; raise to 0.5m.
+        # In the Δq era anchor_ori was 0.8 (dead code) and anchor_pos=0.25m sufficed
+        # for ep_len=125+; these looser thresholds are strictly more permissive.
         self.terminations.anchor_ori.params["threshold"] = 0.5
         self.terminations.anchor_pos.params["threshold"] = 0.5
-
-        # Always start from frame 0.  Without this, _adaptive_sampling can converge
-        # to near-end frames (high bin_failed_count → high sampling probability →
-        # more failures → positive feedback).
-        self.commands.motion.start_from_beginning = True
-        self.commands.motion.start_frame = 0
 
         self.commands.motion.anchor_body_name = "torso_link"
         self.commands.motion.body_names = [
