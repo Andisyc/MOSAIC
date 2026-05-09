@@ -292,6 +292,14 @@ class G1FlatFrontRESFinetuneEnvCfg(FrontRESFinetuneTrackingEnvCfg):
         self.scene.robot = G1_CYLINDER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.actions.joint_pos.scale = G1_ACTION_SCALE
 
+        # GMT was already trained with Physics DR and is robust to PD gain
+        # variations, COM offsets, and payload without FrontRES involvement.
+        # FrontRES only corrects motion reference errors (ΔSE3); it cannot
+        # compensate physical parameter variations via anchor corrections.
+        # Physics DR here makes GMT fail as a B1 baseline (ep_len ≈ 12),
+        # zeroing both r_delta and the supervised signal — a training deadlock.
+        self.events = None
+
         # Obs layout (800 dims total):
         #   [0:770]  = GMT-compatible prefix:
         #              [cmd(58), ori(6), ang(3), jpos(29), jvel(29), act(29)] × 5
