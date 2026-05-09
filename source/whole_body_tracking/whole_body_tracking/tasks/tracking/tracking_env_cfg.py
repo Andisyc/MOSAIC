@@ -527,7 +527,21 @@ class TerminationsCfg: # Episode结束判定
     
     anchor_ori = DoneTerm(
         func=mdp.bad_anchor_ori,
-        params={"asset_cfg": SceneEntityCfg("robot"), "command_name": "motion", "threshold": 0.8},)
+        params={"asset_cfg": SceneEntityCfg("robot"), "command_name": "motion", "threshold": 0.20},
+        # threshold = 0.20  →  fires when |gravity_proj_z(anchor) - gravity_proj_z(robot)| > 0.20
+        # i.e. anchor-robot orientation mismatch > ~37°.
+        #
+        # Original 0.8 (≈78°) was effectively a dead code — never triggered.
+        #
+        # Key distinction: FrontRES only corrects OU tilt perturbations, not the reference
+        # motion's natural lean. For a dancing motion with natural 45° forward lean, both
+        # anchor_quat_w and robot_quat contain that lean → error ≈ 0 (no spurious trigger).
+        #
+        # Safety budget at threshold 0.20:
+        #   FrontRES max wrong correction (Δroll=Δpitch=0.3 rad) → error ≈ 0.088  (2.3× margin)
+        #   OU tilt after FrontRES correction (residual) → ≈ 0.002 (100× margin)
+        #   Genuine robot fall > 37° → triggers correctly
+    )
     
     ee_body_pos = DoneTerm( # 根节点触地
         func=mdp.bad_motion_body_pos_z_only,
