@@ -491,19 +491,19 @@ class OnPolicyRunner:
             # GMT raw rewards must be tracked separately before they are zeroed.
             cur_reward_sum_gmt = torch.zeros(N_base, dtype=torch.float, device=self.device)
 
-            # Permanently disable OU perturbation for GMT baseline envs [N_train:].
-            # Must be done once here (before the first env.step) rather than per-step:
-            # per-step reset_envs() zeros the state, but the very next _ou_step() adds
-            # noise = sqrt(1-β²)*max_mag*randn. At dr_scale=4 this single-step noise
-            # (std ≈ 0.085 m z-float) has ~43% chance of triggering ee_body_pos
-            # termination (threshold 0.25 m) within 10 steps → ep_len_gmt ≈ 10.
-            # set_baseline_envs() forces _ou_step() to return 0 for those envs permanently.
-            _gmt_ids_setup = torch.arange(N_train, self.env.num_envs, device=self.device)
-            _env_setup = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
-            _mcmd_setup = _env_setup.command_manager._terms.get('motion')
-            if _mcmd_setup is not None and hasattr(_mcmd_setup, 'perturber'):
-                _mcmd_setup.perturber.set_baseline_envs(_gmt_ids_setup)
-                print(f"[Runner] OU perturber: baseline mask set for envs [{N_train}, {self.env.num_envs})")
+            # REMOVED: set_baseline_envs() was originally added to fix ep_len_gmt≈10
+            # caused by large OU noise at high dr_scale hitting termination thresholds.
+            # However, zeroing perturbations for baseline envs makes them track a CLEAN
+            # (unperturbed) reference, so r_delta = reward(perturbed+correction) -
+            # reward(clean) ≤ 0 always — a mathematically impossible training signal.
+            #
+            # Correct baseline: GMT with the SAME perturbation but NO correction.
+            # r_delta = reward(perturbed+correction) - reward(perturbed)
+            # This is positive when FrontRES correction actually helps, providing the
+            # correct learning signal for PPO to improve FrontRES.
+            #
+            # The ep_len_gmt≈10 root cause was the obs ordering bug (anchor errors at
+            # [0:30] instead of [770:800]), which has been fixed separately.
 
         # ── Adaptive DR: target-survival-rate PI controller ───────────────────
         # Maintains training_survival_rate ≈ dr_target_survival by continuously
