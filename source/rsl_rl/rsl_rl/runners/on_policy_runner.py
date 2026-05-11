@@ -836,20 +836,54 @@ class OnPolicyRunner:
                     if _is_task_space_mode:
                         _task_corr = getattr(self.alg.policy, 'last_task_correction', None)
 
-                        # ── Oracle injection for r_delta feasibility test ──────────────
-                        # When oracle_inject=True in runner cfg, bypass FrontRES output and
-                        # directly apply the ground-truth supervised_target (= -OU perturbation).
-                        # If r_delta > 0 with oracle: task is feasible, training dynamics need fix.
-                        # If r_delta ≈ 0 or < 0 with oracle: GMT too robust, reward design broken.
-                        if self.cfg.get("oracle_inject", False) and _task_corr is not None:
+                        # ── Curriculum Oracle ──────────────────────────────────────────
+                        # Mixes oracle (-OU ground truth) with FrontRES output to break the
+                        # chicken-and-egg deadlock:
+                        #   Untrained FrontRES → bad corrections → r_delta<0 → negative
+                        #   advantages → PPO fights supervised → FrontRES never learns.
+                        # With oracle mix, r_delta stays ≥ 0 throughout; PPO and supervised
+                        # gradients are always aligned. Mix fades out as FrontRES improves.
+                        #
+                        #   mix = 1.0 → pure oracle   (cos_sim < oracle_mix_cos_low)
+                        #   mix = 0.0 → pure FrontRES (cos_sim ≥ oracle_mix_cos_high)
+                        #   linear interpolation in between
+                        #
+                        # This is standard curriculum / demonstration bootstrapping (c.f.
+                        # DAgger, residual RL). The oracle is only the OU state, which is
+                        # available during training (not at deployment).
+                        if self.cfg.get("oracle_curriculum", False) and _task_corr is not None:
                             _env_oracle = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
                             for _cmd_oracle in _env_oracle.command_manager._terms.values():
                                 if hasattr(_cmd_oracle, 'supervised_target'):
-                                    _sup = _cmd_oracle.supervised_target.to(self.device)  # (N_envs, 6)
-                                    _oracle_corr = torch.zeros_like(_task_corr)
-                                    _n = min(_sup.shape[1], _oracle_corr.shape[1])
-                                    _oracle_corr[:, :_n] = _sup[:, :_n]
-                                    _task_corr = _oracle_corr
+                                    _sup = _cmd_oracle.supervised_target.to(self.device)
+                                    _oracle_full = torch.zeros_like(_task_corr)
+                                    _n = min(_sup.shape[-1], _oracle_full.shape[-1])
+                                    _oracle_full[:, :_n] = _sup[:, :_n]
+
+                                    # Per-step EMA of cos(FrontRES_output, oracle)
+                                    # Tracks how close raw FrontRES is to the ideal correction.
+                                    _fr_v  = _task_corr[:N_train, :_n]
+                                    _or_v  = _oracle_full[:N_train, :_n]
+                                    _cos_s = (_fr_v * _or_v).sum(-1) / (
+                                        _fr_v.norm(dim=-1) * _or_v.norm(dim=-1) + 1e-8)
+                                    _ema_alpha = 0.99
+                                    _prev_ema  = getattr(self, '_oracle_cos_ema', 0.0)
+                                    _new_ema   = _ema_alpha * _prev_ema + (1 - _ema_alpha) * float(_cos_s.mean())
+                                    self._oracle_cos_ema = _new_ema
+
+                                    # Mix coefficient
+                                    _cos_lo = float(self.cfg.get("oracle_mix_cos_low",  0.3))
+                                    _cos_hi = float(self.cfg.get("oracle_mix_cos_high", 0.85))
+                                    if _new_ema < _cos_lo:
+                                        _mix = 1.0
+                                    elif _new_ema < _cos_hi:
+                                        _mix = 1.0 - (_new_ema - _cos_lo) / (_cos_hi - _cos_lo)
+                                    else:
+                                        _mix = 0.0
+                                    self._oracle_mix = _mix
+
+                                    if _mix > 0.0:
+                                        _task_corr = (1.0 - _mix) * _task_corr + _mix * _oracle_full
                                     break
                         # ─────────────────────────────────────────────────────────────
 
@@ -893,35 +927,6 @@ class OnPolicyRunner:
                                     _cmd_term._frontres_quat_correction[N_train:].zero_()
                                     _cmd_term._frontres_quat_correction[N_train:, 0] = 1.0
 
-                                    # ── Direction diagnostic (every 500 steps) ────────────────
-                                    # Checks whether FrontRES correction is opposing the OU
-                                    # perturbation (correct) or amplifying it (wrong sign).
-                                    # sup_target = -OU perturbation (what FrontRES should output)
-                                    # frontres_corr = what FrontRES actually applied (scaled by α)
-                                    # dot > 0 → aligned with target (cancels OU) ✓
-                                    # dot < 0 → opposed to target (amplifies OU) ✗
-                                    _diag_step = getattr(self, '_frontres_diag_step', 0)
-                                    self._frontres_diag_step = _diag_step + 1
-                                    if _diag_step < 10 and hasattr(_cmd_term, 'supervised_target'):
-                                        _sup_tgt  = _cmd_term.supervised_target[:N_train, :3]  # -OU (m)
-                                        _fr_corr  = _cmd_term._frontres_pos_correction[:N_train]  # FrontRES pos
-                                        _raw_corr = _task_corr[:N_train, :3]                    # before alpha
-                                        _alpha_v  = getattr(self.alg.policy, 'delta_q_alpha', 1.0)
-                                        _dot = (_sup_tgt * _raw_corr).sum(dim=-1)  # per-env dot product
-                                        _sup_norm = _sup_tgt.norm(dim=-1)
-                                        _fr_norm  = _raw_corr.norm(dim=-1)
-                                        _cos = _dot / (_sup_norm * _fr_norm + 1e-8)
-                                        print(
-                                            f"\n[FrontRES Dir Check | step={_diag_step} | α={_alpha_v:.3f}]\n"
-                                            f"  OU perturbation  (=-sup_tgt mean): {(-_sup_tgt).mean(0).cpu().numpy()}\n"
-                                            f"  FrontRES output  (raw, pre-α):     {_raw_corr.mean(0).cpu().numpy()}\n"
-                                            f"  FrontRES applied (post-α):         {_fr_corr.mean(0).cpu().numpy()}\n"
-                                            f"  cos(FrontRES, target) mean={_cos.mean():.3f}  "
-                                            f"[+1=cancel OU, -1=amplify OU]\n"
-                                            f"  sup_target norm mean={_sup_norm.mean():.4f}m  "
-                                            f"  frontres norm mean={_fr_norm.mean():.4f}m"
-                                        )
-                                    # ─────────────────────────────────────────────────────────
 
                     # Read supervised target BEFORE env.step: the command term's cache holds
                     # the perturbation that generated the CURRENT obs (used by FrontRES this step).

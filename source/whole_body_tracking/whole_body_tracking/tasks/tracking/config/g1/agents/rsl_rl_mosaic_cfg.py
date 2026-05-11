@@ -455,24 +455,27 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
       root_tilt_prob=0.3,    root_tilt_max_rad=0.08, # Δroll, Δpitch
     """
     num_steps_per_env = 24
-    max_iterations    = 15      # oracle test: 15 iters ≈ 90s; restore to 30000 after
+    max_iterations    = 30000
     save_interval     = 500
     experiment_name   = "g1_flat_frontres_unified"
     empirical_normalization = True
 
-    # ── Oracle injection test ─────────────────────────────────────────────────
-    # oracle_inject=True bypasses FrontRES and applies ground-truth -OU correction.
-    # Use with the settings below; ~15 iterations (~90s) is enough to conclude.
-    # After test: restore oracle_inject=False, max_iterations=30000,
-    #   critic_warmup_iterations=500, delta_q_alpha_init=0.0,
-    #   delta_q_alpha_ramp_iterations=5000, remove dr_scale_init.
-    oracle_inject                  = True   # ← oracle test active
-    dr_scale_init                  = 1.5    # skip dr ramp; start with meaningful perturbation
+    # ── Curriculum Oracle ─────────────────────────────────────────────────────
+    # Mixes oracle (-OU ground truth) with FrontRES output to bootstrap training.
+    # Prevents the chicken-and-egg deadlock: untrained FrontRES → r_delta<0 →
+    # PPO/supervised gradient conflict → FrontRES never learns.
+    # Mix fades from 1.0 (pure oracle) to 0.0 (pure FrontRES) as cos_sim grows.
+    oracle_curriculum              = True   # enable curriculum oracle
+    oracle_mix_cos_low             = 0.3    # below this: pure oracle
+    oracle_mix_cos_high            = 0.85   # above this: pure FrontRES
 
     # ── Task-space correction ramp ────────────────────────────────────────────
-    critic_warmup_iterations       = 0      # no warmup: alpha active from iter 0
-    delta_q_alpha_init             = 1.0    # full correction magnitude immediately
-    delta_q_alpha_ramp_iterations  = 0      # no ramp
+    # Alpha must be 1.0 from the start so oracle corrections reach full magnitude.
+    # Warmup still protects the critic: actor updates (PPO) frozen for 500 iters,
+    # but oracle still applies corrections and supervised loss still trains FrontRES.
+    critic_warmup_iterations       = 500    # critic learns V(s) before PPO actor updates
+    delta_q_alpha_init             = 1.0    # full correction magnitude from iter 0
+    delta_q_alpha_ramp_iterations  = 0      # no ramp needed with oracle bootstrapping
 
     # 两台服务器上的 MOSAIC 根目录（不含实验子目录）
     candidate_gmt_paths = [
