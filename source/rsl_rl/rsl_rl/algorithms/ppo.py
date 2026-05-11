@@ -53,6 +53,10 @@ class PPO:
         lambda_reg_min: float = 0.0,
         # PCGrad：检测 PPO 梯度与正则化梯度的冲突并投影消解
         use_pcgrad: bool = False,
+        # ── FrontRES supervised loss ──────────────────────────────────────────
+        # λ_sup × HuberLoss(pred, target) anchors the policy mean μ to the
+        # anti-DR direction.  1.0 = full anchor; decay to ~0.1 over training.
+        lambda_supervised: float = 0.0,
     ):
         # device-related parameters
         self.device = device
@@ -119,9 +123,8 @@ class PPO:
             self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
 
         # ── FrontRES supervised loss ──────────────────────────────────────────
-        # λ_sup × HuberLoss(pred, target) anchors the policy mean μ to the
-        # anti-DR direction.  1.0 = full anchor; decay to ~0.1 over training.
-        lambda_supervised: float = 0.0,
+        self.lambda_supervised = lambda_supervised
+        self.supervised_loss_fn = torch.nn.HuberLoss(delta=1.0)
 
         # FrontRES 正则化参数
         self.lambda_reg_init    = lambda_reg_init
