@@ -403,10 +403,33 @@ class FrontRESActorCritic(nn.Module):
         # ========== Action Noise ==========
 
         # Distribution covers the full output [Δq, Δz] = total_output_dim dims
+        #
+        # Task-space mode (FrontRES SE3 corrector): σ is a FIXED hyperparameter,
+        # not a trainable parameter.
+        #
+        # Why fixed for task-space:
+        #   FrontRES predicts a known target (-OU perturbation). Its uncertainty
+        #   should decrease as the mean μ improves — this happens naturally via the
+        #   supervised loss driving μ toward the target, not via PPO optimising σ.
+        #   Making σ trainable under PPO causes 1/σ² gradient amplification:
+        #   at σ=0.1, log_prob gradients are 100× larger than at σ=1.0, allowing
+        #   even small negative advantages to drive σ upward explosively.
+        #   PPO's objective (maximise reward) is orthogonal to "reduce correction
+        #   variance" — it has no reason to keep σ small, and entropy bonuses
+        #   actively push it up.  The result is the σ→28 / PhysX corruption spiral.
+        #
+        # Standard locomotion actors (num_task_corrections == 0) retain trainable
+        # σ because exploration breadth is legitimately reward-relevant.
         if self.noise_std_type == "scalar":
-            self.std = nn.Parameter(init_noise_std * torch.ones(self.total_output_dim))
+            self.std = nn.Parameter(
+                init_noise_std * torch.ones(self.total_output_dim),
+                requires_grad=(self.num_task_corrections == 0),
+            )
         elif self.noise_std_type == "log":
-            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(self.total_output_dim)))
+            self.log_std = nn.Parameter(
+                torch.log(init_noise_std * torch.ones(self.total_output_dim)),
+                requires_grad=(self.num_task_corrections == 0),
+            )
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
