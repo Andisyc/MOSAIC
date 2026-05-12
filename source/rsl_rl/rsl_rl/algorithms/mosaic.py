@@ -1408,16 +1408,22 @@ class MOSAIC:
             # ========== Supervised Auxiliary Loss (Unified Stage 1+2) ==========
             supervised_loss = torch.tensor(0.0, device=self.device)
             _sup_cos_sim    = 0.0
+            # mu_batch may have 8 dims (Δpos_r, Δrpy_r, c_pos_r, c_rpy_r) when
+            # confidence heads are active; target always has 6 (Δpos, Δrpy).
+            _mu_dim = mu_batch.shape[-1]
+            _sup_dim = supervised_target_batch.shape[-1] if supervised_target_batch is not None else 0
             if (self.lambda_supervised > 0 and supervised_target_batch is not None
-                    and mu_batch.shape[-1] == supervised_target_batch.shape[-1]):
-                raw_pred = mu_batch[:original_batch_size]        # [B, 6] raw FrontRES mean
-                # TanhNormal: mu_batch is in raw (unbounded) space; convert to bounded correction
-                # space before comparing against the physical-units supervised target.
+                    and _mu_dim >= _sup_dim):
+                raw_pred = mu_batch[:original_batch_size]
                 if hasattr(self.policy, 'num_task_corrections') and self.policy.num_task_corrections > 0:
-                    pred = torch.cat([
-                        torch.tanh(raw_pred[:, :3]) * self.policy.max_delta_pos,
-                        torch.tanh(raw_pred[:, 3:]) * self.policy.max_delta_rpy,
-                    ], dim=-1)
+                    _pos_raw = torch.tanh(raw_pred[:, :3]) * self.policy.max_delta_pos
+                    _rpy_raw = torch.tanh(raw_pred[:, 3:6]) * self.policy.max_delta_rpy
+                    if _mu_dim >= 8:
+                        _c_pos = torch.sigmoid(raw_pred[:, 6:7])
+                        _c_rpy = torch.sigmoid(raw_pred[:, 7:8])
+                        _pos_raw = _pos_raw * _c_pos
+                        _rpy_raw = _rpy_raw * _c_rpy
+                    pred = torch.cat([_pos_raw, _rpy_raw], dim=-1)
                 else:
                     pred = raw_pred
                 target = supervised_target_batch[:original_batch_size]

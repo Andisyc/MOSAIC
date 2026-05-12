@@ -548,10 +548,10 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         num_learning_epochs  = 5,
         num_mini_batches     = 4,
         learning_rate        = 3.0e-5,
-        schedule             = "adaptive",
+        schedule             = "fixed",    # fixed: adaptive KL deadlocks with FrontRES 8-DoF output
         gamma                = 0.99,
         lam                  = 0.95,
-        desired_kl           = 0.01,
+        desired_kl           = 0.01,       # kept as reference (not used in fixed mode)
         max_grad_norm        = 0.5,
 
         # ── Supervised auxiliary loss (λ_sup schedule) ────────────────────────

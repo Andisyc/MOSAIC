@@ -1196,6 +1196,10 @@ class OnPolicyRunner:
             _staircase_level_for_log = None
             _staircase_mult_for_log  = None
 
+            # Phase flags for diagnostics (exposed to log() via locals())
+            _supervised_warmup_active = False  # runs before main loop, always False here
+            _critic_warmup_active     = _critic_warmup
+
             # log info
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
@@ -1385,16 +1389,30 @@ class OnPolicyRunner:
             # ── Phase indicator ──────────────────────────────────────────────
             _ts_mode = getattr(self.alg.policy, 'num_task_corrections', 0) > 0
             if _ts_mode:
+                _is_warmup = locs.get("_supervised_warmup_active", False)
+                _is_critic = locs.get("_critic_warmup_active", False)
                 _lam = getattr(self.alg, 'lambda_supervised', 0.0)
-                if _lam > 0.5:
+                if _is_warmup:
+                    _phase = "SUPERVISED WARMUP"
+                    _notes = "(GMT-only, FrontRES corrections disabled)"
+                elif _is_critic:
+                    _phase = "CRITIC WARMUP"
+                    _notes = "(DR=0, Actor active, cos_sim meaningless)"
+                elif _lam > 0.5:
                     _phase = "PPO + SUPERVISED ANCHOR"
+                    _notes = ""
                 elif _lam > 0.15:
                     _phase = "PPO + WEAK SUPERVISION"
+                    _notes = ""
                 else:
                     _phase = "PPO FINE-TUNING"
+                    _notes = ""
             else:
                 _phase = "PPO"
+                _notes = ""
             _phase_str = f"  PHASE: {_phase}  "
+            if _notes:
+                _phase_str += f"\n  {_notes}  "
 
             log_string = (
                 f"""{'#' * width}\n"""
