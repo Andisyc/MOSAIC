@@ -60,6 +60,7 @@ parser.add_argument("--checkpoint", type=str, required=True,
 parser.add_argument("--num_envs",   type=int, default=N_TRIALS,
                     help="Number of parallel envs (= trials per condition).")
 parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR)
+# --device / --headless are added by AppLauncher.add_app_launcher_args below
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -112,7 +113,6 @@ def _build_env(motion_file: str, num_envs: int):
       - Disable timeout, events, obs noise, motion perturbations (we control them)
       - All envs track the same motion from the beginning
     """
-    from isaaclab_tasks.utils.hydra import hydra_task_config
     from whole_body_tracking.tasks.tracking.mdp.motion_perturbations import MotionPerturbationCfg
 
     # Load registered env cfg
@@ -343,7 +343,7 @@ def run_condition(
 # ════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args_cli.device if torch.cuda.is_available() else "cpu"
     num_envs = args_cli.num_envs
     output_dir = _make_output_dir(args_cli.output_dir)
 
