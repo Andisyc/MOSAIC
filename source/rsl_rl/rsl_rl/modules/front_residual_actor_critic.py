@@ -423,8 +423,10 @@ class FrontRESActorCritic(nn.Module):
         if self.noise_std_type == "scalar":
             _val = init_noise_std * torch.ones(self.total_output_dim)
             if self.num_task_corrections > 0:
-                # FrontRES: fixed σ (regression task, exploration is harmful).
-                # register_buffer keeps the value but excludes it from optimiser.
+                # FrontRES: per-dimension σ.
+                #   pos/rpy (6 dims):  init_noise_std (0.01) — precision, not exploration
+                #   c_pos/c_rpy (2 dims): 5× larger — PPO needs room to explore gating
+                _val[-2:] = init_noise_std * 5.0
                 self.register_buffer('std', _val)
             else:
                 self.std = nn.Parameter(_val)
@@ -883,6 +885,7 @@ class FrontRESActorCritic(nn.Module):
                 std = torch.exp(self.log_std).clamp(min=_STD_MIN)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
+
         # PyTorch clamp() propagates NaN (NaN.clamp(min=x) == NaN).
         # If self.std becomes NaN via a gradient explosion, Normal(mean, NaN) will crash
         # in .sample() because NaN >= 0 is False.  nan_to_num breaks the death spiral by

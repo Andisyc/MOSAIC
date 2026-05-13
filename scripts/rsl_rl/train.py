@@ -154,6 +154,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     candidate_base_paths = [
         "/hdd0/yuxuancheng/MOSAIC/",
         "/hdd1/cyx/MOSAIC/",
+        "/ssd1/cyx/MOSAIC/"
     ]
 
     # 自动选择第一个真实存在的路径

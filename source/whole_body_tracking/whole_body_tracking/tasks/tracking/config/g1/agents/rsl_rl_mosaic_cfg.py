@@ -522,7 +522,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         residual_last_layer_gain = 0.01,
         critic_hidden_dims     = [1024, 1024, 512, 256],
         activation             = "elu",
-        init_noise_std         = 0.05,     # fixed (requires_grad=False for task-space mode)
+        init_noise_std         = 0.01,     # fixed: 3mm noise floor, sufficient for PPO IS ratio
                                            # pos noise = 1.5cm, rpy noise = 1.5° — well below
                                            # DR perturbation (5-20cm) and GMT tracking error.
                                            # ratio ∈ [0.6, 1.6]: meaningful PPO dynamic range.
