@@ -8,7 +8,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--motion",     type=str, required=True)
 parser.add_argument("--checkpoint", type=str, required=True)
 AppLauncher.add_app_launcher_args(parser)
-args_cli = parser.parse_args()
+args_cli, hydra_args = parser.parse_known_args()
+sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
