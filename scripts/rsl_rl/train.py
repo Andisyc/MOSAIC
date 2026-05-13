@@ -142,6 +142,38 @@ def _sanitize_env_cfg_for_training(env_cfg) -> None:
     if hasattr(env_cfg, "scene") and hasattr(env_cfg.scene, "contact_forces"):
         env_cfg.scene.contact_forces.debug_vis = False
 
+    # Large FrontRES runs can create hundreds of thousands of rigid bodies and
+    # contacts.  If the PhysX GPU capacities are left at defaults, Omniverse can
+    # fail to create the tensor simulation view, which later appears as missing
+    # Articulation._data.  Scale the common capacities with num_envs.
+    physx = getattr(getattr(env_cfg, "sim", None), "physx", None)
+    if physx is not None and hasattr(env_cfg, "scene"):
+        num_envs = int(getattr(env_cfg.scene, "num_envs", 0) or 0)
+
+        def _raise_capacity(name: str, value: int) -> None:
+            if hasattr(physx, name):
+                current = getattr(physx, name)
+                if current is None or int(current) < int(value):
+                    setattr(physx, name, int(value))
+
+        _raise_capacity("gpu_max_rigid_contact_count", max(2**23, num_envs * 4096))
+        _raise_capacity("gpu_max_rigid_patch_count", max(15 * 2**17, num_envs * 512))
+        _raise_capacity("gpu_found_lost_pairs_capacity", max(2**24, num_envs * 2048))
+        _raise_capacity("gpu_found_lost_aggregate_pairs_capacity", max(2**23, num_envs * 1024))
+        _raise_capacity("gpu_total_aggregate_pairs_capacity", max(2**23, num_envs * 1024))
+        _raise_capacity("gpu_collision_stack_size", max(2**26, num_envs * 8192))
+        _raise_capacity("gpu_heap_capacity", max(2**27, num_envs * 16384))
+        _raise_capacity("gpu_temp_buffer_capacity", max(2**26, num_envs * 8192))
+
+        print(
+            "[INFO] PhysX GPU capacities prepared for "
+            f"{num_envs} envs: "
+            f"contact={getattr(physx, 'gpu_max_rigid_contact_count', 'N/A')}, "
+            f"patch={getattr(physx, 'gpu_max_rigid_patch_count', 'N/A')}, "
+            f"pairs={getattr(physx, 'gpu_found_lost_pairs_capacity', 'N/A')}",
+            flush=True,
+        )
+
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point") # 
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
