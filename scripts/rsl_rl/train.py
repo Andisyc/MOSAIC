@@ -152,6 +152,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # 两台服务器上的 MOSAIC 根目录（不含实验子目录）
     candidate_base_paths = [
+        "/workspace/",
         "/hdd0/yuxuancheng/MOSAIC/",
         "/hdd1/cyx/MOSAIC/",
         "/ssd1/cyx/MOSAIC/"
