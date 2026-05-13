@@ -1,6 +1,5 @@
 """Tiny validation pipeline: a couple of epsilons/pushes, save results, plot."""
 import argparse
-import faulthandler
 import os
 import sys
 from pathlib import Path
@@ -60,12 +59,6 @@ parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR)
 parser.add_argument("--video",      action="store_true", default=False)
 parser.add_argument("--video_length", type=int, default=300)
 parser.add_argument(
-    "--startup_timeout",
-    type=int,
-    default=30,
-    help="Dump Python stack traces every N seconds while diagnosing startup hangs. Use 0 to disable.",
-)
-parser.add_argument(
     "--keep_events",
     action="store_true",
     default=False,
@@ -73,11 +66,6 @@ parser.add_argument(
 )
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
-
-if args_cli.startup_timeout > 0:
-    faulthandler.enable()
-    faulthandler.dump_traceback_later(args_cli.startup_timeout, repeat=True)
-
 
 def _parse_float_list(value: str) -> list[float]:
     try:
@@ -94,7 +82,7 @@ def _resolve_motion_input(path: str, file_glob: str) -> tuple[str, str, str]:
         candidates = sorted(motion_path.rglob(file_glob))
         if candidates:
             selected = candidates[0]
-            log(f"[SMOKE] --motion is a directory; minimal run uses first .npz: {selected}")
+            log(f"[Minimal] --motion is a directory; using first .npz: {selected}")
             return str(motion_path), selected.name, str(selected)
     parser.error(
         f"--motion must be a .npz file or a directory containing .npz files: {path}"
@@ -116,20 +104,19 @@ if (
     and not os.environ.get("DISPLAY")
     and not os.environ.get("WAYLAND_DISPLAY")
 ):
-    log("[SMOKE] No display detected; forcing --headless for Isaac Sim startup.")
+    log("[Minimal] No display detected; forcing --headless for Isaac Sim startup.")
     args_cli.headless = True
 
 # This script does not use Hydra.  Leaving unknown CLI fragments in sys.argv can
 # make Kit consume arguments that were intended for other launch paths.
 if hydra_args:
-    log(f"[SMOKE] Ignoring non-AppLauncher arguments: {hydra_args}")
+    log(f"[Minimal] Ignoring non-AppLauncher arguments: {hydra_args}")
 sys.argv = [sys.argv[0]]
 
-log(f"[SMOKE] Launching Isaac Sim via AppLauncher: device={args_cli.device}, headless={args_cli.headless}")
+log(f"[Minimal] Launching Isaac Sim: device={args_cli.device}, headless={args_cli.headless}")
 app_launcher = AppLauncher(args_cli)
-log("[SMOKE] AppLauncher constructed; retrieving simulation_app...")
 simulation_app = app_launcher.app
-log("[SMOKE] simulation_app is ready.")
+log("[Minimal] Isaac Sim ready.")
 
 # ── After Isaac Sim is running ──────────────────────────────────────────
 import torch
@@ -148,7 +135,7 @@ from plot_results import load_and_plot
 from push_controller import PushController
 from results_io import ResultsStore, TrialResult
 
-log("[SMOKE] Isaac Sim running, importing modules...")
+log("[Minimal] Building environment...")
 
 # ── Minimal env build ───────────────────────────────────────────────────
 task_entry = gym.envs.registry[args_cli.task]
@@ -220,9 +207,7 @@ if motion_cfg is not None:
         if hasattr(motion_cfg, attr):
             setattr(motion_cfg, attr, zero)
 
-log("[SMOKE] Creating env...")
 env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-log("[SMOKE] gym.make returned.")
 if args_cli.video:
     video_kwargs = {
         "video_folder": os.path.join(os.path.dirname(args_cli.checkpoint), "videos", "run_minimal"),
@@ -232,7 +217,7 @@ if args_cli.video:
     }
     env = gym.wrappers.RecordVideo(env, **video_kwargs)
 env = RslRlVecEnvWrapper(env)
-log(f"[SMOKE] Env created: {env.num_envs} envs")
+log(f"[Minimal] Env created: {env.num_envs} envs")
 
 # ── Load GMT ────────────────────────────────────────────────────────────
 from whole_body_tracking.tasks.tracking.config.g1.agents.rsl_rl_ppo_cfg import G1FlatPPORunnerCfg
@@ -241,7 +226,7 @@ agent_cfg = G1FlatPPORunnerCfg()
 runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=args_cli.device)
 runner._move_normalizer_to_device(args_cli.device)
 runner.load(args_cli.checkpoint, load_optimizer=False, load_critic=False)
-log("[SMOKE] GMT loaded")
+log("[Minimal] GMT loaded")
 
 env_unwrapped = env.unwrapped
 robot = env_unwrapped.scene["robot"]
@@ -327,14 +312,14 @@ meta = {
 store = ResultsStore(meta)
 
 log(
-    f"[SMOKE] Tiny validation: eps={EPSILON_VALUES}, pushes={PUSH_VELOCITIES}, "
+    f"[Minimal] Tiny validation: eps={EPSILON_VALUES}, pushes={PUSH_VELOCITIES}, "
     f"trials={args_cli.num_trials}, settle={args_cli.settle_steps}, observe={args_cli.observe_steps}"
 )
 num_batches = (args_cli.num_trials + env.num_envs - 1) // env.num_envs
 for ei, epsilon in enumerate(EPSILON_VALUES):
     for pi, delta_v in enumerate(PUSH_VELOCITIES):
         all_results = []
-        log(f"[SMOKE] Condition epsilon={epsilon:.3f}, push={delta_v:.2f}")
+        log(f"[Minimal] Condition epsilon={epsilon:.3f}, push={delta_v:.2f}")
         for _ in range(num_batches):
             all_results.extend(_run_tiny_condition(epsilon, delta_v))
             if len(all_results) >= args_cli.num_trials:
@@ -352,8 +337,7 @@ output_dir = os.path.join(
 store.save(output_dir)
 load_and_plot(output_dir)
 
-log(f"[SMOKE] Tiny validation pipeline OK. Results: {output_dir}")
+log(f"[Minimal] Tiny validation pipeline OK. Results: {output_dir}")
 env.close()
 simulation_app.close()
-faulthandler.cancel_dump_traceback_later()
-log("[SMOKE] Done.")
+log("[Minimal] Done.")

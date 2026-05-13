@@ -9,6 +9,8 @@
 import os
 import argparse
 import sys
+import faulthandler
+import signal
 
 os.environ.setdefault("WANDB_SILENT", "true")
 # Redirect wandb local run files to HDD to avoid filling /home
@@ -59,6 +61,11 @@ cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+
+faulthandler.enable()
+if hasattr(signal, "SIGUSR1"):
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    print("[DEBUG] Registered SIGUSR1 stack dump. Use: kill -USR1 <pid>", flush=True)
 
 if WORLD_SIZE > 1:
     args_cli.distributed = True

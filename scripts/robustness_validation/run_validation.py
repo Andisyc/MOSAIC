@@ -52,7 +52,6 @@ OUTPUT_DIR = "verify/robustness_validation"
 # ════════════════════════════════════════════════════════════════════════════
 
 import argparse
-import faulthandler
 import os
 import sys
 from pathlib import Path
@@ -105,8 +104,6 @@ parser.add_argument("--num_envs",   type=int, default=N_PARALLEL,
 parser.add_argument("--num_trials", type=int, default=N_TRIALS,
                     help="Total trials per condition.")
 parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR)
-parser.add_argument("--startup_timeout", type=int, default=30,
-                    help="Dump Python stack traces every N seconds while diagnosing hangs. Use 0 to disable.")
 # --device / --headless are added by AppLauncher.add_app_launcher_args below
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -133,10 +130,6 @@ def _resolve_motion_input(path: str, file_glob: str) -> tuple[str, str, str]:
 args_cli.motion_dir, args_cli.motion_file_glob, args_cli.motion_original = _resolve_motion_input(
     args_cli.motion, args_cli.file_glob
 )
-
-if args_cli.startup_timeout > 0:
-    faulthandler.enable()
-    faulthandler.dump_traceback_later(args_cli.startup_timeout, repeat=True)
 
 if (
     sys.platform.startswith("linux")
@@ -576,7 +569,6 @@ if __name__ == "__main__":
     try:
         main()
     finally:
-        faulthandler.cancel_dump_traceback_later()
         simulation_app.close()
         # Isaac Sim background GPU threads don't exit on simulation_app.close().
         # os._exit() bypasses Python cleanup and terminates the process immediately,

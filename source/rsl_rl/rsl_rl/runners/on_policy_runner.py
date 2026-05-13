@@ -407,11 +407,22 @@ class OnPolicyRunner:
             teacher_obs = teacher_obs.to(self.device)
         else:
             teacher_obs = privileged_obs
+        print(
+            f"[Runner] Initial obs moved to device: obs={tuple(obs.shape)} {obs.device}, "
+            f"priv={tuple(privileged_obs.shape)} {privileged_obs.device}, "
+            f"teacher={tuple(teacher_obs.shape)} {teacher_obs.device}",
+            flush=True,
+        )
         
         # Initialize ref_vel_estimator observations (NO normalization!) 速度估计器
         ref_vel_estimator_obs = obs_dict.get(self.ref_vel_estimator_obs_type)
         if ref_vel_estimator_obs is not None:
             ref_vel_estimator_obs = ref_vel_estimator_obs.to(self.device)
+            print(
+                f"[Runner] ref_vel_estimator_obs moved: "
+                f"{tuple(ref_vel_estimator_obs.shape)} {ref_vel_estimator_obs.device}",
+                flush=True,
+            )
 
         # For Stage 1: save raw obs BEFORE obs_normalizer for GMT ONNX input.
         # The exported ONNX includes the normalizer in the computation graph, so
@@ -420,13 +431,19 @@ class OnPolicyRunner:
             obs_raw_for_gmt = obs.clone()
 
         # Normalize initial observations (same as in training loop) 观测归一器
+        print("[Runner] Applying obs normalizer...", flush=True)
         obs = self._apply_obs_normalizer(obs) # 三种观测量分别使用不同观测归一器
+        print("[Runner] Policy obs normalized.", flush=True)
 
         # 使用观测量归一化器对观测量进行处理
+        print("[Runner] Applying privileged/teacher normalizers...", flush=True)
         privileged_obs = self.privileged_obs_normalizer(privileged_obs)
         teacher_obs = self.teacher_obs_normalizer(teacher_obs)
+        print("[Runner] Privileged/teacher obs normalized.", flush=True)
 
+        print("[Runner] Switching modules to train mode...", flush=True)
         self.train_mode() # switch to train mode (for dropout for example)
+        print("[Runner] Train mode set.", flush=True)
 
         # Book keeping
         ep_infos = []
@@ -455,6 +472,7 @@ class OnPolicyRunner:
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
+            print(f"[Runner] Parameter synchronization complete for rank {self.gpu_global_rank}.", flush=True)
             # TODO: Do we need to synchronize empirical normalizers?
             #   Right now: No, because they all should converge to the same values "asymptotically".
 
@@ -640,6 +658,11 @@ class OnPolicyRunner:
                 print(f"[Runner] Warmup checkpoint saved to {warmup_path}")
         # ── END supervised warmup ─────────────────────────────────────────────────
 
+        print(
+            f"[Runner] Entering PPO loop: start_iter={start_iter}, "
+            f"tot_iter={tot_iter}, steps_per_env={self.num_steps_per_env}",
+            flush=True,
+        )
         for it in range(start_iter, tot_iter):
             start = time.time()
 
