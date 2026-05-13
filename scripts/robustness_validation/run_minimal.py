@@ -52,8 +52,7 @@ env_cfg_cls.__post_init__ = _safe_post_init
 
 env_cfg = env_cfg_cls()
 env_cfg.scene.num_envs = 1
-env_cfg.commands.motion.motion_file = args_cli.motion
-env_cfg.commands.motion.motion = args_cli.motion
+env_cfg.commands.motion.motion = args_cli.motion   # MotionCommandCfg 的正确字段名
 
 # Disable timeout
 if hasattr(env_cfg, "terminations") and hasattr(env_cfg.terminations, "time_out"):
