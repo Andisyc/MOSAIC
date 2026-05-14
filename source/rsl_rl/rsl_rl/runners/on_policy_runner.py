@@ -1246,28 +1246,47 @@ class OnPolicyRunner:
                             _dr_xy_fr   = _a_raw[:N_train, :2] - _a_w[:N_train, :2]
                             _corr_xy_fr = _a_fr[:N_train,  :2] - _a_raw[:N_train, :2]
                             _r_xy = _r_vec(_dr_xy_fr, _corr_xy_fr)
-                            # Roll/Pitch
-                            _e_raw = quat_error_magnitude(_q_raw[:N_train], _q_w[:N_train])
-                            _e_fr  = quat_error_magnitude(_q_fr[:N_train],  _q_w[:N_train])
+                            def _quat_to_rpy_xyzw(q: torch.Tensor):
+                                # IsaacLab tensors here are xyzw. Keep yaw separate below so
+                                # roll/pitch reward does not double-count heading errors.
+                                x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+                                roll = torch.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+                                pitch_arg = 2.0 * (w * y - z * x)
+                                pitch = torch.asin(torch.clamp(pitch_arg, -1.0, 1.0))
+                                yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+                                return roll, pitch, yaw
+
+                            def _wrap_pi(a: torch.Tensor):
+                                return torch.atan2(torch.sin(a), torch.cos(a))
+
+                            # Roll/Pitch only.  The previous full-quaternion error also
+                            # included yaw, which made the 0.4 RP term dominate r_delta.
+                            _roll_raw, _pitch_raw, _yaw_raw = _quat_to_rpy_xyzw(_q_raw[:N_train])
+                            _roll_fr,  _pitch_fr,  _yaw_fr  = _quat_to_rpy_xyzw(_q_fr[:N_train])
+                            _roll_w,   _pitch_w,   _yaw_w   = _quat_to_rpy_xyzw(_q_w[:N_train])
+                            _rp_raw = torch.stack(
+                                [_wrap_pi(_roll_raw - _roll_w), _wrap_pi(_pitch_raw - _pitch_w)], dim=-1
+                            )
+                            _rp_fr = torch.stack(
+                                [_wrap_pi(_roll_fr - _roll_w), _wrap_pi(_pitch_fr - _pitch_w)], dim=-1
+                            )
+                            _e_raw = _rp_raw.norm(dim=-1)
+                            _e_fr  = _rp_fr.norm(dim=-1)
                             _r_rp = _e_raw - _e_fr
                             # Yaw
-                            _yaw_raw = torch.atan2(2*(_q_raw[:N_train,0]*_q_raw[:N_train,3] + _q_raw[:N_train,1]*_q_raw[:N_train,2]),
-                                                    1-2*(_q_raw[:N_train,2]**2 + _q_raw[:N_train,3]**2))
-                            _yaw_fr  = torch.atan2(2*(_q_fr[:N_train,0]*_q_fr[:N_train,3] + _q_fr[:N_train,1]*_q_fr[:N_train,2]),
-                                                    1-2*(_q_fr[:N_train,2]**2 + _q_fr[:N_train,3]**2))
-                            _yaw_w   = torch.atan2(2*(_q_w[:N_train,0]*_q_w[:N_train,3] + _q_w[:N_train,1]*_q_w[:N_train,2]),
-                                                    1-2*(_q_w[:N_train,2]**2 + _q_w[:N_train,3]**2))
-                            _r_ya = _r_axis(_yaw_raw - _yaw_w, _yaw_fr - _yaw_raw)
+                            _yaw_err_raw = _wrap_pi(_yaw_raw - _yaw_w)
+                            _yaw_corr = _wrap_pi(_yaw_fr - _yaw_raw)
+                            _r_ya = _r_axis(_yaw_err_raw, _yaw_corr)
 
-                            _r_step = 0.3*_r_z + 0.2*_r_xy + 0.4*_r_rp + 0.05*_r_ya
+                            _r_step = 0.3*_r_z + 0.3*_r_xy + 0.15*_r_rp + 0.02*_r_ya
                             _dr_z_abs_log = _dr_z_fr.abs().mean()
                             _dr_xy_abs_log = _dr_xy_fr.norm(dim=-1).mean()
                             _dr_rp_abs_log = _e_raw.mean()
-                            _dr_yaw_abs_log = (_yaw_raw - _yaw_w).abs().mean()
+                            _dr_yaw_abs_log = _yaw_err_raw.abs().mean()
                             _corr_z_abs_log = _corr_z_fr.abs().mean()
                             _corr_xy_abs_log = _corr_xy_fr.norm(dim=-1).mean()
                             _corr_rp_abs_log = (_e_fr - _e_raw).abs().mean()
-                            _corr_yaw_abs_log = (_yaw_fr - _yaw_raw).abs().mean()
+                            _corr_yaw_abs_log = _yaw_corr.abs().mean()
 
                             # ── r_rescue ─────────────────────────────────
                             _n_pair = min(N_train, N_base)
@@ -1956,8 +1975,10 @@ class OnPolicyRunner:
         is_full_resume: bool = self.cfg.get('is_full_resume', True)
         if not is_full_resume:
             load_optimizer = False   # 权重迁移模式：强制跳过优化器，从零初始化 Adam
+            load_critic = False      # reward definition may change; critic must relearn V(s)
         print(f"[Runner] is_full_resume={is_full_resume} → "
-              f"load_optimizer={load_optimizer}, reset_noise_std={not is_full_resume}")
+              f"load_optimizer={load_optimizer}, load_critic={load_critic}, "
+              f"reset_noise_std={not is_full_resume}")
 
         # Check if using ResidualActorCritic (special handling)
         if isinstance(self.alg.policy, (ResidualActorCritic, FrontRESActorCritic)):
@@ -2104,7 +2125,11 @@ class OnPolicyRunner:
                     self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         # -- load current learning iteration
         if resumed_training:
-            self.current_learning_iteration = loaded_dict["iter"]
+            if is_full_resume:
+                self.current_learning_iteration = loaded_dict["iter"]
+            else:
+                self.current_learning_iteration = 0
+                print("[Runner] Stage1→Stage2 cold-start: current_learning_iteration reset to 0.")
 
         # ── 噪声 std 控制 ──────────────────────────────────────────────────────────
         # is_full_resume=True:  保留 checkpoint 中已自然适应的 std（断点续训）
