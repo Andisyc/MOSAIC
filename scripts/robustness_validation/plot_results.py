@@ -13,6 +13,7 @@ Multiple motions (aggregated):
 from __future__ import annotations
 import argparse
 import os
+from pathlib import Path
 
 import numpy as np
 import matplotlib
@@ -50,6 +51,25 @@ def load_and_plot(results_dir: str, output_dir: str | None = None) -> None:
     load_and_plot_multi([results_dir], motion_names=None, output_dir=output_dir)
 
 
+def _validate_results_dir(path: str) -> str:
+    """Validate a results directory and return its normalized path."""
+
+    p = Path(path).expanduser()
+    if not p.is_dir():
+        raise NotADirectoryError(f"Expected a results directory, got: {path}")
+
+    missing = [
+        name
+        for name in ("meta.json", "results_raw.npz")
+        if not (p / name).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"Result directory {p} is missing required file(s): {', '.join(missing)}"
+        )
+    return str(p)
+
+
 def load_and_plot_multi(
     results_dirs: list[str],
     motion_names: list[str] | None = None,
@@ -64,19 +84,21 @@ def load_and_plot_multi(
         - Mean across motions as thick solid line with ±1 std shading.
         - Heatmap shows mean recovery rate.
     """
+    result_dirs = [_validate_results_dir(path) for path in results_dirs]
+
     if output_dir is None:
         # Default: sibling "figures" folder next to the first results dir
-        output_dir = os.path.join(os.path.dirname(results_dirs[0]), "figures_combined")
+        output_dir = os.path.join(os.path.dirname(result_dirs[0]), "figures_combined")
     os.makedirs(output_dir, exist_ok=True)
 
     # Assign default motion names if not provided
     if motion_names is None:
-        motion_names = [os.path.basename(d) for d in results_dirs]
+        motion_names = [os.path.basename(d) for d in result_dirs]
 
     # Load stores + summaries
     named_summaries: list[tuple[str, dict]] = []
     meta = None
-    for name, d in zip(motion_names, results_dirs):
+    for name, d in zip(motion_names, result_dirs):
         store = ResultsStore.load(d)
         named_summaries.append((name, store.to_summary()))
         if meta is None:
@@ -84,7 +106,7 @@ def load_and_plot_multi(
 
     # Merge into aggregated summary
     merged = ResultsStore.merge_summaries(named_summaries)
-    multi_mode = len(results_dirs) > 1
+    multi_mode = len(result_dirs) > 1
 
     plot_recovery_curve(merged, meta, output_dir, multi_mode=multi_mode)
     plot_zmp_mechanism(merged, meta, output_dir, multi_mode=multi_mode)
@@ -438,7 +460,7 @@ if __name__ == "__main__":
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--results_dir",  type=str,
-                       help="Single results directory.")
+                       help="Single results directory containing meta.json and results_raw.npz.")
     group.add_argument("--results_dirs", type=str, nargs="+",
                        help="Multiple results directories (one per motion sequence).")
 
