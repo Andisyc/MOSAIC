@@ -3,6 +3,7 @@ from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg
 from whole_body_tracking.utils.rsl_rl_cfg import (
     RslRlMOSAICAlgorithmCfg,
+    RslRlFrontRESUnifiedAlgorithmCfg,
     RslRlResidualActorCriticCfg,
     RslRlFrontResidualActorCriticCfg,
     RslRlPpoActorCriticWithRefVelSkipCfg,
@@ -472,23 +473,28 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # ── Fix 2: Low-pass filter on anchor corrections ──────────────────────────
     correction_smooth_alpha        = 0.4
 
-    # ── Adaptive DR: r_delta-sign PI controller ──────────────────────────────
     # ── Supervised warmup: pure HuberLoss before PPO loop ──────────────────
-    supervised_warmup_iterations   = 500    # train Δ with full DR before PPO
+    # Give FrontRES enough supervised exposure to learn the correction
+    # direction before PPO sees r_delta.  PPO still keeps an online supervised
+    # anchor afterwards, so the transition is gradual rather than a hard switch.
+    supervised_warmup_iterations   = 300
+    supervised_warmup_steps_per_iter = 8
+    supervised_warmup_max_envs_per_step = 4096
+    supervised_warmup_dr_scale      = 0.75
     supervised_warmup_lr           = 1e-4
-    supervised_warmup_epochs       = 5
+    supervised_warmup_epochs       = 3
 
     # ── Adaptive DR: r_delta-sign PI controller ────────────────────────────
-    dr_scale_init                  = 1.0    # match warmup DR level — no Δ adjustment gap
-    dr_adapt_speed                 = 0.002  # per-iteration step size
+    dr_scale_init                  = 0.3    # start RL easier than warmup; critic sees lower-variance r_delta first
+    dr_adapt_speed                 = 0.001  # per-iteration step size
     dr_max_scale                   = 4.0    # upper limit
-    dr_min_scale                   = 0.20   # lower limit must beat σ noise floor (15mm)
+    dr_min_scale                   = 0.10   # lower limit must beat σ noise floor (15mm)
     dr_ema_alpha                   = 0.95   # r_delta EMA smoothing
 
     # ── Task-space correction ramp ────────────────────────────────────────────
-    # Alpha must be 1.0 from the start so oracle corrections reach full magnitude.
-    # Warmup still protects the critic: actor updates (PPO) frozen for 500 iters,
-    # but oracle still applies corrections and supervised loss still trains FrontRES.
+    # Alpha must be 1.0 from the start so task-space corrections reach the
+    # command term.  Stability is handled by conservative projection, confidence,
+    # supervised warmup, and low initial DR scale.
     # ── IID step-jump perturbation probabilities (per-axis, per-step) ──────
     # Z needs IID because GMT leg suspension absorbs OU float completely.
     # XY benefits from both OU (drift) and IID (rescue signal).
@@ -502,13 +508,20 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     iid_std_rp                     = 0.05   # RP jump std (rad)
     iid_std_ya                     = 0.05   # Yaw jump std (rad)
 
-    # ── Critic warmup: DR=0, Actor active ────────────────────────────────────
-    critic_warmup_iterations       = 0      # no DR=0 dead zone; Δ is warmup-initialised
+    # ── Critic warmup: fixed DR=dr_scale_init, Actor active ──────────────────
+    critic_warmup_iterations       = 150    # hold dr_scale_init before PI kicks in
+
+    # ── DR PI controller, velocity form (Phase 3) ────────────────────────────
+    # Δu = Kp×(e−e_prev) + Ki×e  →  dr_scale += Δu
+    # Stays constant at error=0; no double-integration risk.
+    dr_target_r_delta              = 0.01   # target r_delta/step; PI tracks this level
+    dr_p_gain                      = 0.10   # P: reacts to error change (damping)
+    dr_i_gain                      = 0.01   # I: reacts to error level  (steady-state)
 
     # 两台服务器上的 MOSAIC 根目录（不含实验子目录）
     candidate_gmt_paths = [
-        "/home/yuxuancheng/MOSAIC/model/model_27000.pt",
-        "/hdd1/cyx/MOSAIC/model/model_27000.pt",
+        "/home/yuxuancheng/MOSAIC/model/model_27000.pt", # SUST_Main_1
+        "/hdd1/cyx/MOSAIC/model/model_27000.pt", # SUST_Main_2
     ]
 
     # 自动选择第一个真实存在的路径
@@ -546,7 +559,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         max_delta_q            = 0.5,
     )
 
-    algorithm = RslRlMOSAICAlgorithmCfg(
+    algorithm = RslRlFrontRESUnifiedAlgorithmCfg(
         # ── Mode ─────────────────────────────────────────────────────────────
         hybrid  = True,
         use_ppo = True,
@@ -574,22 +587,10 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         lambda_supervised_decay       = 0.997, # per-iter decay after trigger
         supervised_trigger_cosine_sim = 0.85,  # EMA threshold to start decay
         supervised_rpy_loss_weight    = 1.0,
-
-        # ── Teacher / off-policy BC (disabled by default) ────────────────────
-        teacher_checkpoint_path  = None,
-        lambda_teacher_init      = 0.0,
-        lambda_teacher_decay     = 1.0,
-        lambda_teacher_min       = 0.0,
-        expert_trajectory_path   = None,
-        lambda_off_policy        = 0.0,
-        lambda_off_policy_decay  = 1.0,
-        lambda_off_policy_min    = 0.0,
+        supervised_conf_loss_weight   = 0.0,   # BCE drives c→1 always (OU≠0); let PPO learn gating
 
         # ── Misc ─────────────────────────────────────────────────────────────
         gradient_accumulation_steps    = 1,
-        teacher_critic_checkpoint_path = None,
-        teacher_critic_frozen          = False,
-        train_critic_during_distillation = False,
         use_estimate_ref_vel           = False,
         ref_vel_estimator_checkpoint_path = None,
         ref_vel_estimator_type         = "mlp",

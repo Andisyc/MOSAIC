@@ -13,7 +13,7 @@ import torch
 from collections import deque
 
 import rsl_rl
-from rsl_rl.algorithms import PPO, Distillation, MOSAIC
+from rsl_rl.algorithms import PPO, Distillation, MOSAIC, FrontRESUnified
 from whole_body_tracking.utils.supervise import SuperviseTrainer
 from rsl_rl.modules.supervise_learning import SuperviseLearning
 from rsl_rl.env import VecEnv
@@ -52,6 +52,8 @@ class OnPolicyRunner:
             self.training_type = "rl"
         elif self.alg_cfg["class_name"] == "MOSAIC":
             self.training_type = "mosaic"  # MOSAIC has its own training type with teacher action storage
+        elif self.alg_cfg["class_name"] == "FrontRESUnified":
+            self.training_type = "frontres"
         elif self.alg_cfg["class_name"] == "Distillation":
             self.training_type = "distillation"
         elif self.alg_cfg["class_name"] == "SuperviseTrainer":
@@ -79,17 +81,17 @@ class OnPolicyRunner:
                 self.privileged_obs_type = "critic"  # actor-critic reinforcement learning, e.g., PPO
             else:
                 self.privileged_obs_type = None
-        elif self.training_type == "mosaic":
+        elif self.training_type in ("mosaic", "frontres"):
             # MOSAIC uses critic observations for value function when available.
             # Teacher observations are handled separately for teacher BC.
             has_teacher_obs = "teacher" in obs_dict
             has_critic_obs = "critic" in obs_dict
             if has_critic_obs:
                 self.privileged_obs_type = "critic"
-                print(f"[MOSAIC] Using 'critic' observations for value estimation.")
+                print(f"[{self.alg_cfg['class_name']}] Using 'critic' observations for value estimation.")
             elif has_teacher_obs:
                 self.privileged_obs_type = "teacher"
-                print(f"[MOSAIC] Using 'teacher' observations for value estimation (no critic obs available).")
+                print(f"[{self.alg_cfg['class_name']}] Using 'teacher' observations for value estimation (no critic obs available).")
             else:
                 self.privileged_obs_type = None
         elif self.training_type == "distillation":
@@ -135,7 +137,7 @@ class OnPolicyRunner:
         # Check if using ResidualActorCritic (special handling for estimator dimension)
         is_residual_policy = policy_class in [ResidualActorCritic, FrontRESActorCritic]
 
-        if self.training_type == "mosaic" and self.alg_cfg.get("use_estimate_ref_vel", False):
+        if self.training_type in ("mosaic", "frontres") and self.alg_cfg.get("use_estimate_ref_vel", False):
             if not is_residual_policy:
                 # For normal ActorCritic: adjust input dimension to include estimated ref_vel
                 num_actor_obs += 3  # Add 3 dimensions for estimated reference velocity (x, y, z)
@@ -173,7 +175,7 @@ class OnPolicyRunner:
         # initialize algorithm 实例化训练方式
         alg_class_name = self.alg_cfg.pop("class_name")
         alg_class = eval(alg_class_name)
-        self.alg: PPO | Distillation | MOSAIC = alg_class(
+        self.alg: PPO | Distillation | MOSAIC | FrontRESUnified = alg_class(
             policy,
             device=self.device,
             **self.alg_cfg,
@@ -261,19 +263,21 @@ class OnPolicyRunner:
                 print("[Runner] Using teacher observation normalizer from checkpoint (frozen)")
             # else: keep the EmpiricalNormalization created above
 
-        # For MOSAIC, pass obs_normalizer and privileged_obs_normalizer for teacher BC 学生观测量&特权信息归一器
-        if alg_class_name == "MOSAIC":
+        # MOSAIC needs these for teacher BC; FrontRESUnified uses them for its
+        # own supervised auxiliary loss and checkpoint resume path.
+        if alg_class_name in ("MOSAIC", "FrontRESUnified"):
             self.alg.obs_normalizer = self.obs_normalizer
             self.alg.privileged_obs_normalizer = self.privileged_obs_normalizer
-            print("[Runner] Passed obs_normalizer and privileged_obs_normalizer to MOSAIC for teacher BC")
+            print(f"[Runner] Passed obs_normalizer and privileged_obs_normalizer to {alg_class_name}")
 
-            # Pass environment's group mapping to MOSAIC for multi-teacher consistency
+            # Pass environment's group mapping for multi-teacher consistency in MOSAIC
+            # and paired motion bookkeeping in FrontRESUnified.
             env = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
             if hasattr(env, 'command_manager') and 'motion' in env.command_manager._terms:
                 motion_command = env.command_manager._terms['motion']
                 if hasattr(motion_command, 'group_name_to_idx'):
                     self.alg.env_group_name_to_idx = motion_command.group_name_to_idx
-                    print(f"[Runner] Passed environment's group mapping to MOSAIC: {self.alg.env_group_name_to_idx}")
+                    print(f"[Runner] Passed environment's group mapping to {alg_class_name}: {self.alg.env_group_name_to_idx}")
 
             # If MOSAIC loaded a teacher critic normalizer, use it for privileged obs
             if hasattr(self.alg, "teacher_critic_normalizer") and self.alg.teacher_critic_normalizer is not None:
@@ -281,7 +285,7 @@ class OnPolicyRunner:
                 print("[Runner] Using teacher critic normalizer for privileged observations")
 
         # init storage and model
-        if self.training_type == "mosaic":
+        if self.training_type in ("mosaic", "frontres"):
             # For FrontRESActorCritic in task-space mode, the "action" stored in the
             # rollout buffer is 6-dim SE(3) correction [Δpos, Δrpy], NOT 29-dim robot joints.
             _mosaic_action_dim = getattr(policy, 'total_output_dim', None) or self.env.num_actions
@@ -292,7 +296,11 @@ class OnPolicyRunner:
                 [num_obs],
                 [num_privileged_obs],
                 [_mosaic_action_dim],
-                teacher_obs_shape=[num_teacher_obs] if num_teacher_obs is not None else None,
+                teacher_obs_shape=(
+                    [num_teacher_obs]
+                    if self.training_type == "mosaic" and num_teacher_obs is not None
+                    else None
+                ),
                 ref_vel_estimator_obs_shape=[num_ref_vel_estimator_obs] if self.ref_vel_estimator_obs_type is not None else None,)
         elif self.training_type == "supervise":
             # action_shape must match the supervision target dim (num_privileged_obs),
@@ -514,7 +522,16 @@ class OnPolicyRunner:
             N_train = self.env.num_envs // 2
             N_base  = self.env.num_envs - N_train
             print(f"[Runner] FrontRES B1 delta-reward: "
-                  f"{N_train} training envs (FrontRES) + {N_base} baseline envs (GMT-only)")
+                  f"{N_train} training envs (FrontRES) + {N_base} baseline envs (GMT-only)",
+                  flush=True)
+            _env_pair = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+            if hasattr(_env_pair, 'command_manager') and 'motion' in _env_pair.command_manager._terms:
+                _mcmd_pair = _env_pair.command_manager._terms['motion']
+                if hasattr(_mcmd_pair, 'set_frontres_paired_baseline'):
+                    _mcmd_pair.set_frontres_paired_baseline(N_train)
+                    print("[Runner] FrontRES B1 paired baseline enabled: "
+                          "env i and env i+N_train share motion/frame/perturbation",
+                          flush=True)
             # Separate cumulative reward tracker for GMT envs (raw GMT reward, for logging only).
             # We zero GMT rewards in the PPO storage so V(s) only learns from FrontRES r_delta.
             # GMT raw rewards must be tracked separately before they are zeroed.
@@ -534,13 +551,11 @@ class OnPolicyRunner:
             # The ep_len_gmt≈10 root cause was the obs ordering bug (anchor errors at
             # [0:30] instead of [770:800]), which has been fixed separately.
 
-        # ── Adaptive DR: r_delta-sign PI controller ──────────────────────────
-        # Adjusts dr_scale based on whether FrontRES is helping (r_delta > 0).
-        #   r_delta_ema > 0 → dr_scale += speed  (FrontRES helps → harder)
-        #   r_delta_ema < 0 → dr_scale -= speed  (FrontRES hurts → easier)
-        # Replaces the old survival-based controller: with confidence-gated
-        # corrections, survival stays high regardless of learning progress.
-        _dr_speed       = float(self.cfg.get("dr_adapt_speed",  0.002))
+        # ── Adaptive DR: PI controller ────────────────────────────────────────
+        # Tracks dr_target_r_delta performance level.
+        #   error = r_delta_ema - dr_target_r_delta
+        #   error > 0: FrontRES above target → increase DR (harder)
+        #   error < 0: FrontRES below target → decrease DR (easier)
         _dr_max         = float(self.cfg.get("dr_max_scale",    4.0))
         _dr_min         = float(self.cfg.get("dr_min_scale",    0.0))
         _dr_ema_alpha   = float(self.cfg.get("dr_ema_alpha",    0.95))
@@ -583,15 +598,50 @@ class OnPolicyRunner:
                     iid_std_ya           = float(getattr(_pt, 'iid_std_ya',           0.0)),
                 )
                 print(
-                    f"[Runner] Adaptive DR (r_delta-sign PI): "
-                    f"speed={_dr_speed}, max_scale={_dr_max}, "
-                    f"ema_alpha={_dr_ema_alpha}, "
-                    f"base float_ratio={_perturb_target.float_ratio:.3f}m, "
-                    f"base root_tilt={_perturb_target.root_tilt_max_rad:.3f}rad, "
+                    f"[Runner] Adaptive DR (PI controller): "
+                    f"Kp={self.cfg.get('dr_p_gain', 0.10)}, "
+                    f"Ki={self.cfg.get('dr_i_gain', 0.01)}, "
+                    f"target_r_delta={self.cfg.get('dr_target_r_delta', 0.01)}, "
+                    f"max_scale={_dr_max}, ema_alpha={_dr_ema_alpha}, "
                     f"resume dr_scale={_dr_scale:.3f}"
                 )
             else:
                 print("[Runner] WARNING: FrontRES DR enabled but env.cfg.motion_perturbations not found")
+
+        def _apply_frontres_dr_scale(scale: float) -> None:
+            if not (_is_frontres and _perturb_target is not None):
+                return
+            _env_raw = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+            if not (hasattr(_env_raw, 'command_manager') and 'motion' in _env_raw.command_manager._terms):
+                return
+            _mcmd = _env_raw.command_manager._terms['motion']
+            if not hasattr(_mcmd, 'perturber'):
+                return
+
+            def _pt(attr, default=0.0):
+                return getattr(_perturb_target, attr, default)
+
+            _mcmd.perturber.cfg.float_prob          = _pt('float_prob')
+            _mcmd.perturber.cfg.float_ratio         = _pt('float_ratio')         * scale
+            _mcmd.perturber.cfg.sink_prob           = _pt('sink_prob')
+            _mcmd.perturber.cfg.sink_ratio          = _pt('sink_ratio')          * scale
+            _mcmd.perturber.cfg.foot_slip_prob      = _pt('foot_slip_prob')
+            _mcmd.perturber.cfg.foot_slip_ratio     = _pt('foot_slip_ratio')     * scale
+            _mcmd.perturber.cfg.lateral_drift_prob  = _pt('lateral_drift_prob')
+            _mcmd.perturber.cfg.lateral_drift_std   = _pt('lateral_drift_std')   * scale
+            _mcmd.perturber.cfg.root_tilt_prob      = _pt('root_tilt_prob')
+            _mcmd.perturber.cfg.root_tilt_max_rad   = _pt('root_tilt_max_rad')   * scale
+            _mcmd.perturber.cfg.joint_noise_prob    = _pt('joint_noise_prob')
+            _mcmd.perturber.cfg.joint_noise_std     = _pt('joint_noise_std')     * scale
+            _mcmd.perturber.cfg.iid_prob_z          = _pt('iid_prob_z')
+            _mcmd.perturber.cfg.iid_std_z           = _pt('iid_std_z')           * scale
+            _mcmd.perturber.cfg.iid_prob_xy         = _pt('iid_prob_xy')
+            _mcmd.perturber.cfg.iid_std_xy          = _pt('iid_std_xy')          * scale
+            _mcmd.perturber.cfg.iid_prob_rp         = _pt('iid_prob_rp')
+            _mcmd.perturber.cfg.iid_std_rp          = _pt('iid_std_rp')          * scale
+            _mcmd.perturber.cfg.iid_prob_ya         = _pt('iid_prob_ya')
+            _mcmd.perturber.cfg.iid_std_ya          = _pt('iid_std_ya')          * scale
+            _mcmd.perturber._dr_scale = float(scale)
 
         # ── FrontRES supervised warmup (Stage 1 → Stage 2 merge) ──────────────────
         # Runs BEFORE the PPO loop. Teaches FrontRES to detect perturbations via
@@ -599,11 +649,21 @@ class OnPolicyRunner:
         # After warmup, PPO fine-tunes with r_delta reward (same architecture, same obs).
         _warmup_iters = int(self.cfg.get("supervised_warmup_iterations", 0))
         if start_iter > 0 and _warmup_iters > 0:
-            print(f"[Runner] Resuming from iter {start_iter} — skipping supervised warmup")
+            print(f"[Runner] Resuming from iter {start_iter} — skipping supervised warmup", flush=True)
+            _warmup_iters = 0
+        if getattr(self, "_frontres_warmup_complete", False) and _warmup_iters > 0:
+            print("[Runner] Loaded a completed FrontRES warmup checkpoint — skipping supervised warmup",
+                  flush=True)
             _warmup_iters = 0
         if _is_frontres and _warmup_iters > 0:
+            _warmup_dr_scale = float(self.cfg.get("supervised_warmup_dr_scale", _dr_scale_init))
+            _apply_frontres_dr_scale(_warmup_dr_scale)
             _warmup_lr     = float(self.cfg.get("supervised_warmup_lr", 1e-4))
             _warmup_epochs = int(self.cfg.get("supervised_warmup_epochs", 5))
+            _warmup_steps  = int(self.cfg.get("supervised_warmup_steps_per_iter", self.num_steps_per_env))
+            _warmup_steps  = max(1, min(_warmup_steps, self.num_steps_per_env))
+            _warmup_max_envs = int(self.cfg.get("supervised_warmup_max_envs_per_step", self.env.num_envs))
+            _warmup_max_envs = max(1, min(_warmup_max_envs, self.env.num_envs))
             _warmup_opt = torch.optim.Adam(
                 self.alg.policy.residual_actor.parameters(), lr=_warmup_lr)
             _warmup_loss_fn = torch.nn.HuberLoss(delta=1.0)
@@ -618,18 +678,22 @@ class OnPolicyRunner:
                 _nfo = self.alg.policy.num_actor_obs  # use full obs when no subset configured
 
             print(f"[Runner] === Supervised warmup: {_warmup_iters} iters "
-                  f"(lr={_warmup_lr}, epochs={_warmup_epochs}, "
-                  f"frontres_input={_nfo} dims) ===")
+                  f"(dr_scale={_warmup_dr_scale}, lr={_warmup_lr}, epochs={_warmup_epochs}, "
+                  f"steps_per_iter={_warmup_steps}, "
+                  f"max_envs_per_step={_warmup_max_envs}, "
+                  f"frontres_input={_nfo} dims) ===",
+                  flush=True)
 
             for _wu in range(_warmup_iters):
                 _wo_list: list[torch.Tensor] = []
                 _wt_list: list[torch.Tensor] = []
 
                 with torch.inference_mode():
-                    for _ in range(self.num_steps_per_env):
+                    for _ in range(_warmup_steps):
                         obs, extras = self.env.get_observations()
                         obs_dict = extras.get("observations", {})
-                        _p_obs = obs_dict.get(self.policy_obs_type, obs).to(self.device)
+                        _p_obs_raw = obs_dict.get(self.policy_obs_type, obs).to(self.device)
+                        _p_obs = self._apply_obs_normalizer(_p_obs_raw)
 
                         # GMT-only actions (FrontRES correction = zero during warmup)
                         env_actions = self.alg.policy.get_env_action(
@@ -639,11 +703,19 @@ class OnPolicyRunner:
 
                         obs, _, dones, extras = self.env.step(env_actions.to(self.env.device))
                         obs_dict = extras.get("observations", {})
-                        _p_obs = obs_dict.get(self.policy_obs_type, obs).to(self.device)
+                        _p_obs_raw = obs_dict.get(self.policy_obs_type, obs).to(self.device)
+                        _p_obs = self._apply_obs_normalizer(_p_obs_raw)
+                        _target = _get_warmup_target(_env_raw, "motion").to(self.device)
+
+                        if _warmup_max_envs < self.env.num_envs:
+                            _sample_ids = torch.randperm(
+                                self.env.num_envs, device=self.device)[:_warmup_max_envs]
+                            _p_obs = _p_obs[_sample_ids]
+                            _target = _target[_sample_ids]
 
                         # Both obs and target reflect the perturbation applied this step
                         _wo_list.append(_p_obs[:, :_nfo])
-                        _wt_list.append(_get_warmup_target(_env_raw, "motion"))
+                        _wt_list.append(_target)
 
                 # Supervised SGD over collected rollout data
                 _all_obs = torch.cat(_wo_list, dim=0)      # (S*E, _nfo)
@@ -655,23 +727,48 @@ class OnPolicyRunner:
                     for i in range(0, _N, 4096):
                         idx = perm[i:i + 4096]
                         pred = self.alg.policy.residual_actor(_all_obs[idx])
-                        # pred: [N, 7] (Δpos_raw, Δrpy_raw, conf_raw)
+                        # pred: [N, 8] (Δpos_raw, Δrpy_raw, conf_raw)
                         # tgt:  [N, 6] (Δpos, Δrpy) — compare pos/rpy only
-                        loss = _warmup_loss_fn(pred[:, :6], _all_tgt[idx])
+                        if getattr(self.alg.policy, 'num_task_corrections', 0) > 0:
+                            pred_sup = torch.cat([
+                                torch.tanh(pred[:, :3]) * self.alg.policy.max_delta_pos,
+                                torch.tanh(pred[:, 3:6]) * self.alg.policy.max_delta_rpy,
+                            ], dim=-1)
+                            target_sup = torch.cat([
+                                _all_tgt[idx, :3].clamp(
+                                    -self.alg.policy.max_delta_pos, self.alg.policy.max_delta_pos),
+                                _all_tgt[idx, 3:].clamp(
+                                    -self.alg.policy.max_delta_rpy, self.alg.policy.max_delta_rpy),
+                            ], dim=-1)
+                        else:
+                            pred_sup = pred[:, :_all_tgt.shape[-1]]
+                            target_sup = _all_tgt[idx]
+                        loss = _warmup_loss_fn(pred_sup, target_sup)
+                        _conf_w = float(getattr(self.alg, 'supervised_conf_loss_weight', 0.0))
+                        if getattr(self.alg.policy, 'num_task_corrections', 0) > 0 and pred.shape[-1] >= 8 and _conf_w > 0:
+                            target_conf = (target_sup.norm(dim=-1, keepdim=True) > 1e-4).to(pred.dtype)
+                            conf_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                                pred[:, 6:8], target_conf.expand(-1, 2))
+                            loss = loss + _conf_w * conf_loss
                         _warmup_opt.zero_grad()
                         loss.backward()
                         _warmup_opt.step()
 
                 if (_wu + 1) % max(1, _warmup_iters // 5) == 0:
                     print(f"[Runner]   warmup {_wu + 1}/{_warmup_iters}: "
-                          f"loss={loss.item():.6f}")
+                          f"loss={loss.item():.6f}",
+                          flush=True)
 
-            print(f"[Runner] === Supervised warmup complete (final loss={loss.item():.6f}) ===")
+            print(f"[Runner] === Supervised warmup complete (final loss={loss.item():.6f}) ===",
+                  flush=True)
             # Save warmup checkpoint so subsequent runs can skip this phase via --resume
             if self.log_dir is not None:
+                self._frontres_warmup_complete = True
+                self._dr_scale = _dr_scale
                 warmup_path = os.path.join(self.log_dir, f"model_warmup.pt")
                 self.save(warmup_path)
-                print(f"[Runner] Warmup checkpoint saved to {warmup_path}")
+                print(f"[Runner] Warmup checkpoint saved to {warmup_path}", flush=True)
+            _apply_frontres_dr_scale(_dr_scale)
         # ── END supervised warmup ─────────────────────────────────────────────────
 
         print(
@@ -689,57 +786,50 @@ class OnPolicyRunner:
                               and critic_warmup_iters > 0
                               and (it - start_iter) < critic_warmup_iters)
 
-            # --- DR PI controller: r_delta-sign → adjust dr_scale ------------
+            # --- DR PI controller: r_delta → dr_scale ---------------------------
+            # Tracks a target r_delta performance level.
+            # error = r_delta_ema - dr_target_r_delta
+            #   error > 0: FrontRES above target → task too easy → increase DR
+            #   error < 0: FrontRES below target → task too hard → decrease DR
+            # P term: proportional response (reacts to magnitude, not just sign)
+            # I term: removes steady-state offset; anti-windup prevents saturation
             if _is_frontres and _perturb_target is not None:
                 # Update r_delta EMA from last iteration's mean
                 _r_delta_ema = (_dr_ema_alpha * _r_delta_ema
                                 + (1.0 - _dr_ema_alpha) * getattr(self, '_last_r_delta_mean', 0.0))
                 if _critic_warmup:
-                    # DR=0 during critic warmup — clean baseline for V(s) learning
-                    _dr_scale = 0.0
-                    self._warmup_just_ended = True  # signal to reset dr_scale after
+                    # Hold at dr_scale_init during Critic warmup.
+                    # DR=0 makes V(s)≈0 (trivially correct, uninformative).
+                    # dr_scale_init=0.3 gives meaningful r_delta so the Critic
+                    # learns real value patterns that transfer to Phase 3.
+                    _dr_scale = _dr_scale_init
+                    self._warmup_just_ended = True
                 else:
                     if getattr(self, '_warmup_just_ended', False):
                         _dr_scale = _dr_scale_init
-                        _r_delta_ema = 0.1  # optimistic: give FrontRES a chance
+                        # Do NOT reset _r_delta_ema: critic warmup now runs at
+                        # dr_scale_init (not DR=0), so the accumulated EMA is
+                        # real signal — discarding it would waste 150 iters of data.
                         self._warmup_just_ended = False
-                    # r_delta > 0 = FrontRES helps → increase DR
-                    # r_delta < 0 = FrontRES hurts → decrease DR
-                    if _r_delta_ema > 0:
-                        _dr_scale = min(_dr_scale + _dr_speed, _dr_max)
-                    else:
-                        _dr_scale = max(_dr_scale - _dr_speed, _dr_min)
+
+                    _kp        = float(self.cfg.get("dr_p_gain",          0.10))
+                    _ki        = float(self.cfg.get("dr_i_gain",          0.01))
+                    _dr_target = float(self.cfg.get("dr_target_r_delta",  0.01))
+
+                    error      = _r_delta_ema - _dr_target
+                    _prev_err  = getattr(self, '_dr_prev_error', error)
+                    # Velocity-form PI: Δu = Kp×Δe + Ki×e
+                    # dr_scale += Δu  (stays constant when error = 0)
+                    # No double-integration: P reacts to error *change*, I to error *level*.
+                    _delta = _kp * (error - _prev_err) + _ki * error
+                    self._dr_prev_error = error
+
+                    _dr_scale = max(_dr_min, min(_dr_max, _dr_scale + _delta))
+
                 # Persist for resume
                 self._dr_scale = _dr_scale
                 # Apply dr_scale to perturber (prob fields unchanged; only ratio/magnitude fields)
-                _env_raw = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
-                if hasattr(_env_raw, 'command_manager') and 'motion' in _env_raw.command_manager._terms:
-                    _mcmd = _env_raw.command_manager._terms['motion']
-                    if hasattr(_mcmd, 'perturber'):
-                        def _pt(attr, default=0.0):
-                            return getattr(_perturb_target, attr, default)
-                        _mcmd.perturber.cfg.float_prob          = _pt('float_prob')
-                        _mcmd.perturber.cfg.float_ratio         = _pt('float_ratio')         * _dr_scale
-                        _mcmd.perturber.cfg.sink_prob           = _pt('sink_prob')
-                        _mcmd.perturber.cfg.sink_ratio          = _pt('sink_ratio')          * _dr_scale
-                        _mcmd.perturber.cfg.foot_slip_prob      = _pt('foot_slip_prob')
-                        _mcmd.perturber.cfg.foot_slip_ratio     = _pt('foot_slip_ratio')     * _dr_scale
-                        _mcmd.perturber.cfg.lateral_drift_prob  = _pt('lateral_drift_prob')
-                        _mcmd.perturber.cfg.lateral_drift_std   = _pt('lateral_drift_std')   * _dr_scale
-                        _mcmd.perturber.cfg.root_tilt_prob      = _pt('root_tilt_prob')
-                        _mcmd.perturber.cfg.root_tilt_max_rad   = _pt('root_tilt_max_rad')   * _dr_scale
-                        _mcmd.perturber.cfg.joint_noise_prob    = _pt('joint_noise_prob')
-                        _mcmd.perturber.cfg.joint_noise_std     = _pt('joint_noise_std')     * _dr_scale
-                        # IID step-jump: prob unchanged, magnitude scaled by dr_scale
-                        _mcmd.perturber.cfg.iid_prob_z          = _pt('iid_prob_z')
-                        _mcmd.perturber.cfg.iid_std_z           = _pt('iid_std_z')          * _dr_scale
-                        _mcmd.perturber.cfg.iid_prob_xy         = _pt('iid_prob_xy')
-                        _mcmd.perturber.cfg.iid_std_xy          = _pt('iid_std_xy')         * _dr_scale
-                        _mcmd.perturber.cfg.iid_prob_rp         = _pt('iid_prob_rp')
-                        _mcmd.perturber.cfg.iid_std_rp          = _pt('iid_std_rp')          * _dr_scale
-                        _mcmd.perturber.cfg.iid_prob_ya         = _pt('iid_prob_ya')
-                        _mcmd.perturber.cfg.iid_std_ya          = _pt('iid_std_ya')          * _dr_scale
-                        _mcmd.perturber._dr_scale = _dr_scale
+                _apply_frontres_dr_scale(_dr_scale)
 
             # FrontRES reward-shaping state: reset at the start of each rollout.
             _frontres_prev_delta_q: torch.Tensor | None = None  # [N, A] for smoothness penalty
@@ -765,8 +855,10 @@ class OnPolicyRunner:
             with torch.inference_mode(): # 关闭计算图的梯度追踪, 只进行推理
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    if self.training_type == "mosaic":
-                        # Extract motion groups for multi-teacher support
+                    if self.training_type in ("mosaic", "frontres"):
+                        # Extract motion groups for MOSAIC multi-teacher support.
+                        # FrontRESUnified ignores this argument; paired-baseline bookkeeping
+                        # is handled directly by the motion command.
                         motion_groups = None
 
                         # CRITICAL FIX: Use unwrapped env to access command_manager
@@ -781,7 +873,7 @@ class OnPolicyRunner:
                         # 前向传播获得动作
                         actions = self.alg.act(obs,
                                                privileged_obs,
-                                               teacher_obs=teacher_obs,
+                                               teacher_obs=teacher_obs if self.training_type == "mosaic" else None,
                                                ref_vel_estimator_obs=ref_vel_estimator_obs,
                                                motion_groups=motion_groups)
 
@@ -934,31 +1026,35 @@ class OnPolicyRunner:
                             _env_raw = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
                             for _cmd_term in _env_raw.command_manager._terms.values():
                                 if hasattr(_cmd_term, '_frontres_pos_correction'):
-                                    # ── Jump-degree soft gate ──────────────────────────────
-                                    # Gate Δpos by (1 - jump_degree): suppresses position
-                                    # correction during free flight (a_z ≈ -g).
-                                    # Δrpy (orientation) is NOT gated: tilt correction is
-                                    # always valid and does not interfere with jump physics.
+                                    # ── Contact-aware conservative projection ───────────────
+                                    # Δxy is softened during ballistic phases to avoid
+                                    # rewriting the flight trajectory. Δrpy is never gated:
+                                    # orientation artifacts can occur in both contact and
+                                    # airborne phases and do not inject vertical support.
+                                    #
+                                    # Δz is asymmetric:
+                                    #   contact phase: positive Δz is blocked (no artificial lift)
+                                    #   airborne phase: positive Δz is allowed only up to
+                                    #                   penetration depth (remove ground
+                                    #                   penetration, not recover flight height)
                                     # _task_corr: [Δpos(3), Δrpy(3), c_pos(1), c_rpy(1)]
                                     _pos_corr = _task_corr[:N_train, :3].clone()
                                     _rpy_corr = _task_corr[:N_train, 3:6].clone()
                                     _c_pos    = _task_corr[:N_train, 6:7].clone()
                                     _c_rpy    = _task_corr[:N_train, 7:8].clone()
 
+                                    _z_upper = torch.zeros_like(_pos_corr[:, 2])
                                     if hasattr(_cmd_term, 'jump_degree'):
-                                        _jd   = _cmd_term.jump_degree[:N_train].to(_task_corr.device)
-                                        _gate = (1.0 - _jd).clamp(0.0, 1.0).unsqueeze(-1)
-                                        _pos_corr = _pos_corr * _gate
-                                        _rpy_corr = _rpy_corr * _gate
+                                        _jd = _cmd_term.jump_degree[:N_train].to(_task_corr.device).clamp(0.0, 1.0)
+                                        _contact_gate = (1.0 - _jd).unsqueeze(-1)
+                                        _pos_corr[:, :2] = _pos_corr[:, :2] * _contact_gate
+                                        if hasattr(_cmd_term, 'anchor_penetration_depth'):
+                                            _penetration = _cmd_term.anchor_penetration_depth[:N_train].to(_task_corr.device)
+                                            _z_upper = _jd * _penetration
 
-                                    # ── Asymmetric Z: only correct float, not sink ──────
-                                    # Float (anchor too high):  robot on toes → unstable
-                                    #   → Δz < 0 (push anchor down)  → passes clamp(max=0)
-                                    # Sink  (anchor too low):   robot crouched → stable
-                                    #   → Δz > 0 (push anchor up)    → blocked: contact
-                                    #     physics self-corrects. Fixing it would fight
-                                    #     the ground and add unnecessary noise.
-                                    _pos_corr[:, 2] = torch.clamp(_pos_corr[:, 2], max=0.0)
+                                    _z_lower = torch.full_like(_pos_corr[:, 2], -self.alg.policy.max_delta_pos)
+                                    _pos_corr[:, 2] = torch.maximum(_pos_corr[:, 2], _z_lower)
+                                    _pos_corr[:, 2] = torch.minimum(_pos_corr[:, 2], _z_upper)
 
                                     # ── Confidence: soft coupling ─────────────────────
                                     _pos_corr = _pos_corr * _c_pos
@@ -1027,7 +1123,9 @@ class OnPolicyRunner:
                         )
                         if _use_clean:
                             # ── Per-axis r_step ───────────────────────────
-                            # r_axis = |DR| - |DR + correction|  (pure anchor, no robot)
+                            # r_axis[i] = |DR_i| - |DR_i + correction_i|
+                            # Keep this per-env; batch-averaging here destroys PPO
+                            # credit assignment because every action receives the same reward.
                             _a_w   = _mcmd_rdelta.anchor_pos_w_original
                             _a_raw = _mcmd_rdelta.anchor_pos_w_raw
                             _a_fr  = _mcmd_rdelta.anchor_pos_w
@@ -1041,15 +1139,15 @@ class OnPolicyRunner:
                             # Z
                             _dr_z_fr   = _a_raw[:N_train, 2] - _a_w[:N_train, 2]
                             _corr_z_fr = _a_fr[:N_train,  2] - _a_raw[:N_train, 2]
-                            _r_z = _r_axis(_dr_z_fr, _corr_z_fr).mean()
+                            _r_z = _r_axis(_dr_z_fr, _corr_z_fr)
                             # XY
                             _dr_xy_fr   = _a_raw[:N_train, :2] - _a_w[:N_train, :2]
                             _corr_xy_fr = _a_fr[:N_train,  :2] - _a_raw[:N_train, :2]
-                            _r_xy = _r_axis(_dr_xy_fr.norm(dim=-1), _corr_xy_fr.norm(dim=-1)).mean()
+                            _r_xy = _r_axis(_dr_xy_fr.norm(dim=-1), _corr_xy_fr.norm(dim=-1))
                             # Roll/Pitch
                             _e_raw = quat_error_magnitude(_q_raw[:N_train], _q_w[:N_train])
                             _e_fr  = quat_error_magnitude(_q_fr[:N_train],  _q_w[:N_train])
-                            _r_rp = (_e_raw - _e_fr).mean()
+                            _r_rp = _e_raw - _e_fr
                             # Yaw
                             _yaw_raw = torch.atan2(2*(_q_raw[:N_train,0]*_q_raw[:N_train,3] + _q_raw[:N_train,1]*_q_raw[:N_train,2]),
                                                     1-2*(_q_raw[:N_train,2]**2 + _q_raw[:N_train,3]**2))
@@ -1057,22 +1155,28 @@ class OnPolicyRunner:
                                                     1-2*(_q_fr[:N_train,2]**2 + _q_fr[:N_train,3]**2))
                             _yaw_w   = torch.atan2(2*(_q_w[:N_train,0]*_q_w[:N_train,3] + _q_w[:N_train,1]*_q_w[:N_train,2]),
                                                     1-2*(_q_w[:N_train,2]**2 + _q_w[:N_train,3]**2))
-                            _r_ya = _r_axis(_yaw_raw - _yaw_w, _yaw_fr - _yaw_raw).mean()
+                            _r_ya = _r_axis(_yaw_raw - _yaw_w, _yaw_fr - _yaw_raw)
 
                             _r_step = 0.3*_r_z + 0.2*_r_xy + 0.4*_r_rp + 0.05*_r_ya
 
                             # ── r_rescue ─────────────────────────────────
-                            _fell_base = dones[N_train:N_train+N_base].view(-1) > 0
-                            _fell_fr   = dones[:N_train].view(-1) > 0
+                            _n_pair = min(N_train, N_base)
+                            _fell_base = dones[N_train:N_train+_n_pair].view(-1) > 0
+                            _fell_fr   = dones[:_n_pair].view(-1) > 0
                             _r_rescue = torch.zeros(N_train, device=self.device)
-                            _r_rescue[_fell_base & ~_fell_fr] =  10.0   # rescued
-                            _r_rescue[_fell_base &  _fell_fr] = -10.0   # both fell
-                            _r_rescue[~_fell_base & _fell_fr] = -10.0   # FrontRES caused fall
-                            _r_rescue_mean = _r_rescue.mean()
+                            _r_rescue_pair = torch.zeros(_n_pair, device=self.device)
+                            # ±0.5 matches r_step magnitude (~0.02-0.05/step).
+                            # ±10 was 200× larger, making Value learn fall-probability
+                            # instead of correction quality, drowning the r_step signal.
+                            _RESCUE_MAG = float(self.cfg.get("r_rescue_magnitude", 0.5))
+                            _r_rescue_pair[_fell_base & ~_fell_fr] =  _RESCUE_MAG   # rescued
+                            _r_rescue_pair[_fell_base &  _fell_fr] = -_RESCUE_MAG   # both fell
+                            _r_rescue_pair[~_fell_base & _fell_fr] = -_RESCUE_MAG   # FrontRES caused fall
+                            _r_rescue[:_n_pair] = _r_rescue_pair
 
-                            r_delta       = _r_step + _r_rescue_mean
-                            _r_base_log   = _r_step  # use step as baseline log
-                            _r_rescue_log = _r_rescue_mean
+                            r_delta       = _r_step + _r_rescue
+                            _r_base_log   = _r_step.mean()  # use step as baseline log
+                            _r_rescue_log = _r_rescue.mean()
                         else:
                             r_raw_gmt = rewards[N_train:].view(-1).clone()
                             r_total   = rewards[:N_train].view(-1)
@@ -1251,7 +1355,7 @@ class OnPolicyRunner:
                 start = stop
 
                 # compute returns 计算广义优势值
-                if self.training_type in ["rl", "mosaic"]:
+                if self.training_type in ["rl", "mosaic", "frontres"]:
                     self.alg.compute_returns(privileged_obs)
 
             # update policy Rollout结束, 开始使用buffer计算Loss更新权重
@@ -1607,6 +1711,10 @@ class OnPolicyRunner:
         # Persist adaptive DR state so resume picks up at the correct scale.
         if hasattr(self, '_dr_scale'):
             saved_dict["dr_scale"] = self._dr_scale
+        if hasattr(self, '_dr_prev_error'):
+            saved_dict["dr_prev_error"] = self._dr_prev_error
+        if hasattr(self, '_frontres_warmup_complete'):
+            saved_dict["frontres_warmup_complete"] = bool(self._frontres_warmup_complete)
         
         # -- Save RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
@@ -1631,6 +1739,9 @@ class OnPolicyRunner:
 
     def load(self, path: str, load_optimizer: bool = True, load_critic: bool = True):
         loaded_dict = torch.load(path, weights_only=False)
+        self._frontres_warmup_complete = bool(loaded_dict.get("frontres_warmup_complete", False))
+        if self._frontres_warmup_complete:
+            print("[Runner] Checkpoint marks FrontRES supervised warmup as complete.")
 
         # ── 断点续训模式控制 ────────────────────────────────────────────────────────
         # is_full_resume=True  (Stage2→Stage2 断点续训): 恢复优化器矩估计+学习率, 保留 std
@@ -1837,16 +1948,17 @@ class OnPolicyRunner:
         # Restore adaptive DR scale so resume continues from the correct DR level.
         # is_full_resume=True  (Stage2断点续训): 恢复 checkpoint 中的 dr_scale
         # is_full_resume=False (Stage1→Stage2冷启动): 忽略 checkpoint dr_scale，
-        #   改用 cfg 中的 dr_init_scale（默认 1.0），确保 Stage2 从 Stage1 训练强度出发，
+        #   改用 cfg 中的 dr_scale_init（默认 1.0），确保 Stage2 从 Stage1 训练强度出发，
         #   避免 dr_scale=0 时 Stage1 修正策略作用于干净参考导致的即时崩溃。
         if is_full_resume:
-            self._dr_scale = loaded_dict.get("dr_scale", 0.0)
+            self._dr_scale      = loaded_dict.get("dr_scale",      0.0)
+            self._dr_prev_error = loaded_dict.get("dr_prev_error", 0.0)
             print(f"[Runner] Adaptive DR scale restored from checkpoint: {self._dr_scale:.4f}")
         else:
-            _dr_init = float(self.cfg.get("dr_init_scale", 1.0))
+            _dr_init = float(self.cfg.get("dr_scale_init", 1.0))
             self._dr_scale = _dr_init
             print(f"[Runner] Stage1→Stage2 cold-start: dr_scale initialised to "
-                  f"dr_init_scale={_dr_init:.4f} (ignoring checkpoint value "
+                  f"dr_scale_init={_dr_init:.4f} (ignoring checkpoint value "
                   f"{loaded_dict.get('dr_scale', 0.0):.4f})")
 
         return loaded_dict["infos"]

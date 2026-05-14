@@ -199,6 +199,46 @@ class RslRlMOSAICAlgorithmCfg(RslRlPpoAlgorithmCfg):
     """EMA cosine-similarity threshold that starts the decay (FrontRES has learned direction)."""
     supervised_rpy_loss_weight: float = 1.0
     """Weight for Δrpy component relative to Δpos in the supervised loss."""
+    supervised_conf_loss_weight: float = 0.05
+    """Small BCE weight for task-space confidence heads; keeps gates learnable before PPO signal is strong."""
+
+
+@configclass
+class RslRlFrontRESUnifiedAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    """FrontRES-only unified training config.
+
+    This intentionally does not inherit from MOSAIC: FrontRES uses PPO plus a
+    supervised ΔSE3 auxiliary loss, without teacher or off-policy BC branches.
+    """
+
+    class_name: str = "FrontRESUnified"
+
+    hybrid: bool = True
+    """Kept for runner/config compatibility; FrontRESUnified requires True."""
+    use_ppo: bool = True
+    """Kept for runner/config compatibility; FrontRESUnified requires True."""
+    gradient_accumulation_steps: int = 1
+    """Kept for config compatibility; FrontRESUnified requires 1."""
+
+    use_estimate_ref_vel: bool = False
+    """Whether to use learned reference velocity estimator."""
+    ref_vel_estimator_checkpoint_path: str | None = None
+    """Path to reference velocity estimator checkpoint (.pt file)."""
+    ref_vel_estimator_type: str = "mlp"
+    """Type of velocity estimator: 'mlp' or 'transformer'."""
+
+    lambda_supervised: float = 0.0
+    """Initial weight for FrontRES supervised auxiliary loss."""
+    lambda_supervised_min: float = 0.05
+    """Minimum supervised loss weight after decay."""
+    lambda_supervised_decay: float = 0.997
+    """Per-update multiplicative decay after cosine trigger."""
+    supervised_trigger_cosine_sim: float = 0.85
+    """EMA cosine-similarity threshold that starts supervised weight decay."""
+    supervised_rpy_loss_weight: float = 1.0
+    """Weight for Δrpy component relative to Δpos in the supervised loss."""
+    supervised_conf_loss_weight: float = 0.05
+    """Small BCE weight for task-space confidence heads."""
 
 
 @configclass

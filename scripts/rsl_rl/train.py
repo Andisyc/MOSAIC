@@ -50,6 +50,24 @@ parser.add_argument(
 
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument(
+    "--supervised_warmup_iterations",
+    type=int,
+    default=None,
+    help="Override FrontRES supervised warmup iterations before PPO starts.",
+)
+parser.add_argument(
+    "--supervised_warmup_steps_per_iter",
+    type=int,
+    default=None,
+    help="Override simulation steps collected per FrontRES supervised warmup iteration.",
+)
+parser.add_argument(
+    "--supervised_warmup_max_envs_per_step",
+    type=int,
+    default=None,
+    help="Maximum env samples kept from each warmup step for supervised SGD.",
+)
 
 # single motion for testing
 # motion_path = '/home/chengyuxuan/MOSAIC/motion_npz/dance1_subject1.npz'
@@ -182,6 +200,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     agent_cfg.max_iterations = (args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations)
+    if args_cli.supervised_warmup_iterations is not None:
+        agent_cfg.supervised_warmup_iterations = args_cli.supervised_warmup_iterations
+    if args_cli.supervised_warmup_steps_per_iter is not None:
+        agent_cfg.supervised_warmup_steps_per_iter = args_cli.supervised_warmup_steps_per_iter
+    if args_cli.supervised_warmup_max_envs_per_step is not None:
+        agent_cfg.supervised_warmup_max_envs_per_step = args_cli.supervised_warmup_max_envs_per_step
 
     # set seeds (explicit rank offset for distributed to avoid identical sampling across ranks)
     # note: certain randomizations occur in the environment initialization so we set the seed here

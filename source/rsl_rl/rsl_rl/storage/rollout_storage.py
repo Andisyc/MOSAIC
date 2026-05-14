@@ -107,19 +107,26 @@ class RolloutStorage:
         if rnd_state_shape is not None:
             self.rnd_state = torch.zeros(num_transitions_per_env, num_envs, *rnd_state_shape, device=self.device)
 
-        # For MOSAIC (PPO + Teacher BC + Expert BC)
-        if training_type == "mosaic":
+        # For MOSAIC (PPO + Teacher BC + Expert BC) and FrontRESUnified
+        # (PPO + supervised ΔSE3).  FrontRES uses only the PPO tensors plus
+        # frontres_mask/supervised_target; teacher tensors stay MOSAIC-only.
+        if training_type in ("mosaic", "frontres"):
             self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
-            # Teacher BC: pre-computed teacher action distribution (mu, sigma)
-            self.teacher_mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
-            self.teacher_sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
-            # Multi-teacher MOSAIC: motion group indices for each environment
-            self.motion_groups = torch.zeros(num_transitions_per_env, num_envs, dtype=torch.long, device=self.device)
+            if training_type == "mosaic":
+                # Teacher BC: pre-computed teacher action distribution (mu, sigma)
+                self.teacher_mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+                self.teacher_sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+                # Multi-teacher MOSAIC: motion group indices for each environment
+                self.motion_groups = torch.zeros(num_transitions_per_env, num_envs, dtype=torch.long, device=self.device)
+            else:
+                self.teacher_mu = None
+                self.teacher_sigma = None
+                self.motion_groups = None
             # B1 split-env critic mask: 1 for FrontRES envs, 0 for GMT baseline envs (default all 1)
             self.frontres_mask = torch.ones(num_transitions_per_env, num_envs, 1, device=self.device)
             # Unified training: ΔSE3 supervised target [Δpos(3), Δrpy(3)] (default zeros = no supervision)
@@ -163,20 +170,20 @@ class RolloutStorage:
             self.mu[self.step].copy_(transition.action_mean)
             self.sigma[self.step].copy_(transition.action_sigma)
 
-        # for MOSAIC (PPO + Teacher BC + Expert BC)
-        if self.training_type == "mosaic":
+        # for MOSAIC / FrontRESUnified
+        if self.training_type in ("mosaic", "frontres"):
             self.values[self.step].copy_(transition.values)
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
             self.mu[self.step].copy_(transition.action_mean)
             self.sigma[self.step].copy_(transition.action_sigma)
             # Store pre-computed teacher actions if available
-            if hasattr(transition, 'teacher_action_mean') and transition.teacher_action_mean is not None:
+            if self.training_type == "mosaic" and hasattr(transition, 'teacher_action_mean') and transition.teacher_action_mean is not None:
                 self.teacher_mu[self.step].copy_(transition.teacher_action_mean)
                 # Sigma might be None for MSE loss (only mean is needed)
                 if transition.teacher_action_sigma is not None:
                     self.teacher_sigma[self.step].copy_(transition.teacher_action_sigma)
             # Store motion groups for multi-teacher support
-            if hasattr(transition, 'motion_groups') and transition.motion_groups is not None:
+            if self.training_type == "mosaic" and hasattr(transition, 'motion_groups') and transition.motion_groups is not None:
                 self.motion_groups[self.step].copy_(transition.motion_groups)
             # Store B1 split-env critic mask (all ones when not in B1 mode)
             if hasattr(transition, 'frontres_mask') and transition.frontres_mask is not None:
@@ -239,7 +246,16 @@ class RolloutStorage:
         # Normalize the advantages if flag is set
         # This is to prevent double normalization (i.e. if per minibatch normalization is used)
         if normalize_advantage:
-            self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+            if self.training_type in ("mosaic", "frontres") and hasattr(self, "frontres_mask") and self.frontres_mask is not None:
+                mask = self.frontres_mask > 0.5
+                if mask.any():
+                    adv_valid = self.advantages[mask]
+                    self.advantages = (self.advantages - adv_valid.mean()) / (adv_valid.std(unbiased=False) + 1e-8)
+                    self.advantages = self.advantages * self.frontres_mask
+                else:
+                    self.advantages.zero_()
+            else:
+                self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
 
     # for distillation
     def generator(self):
@@ -257,7 +273,7 @@ class RolloutStorage:
 
     # for reinforcement learning with feedforward networks (PPO and MOSAIC)
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
-        if self.training_type not in ["rl", "mosaic"]:
+        if self.training_type not in ["rl", "mosaic", "frontres"]:
             raise ValueError("This function is only available for reinforcement learning and MOSAIC training.")
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
@@ -280,16 +296,19 @@ class RolloutStorage:
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
 
-        # For MOSAIC: teacher observations and pre-computed teacher actions
-        if self.training_type == "mosaic":
+        # For MOSAIC: teacher observations and pre-computed teacher actions.
+        # FrontRES gets the same tuple shape with teacher fields set to None.
+        if self.training_type in ("mosaic", "frontres"):
             if self.teacher_observations is not None:
                 teacher_observations = self.teacher_observations.flatten(0, 1)
+            elif self.training_type == "frontres":
+                teacher_observations = None
             else:
                 teacher_observations = privileged_observations
-            teacher_mu = self.teacher_mu.flatten(0, 1)
-            teacher_sigma = self.teacher_sigma.flatten(0, 1)
+            teacher_mu = self.teacher_mu.flatten(0, 1) if self.teacher_mu is not None else None
+            teacher_sigma = self.teacher_sigma.flatten(0, 1) if self.teacher_sigma is not None else None
             # Multi-teacher: motion groups
-            motion_groups = self.motion_groups.flatten(0, 1)
+            motion_groups = self.motion_groups.flatten(0, 1) if self.motion_groups is not None else None
             # B1 split-env critic mask
             frontres_mask = self.frontres_mask.flatten(0, 1)
             # ΔSE3 supervised target
@@ -331,13 +350,13 @@ class RolloutStorage:
                 else:
                     rnd_state_batch = None
 
-                # -- For MOSAIC: teacher observations and pre-computed teacher actions
-                if self.training_type == "mosaic":
-                    teacher_obs_batch = teacher_observations[batch_idx]
-                    teacher_mu_batch = teacher_mu[batch_idx]
-                    teacher_sigma_batch = teacher_sigma[batch_idx]
+                # -- For MOSAIC / FrontRES
+                if self.training_type in ("mosaic", "frontres"):
+                    teacher_obs_batch = teacher_observations[batch_idx] if teacher_observations is not None else None
+                    teacher_mu_batch = teacher_mu[batch_idx] if teacher_mu is not None else None
+                    teacher_sigma_batch = teacher_sigma[batch_idx] if teacher_sigma is not None else None
                     # Multi-teacher: motion groups
-                    motion_groups_batch = motion_groups[batch_idx]
+                    motion_groups_batch = motion_groups[batch_idx] if motion_groups is not None else None
                     frontres_mask_batch = frontres_mask[batch_idx]
                     supervised_target_batch = supervised_target[batch_idx]
                     # For velocity estimator
@@ -351,11 +370,11 @@ class RolloutStorage:
                     teacher_sigma_batch = None
                     motion_groups_batch = None
                     ref_vel_estimator_obs_batch = None
-                    frontres_mask_batch = frontres_mask[batch_idx] if frontres_mask is not None else None
-                    supervised_target_batch = supervised_target[batch_idx] if supervised_target is not None else None
+                    frontres_mask_batch = None
+                    supervised_target_batch = None
 
                 # yield the mini-batch
-                if self.training_type == "mosaic":
+                if self.training_type in ("mosaic", "frontres"):
                     yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                         None,
                         None,
@@ -368,7 +387,7 @@ class RolloutStorage:
 
     # for reinfrocement learning with recurrent networks (PPO and MOSAIC)
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
-        if self.training_type not in ["rl", "mosaic"]:
+        if self.training_type not in ["rl", "mosaic", "frontres"]:
             raise ValueError("This function is only available for reinforcement learning and MOSAIC training.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
         if self.privileged_observations is not None:
@@ -445,11 +464,22 @@ class RolloutStorage:
                 hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
                 hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
 
-                if self.training_type == "mosaic":
+                if self.training_type in ("mosaic", "frontres"):
+                    if self.training_type == "frontres":
+                        ref_vel_estimator_obs_batch = (
+                            self.ref_vel_estimator_observations[:, start:stop]
+                            if self.ref_vel_estimator_observations is not None else None
+                        )
+                        frontres_mask_batch = self.frontres_mask[:, start:stop]
+                        supervised_target_batch = self.supervised_target[:, start:stop]
+                    else:
+                        ref_vel_estimator_obs_batch = None
+                        frontres_mask_batch = None
+                        supervised_target_batch = None
                     yield obs_batch, privileged_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                         hid_a_batch,
                         hid_c_batch,
-                    ), masks_batch, rnd_state_batch, teacher_obs_batch, teacher_mu_batch, teacher_sigma_batch, None, None, None, None
+                    ), masks_batch, rnd_state_batch, teacher_obs_batch, teacher_mu_batch, teacher_sigma_batch, ref_vel_estimator_obs_batch, None, frontres_mask_batch, supervised_target_batch
                 else:
                     yield obs_batch, privileged_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                         hid_a_batch,

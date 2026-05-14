@@ -99,6 +99,9 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         args_cli.resume = True
         args_cli.load_run = run_name
         args_cli.checkpoint = checkpoint_file
+        # Keep the absolute path as well.  train.py prefers this direct path,
+        # which makes warmup/RL iteration robust across different log roots.
+        agent_cfg.student_checkpoint_path = checkpoint_path
 
         print(f"[CLI] Simplified resume from CLI: {checkpoint_path}")
         print(f"[CLI]   - load_run: {run_name}")

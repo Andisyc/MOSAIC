@@ -319,6 +319,8 @@ class MotionCommand(CommandTerm):
         self._frontres_pos_correction = torch.zeros(self.num_envs, 3, device=self.device)
         self._frontres_quat_correction = torch.zeros(self.num_envs, 4, device=self.device)
         self._frontres_quat_correction[:, 0] = 1.0  # identity quaternion (w=1)
+        self._frontres_pair_train_ids: torch.Tensor | None = None
+        self._frontres_pair_base_ids: torch.Tensor | None = None
 
     @property
     def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
@@ -352,6 +354,15 @@ class MotionCommand(CommandTerm):
     def anchor_pos_w(self) -> torch.Tensor:
         return (self.motion.body_pos_w[self.time_steps, self.motion_anchor_body_index]
                 + self._env.scene.env_origins + self._frontres_pos_correction)
+
+    @property
+    def anchor_penetration_depth(self) -> torch.Tensor:
+        """Conservative penetration depth for non-perturbed commands.
+
+        The plain motion command has no degradation cache, so there is no
+        FrontRES-correctable penetration artifact to expose.
+        """
+        return torch.zeros(self.num_envs, device=self.device)
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
@@ -1194,6 +1205,64 @@ class MultiMotionCommand(CommandTerm):
         # ΔSE3 supervised target: correction to UNDO current DR perturbation [Δpos(3), Δrpy(3)]
         self._dr_supervised_target  = torch.zeros(self.num_envs, 6, device=self.device)
 
+    def set_frontres_paired_baseline(self, n_train: int) -> None:
+        """Pair env i with env i+n_train for B1 FrontRES-vs-GMT comparisons."""
+        n_train = int(n_train)
+        n_base = int(self.num_envs - n_train)
+        n_pair = max(0, min(n_train, n_base))
+        if n_pair <= 0:
+            self._frontres_pair_train_ids = None
+            self._frontres_pair_base_ids = None
+            return
+
+        train_ids = torch.arange(n_pair, device=self.device, dtype=torch.long)
+        base_ids = torch.arange(n_train, n_train + n_pair, device=self.device, dtype=torch.long)
+        self._frontres_pair_train_ids = train_ids
+        self._frontres_pair_base_ids = base_ids
+        self._sync_frontres_pairs(sync_perturbation=False)
+
+    def _sync_frontres_pairs(self, sync_perturbation: bool = True) -> None:
+        train_ids = self._frontres_pair_train_ids
+        base_ids = self._frontres_pair_base_ids
+        if train_ids is None or base_ids is None:
+            return
+
+        self.env_motion_indices[base_ids] = self.env_motion_indices[train_ids]
+        self.env_motion_groups[base_ids] = self.env_motion_groups[train_ids]
+        self.time_steps[base_ids] = self.time_steps[train_ids]
+
+        if sync_perturbation:
+            self._cached_perturbed_pos[base_ids] = self._cached_perturbed_pos[train_ids]
+            self._cached_perturbed_quat[base_ids] = self._cached_perturbed_quat[train_ids]
+            self._dr_supervised_target[base_ids] = self._dr_supervised_target[train_ids]
+            self.perturber._z_state[base_ids] = self.perturber._z_state[train_ids]
+            self.perturber._x_state[base_ids] = self.perturber._x_state[train_ids]
+            self.perturber._y_state[base_ids] = self.perturber._y_state[train_ids]
+            self.perturber._roll_state[base_ids] = self.perturber._roll_state[train_ids]
+            self.perturber._pitch_state[base_ids] = self.perturber._pitch_state[train_ids]
+            if self.perturber._joint_state is not None:
+                self.perturber._joint_state[base_ids] = self.perturber._joint_state[train_ids]
+
+        self._frontres_pos_correction[base_ids] = 0.0
+        self._frontres_quat_correction[base_ids] = 0.0
+        self._frontres_quat_correction[base_ids, 0] = 1.0
+
+    def _expand_frontres_pair_env_ids(self, env_ids: torch.Tensor) -> torch.Tensor:
+        train_ids = self._frontres_pair_train_ids
+        base_ids = self._frontres_pair_base_ids
+        if train_ids is None or base_ids is None or env_ids.numel() == 0:
+            return env_ids
+
+        pair_count = train_ids.numel()
+        train_mask = env_ids < pair_count
+        base_mask = (env_ids >= base_ids[0]) & (env_ids < base_ids[0] + pair_count)
+        paired = [env_ids]
+        if train_mask.any():
+            paired.append(env_ids[train_mask] + base_ids[0])
+        if base_mask.any():
+            paired.append(env_ids[base_mask] - base_ids[0])
+        return torch.unique(torch.cat(paired), sorted=False)
+
     # ------------- properties (gathered across envs/motions) -------------
     def _gather_future_by_motion(self, getter: str, horizon: int) -> torch.Tensor:
         if horizon <= 0:
@@ -1357,7 +1426,12 @@ class MultiMotionCommand(CommandTerm):
     @property
     def joint_pos(self) -> torch.Tensor:
         raw = self._gather_by_motion("joint_pos")
-        return self.perturber.apply_joint_perturbation(raw)
+        perturbed = self.perturber.apply_joint_perturbation(raw)
+        train_ids = self._frontres_pair_train_ids
+        base_ids = self._frontres_pair_base_ids
+        if train_ids is not None and base_ids is not None:
+            perturbed[base_ids] = perturbed[train_ids]
+        return perturbed
 
     @property
     def joint_vel(self) -> torch.Tensor:
@@ -1406,6 +1480,19 @@ class MultiMotionCommand(CommandTerm):
     def anchor_pos_w_raw(self) -> torch.Tensor:
         """Perturbed anchor position (DR applied, no FrontRES correction)."""
         return self._cached_perturbed_pos + self._env.scene.env_origins
+
+    @property
+    def anchor_penetration_depth(self) -> torch.Tensor:
+        """Depth below the local ground/contact boundary for the perturbed anchor.
+
+        Positive values mean the degraded reference anchor is below the local
+        ground plane.  This is a conservative upper bound for upward FrontRES
+        correction: it can remove penetration, but cannot reconstruct missing
+        flight height.
+        """
+        ground_z = self._env.scene.env_origins[:, 2]
+        raw_z = self.anchor_pos_w_raw[:, 2]
+        return torch.clamp(ground_z - raw_z, min=0.0)
 
     @property
     def anchor_quat_w_original(self) -> torch.Tensor:
@@ -1768,6 +1855,7 @@ class MultiMotionCommand(CommandTerm):
         if len(env_ids) == 0:
             return
         env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        env_ids = self._expand_frontres_pair_env_ids(env_ids)
         if self.cfg.start_from_beginning:
             start_frame = max(int(self.cfg.start_frame), 0)
             lengths_minus_one = self.motion_lengths[self.env_motion_indices[env_ids]] - 1
@@ -1776,6 +1864,8 @@ class MultiMotionCommand(CommandTerm):
             self.time_steps[env_ids] = torch.minimum(start_frame_tensor, lengths_minus_one)
         else:
             self._adaptive_sampling(env_ids)
+
+        self._sync_frontres_pairs(sync_perturbation=False)
 
         motion_indices = self.env_motion_indices[env_ids]
         self.motion_sample_counts.index_add_(
@@ -1903,16 +1993,23 @@ class MultiMotionCommand(CommandTerm):
         _quat_data = self._gather_by_motion("body_quat_w")
         _root_quat_ref = _quat_data[:, self.motion_anchor_body_index]
         self._cached_perturbed_quat = self.perturber.apply_quat_perturbation(_root_quat_ref)
+        # Update jump_degree before building the supervised target so vertical
+        # targets use the same contact-aware conservative projection as runtime.
+        self._compute_jump_degree()
         # ΔSE3 supervised target: correction that UNDOES the DR perturbation.
         self._dr_supervised_target[:, :3] = _root_pos_ref - self._cached_perturbed_pos
-        # Asymmetric Z: only teach float correction, not sink.
-        # Sink is self-correcting via ground contact physics.
-        self._dr_supervised_target[:, 2] = torch.clamp(self._dr_supervised_target[:, 2], max=0.0)
+        # Conservative vertical projection:
+        #   contact phase: positive Δz is blocked (do not inject artificial lift)
+        #   airborne phase: positive Δz is allowed only up to penetration depth
+        #                   (remove invalid ground penetration, not recover height)
+        z_upper = self.jump_degree * self.anchor_penetration_depth
+        self._dr_supervised_target[:, 2] = torch.minimum(self._dr_supervised_target[:, 2], z_upper)
         _corr_quat = quat_mul(quat_inv(self._cached_perturbed_quat), _root_quat_ref)
         _r, _p, _y = euler_xyz_from_quat(_corr_quat)
         self._dr_supervised_target[:, 3] = _r
         self._dr_supervised_target[:, 4] = _p
         self._dr_supervised_target[:, 5] = _y
+        self._sync_frontres_pairs(sync_perturbation=True)
         # ─────────────────────────────────────────────────────────────────────
 
         # Per-motion episode end detection and resampling
@@ -1951,8 +2048,7 @@ class MultiMotionCommand(CommandTerm):
             (self._global_sim_step % self._resample_motions_every_steps) == 0:
             self._remap_version += 1
 
-        # Update jump_degree for soft gate (used by runner to suppress Δpos during jumps)
-        self._compute_jump_degree()
+        # jump_degree was updated before supervised_target construction above.
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         if env_ids is None:

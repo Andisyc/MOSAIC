@@ -8,5 +8,6 @@
 from .distillation import Distillation
 from .ppo import PPO
 from .mosaic import MOSAIC
+from .frontres_unified import FrontRESUnified
 
-__all__ = ["PPO", "Distillation", "MOSAIC"]
+__all__ = ["PPO", "Distillation", "MOSAIC", "FrontRESUnified"]

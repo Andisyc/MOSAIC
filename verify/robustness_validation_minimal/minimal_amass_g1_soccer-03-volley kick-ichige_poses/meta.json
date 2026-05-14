@@ -1,0 +1,19 @@
+{
+  "task": "General-Tracking-Flat-G1-Wo-State-Estimation-v0",
+  "motion": "/hdd0/yuxuancheng/AMASS_G1NPZ_Final/Eyes_Japan_Dataset/ichige/amass_g1_soccer-03-volley kick-ichige_poses.npz",
+  "motion_dir": "/hdd0/yuxuancheng/AMASS_G1NPZ_Final/Eyes_Japan_Dataset/ichige",
+  "file_glob": "amass_g1_soccer-03-volley kick-ichige_poses.npz",
+  "checkpoint": "/home/yuxuancheng/MOSAIC/model/model_27000.pt",
+  "epsilon_values": [
+    0.0,
+    0.05
+  ],
+  "push_velocities": [
+    1.0
+  ],
+  "n_trials": 2,
+  "n_envs": 1,
+  "settle_steps": 30,
+  "observe_steps": 60,
+  "ou_tau": 0.5
+}

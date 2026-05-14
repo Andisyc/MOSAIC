@@ -94,6 +94,7 @@ class MOSAIC:
         lambda_supervised_decay: float = 0.997,    # per-iteration multiplier after trigger
         supervised_trigger_cosine_sim: float = 0.85,  # EMA cosine_sim threshold to start decay
         supervised_rpy_loss_weight: float = 1.0,   # weight for Δrpy vs Δpos in L_sup
+        supervised_conf_loss_weight: float = 0.05, # BCE weight for task-space confidence heads
     ):
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
@@ -540,6 +541,7 @@ class MOSAIC:
         self.lambda_supervised_decay_rate = lambda_supervised_decay
         self.supervised_trigger_cosine_sim = supervised_trigger_cosine_sim
         self.supervised_rpy_loss_weight   = supervised_rpy_loss_weight
+        self.supervised_conf_loss_weight  = supervised_conf_loss_weight
         self._supervised_decay_triggered  = False
         self._supervised_cosine_ema       = 0.0   # exponential moving average of cos_sim
         self._supervised_ema_alpha        = 0.05  # EMA smoothing factor
@@ -607,7 +609,8 @@ class MOSAIC:
             print(f"  Supervised  λ={self.lambda_supervised:.3f} → {self.lambda_supervised_min}"
                   f"  decay={self.lambda_supervised_decay_rate}"
                   f"  trigger_cos={self.supervised_trigger_cosine_sim}"
-                  f"  rpy_w={self.supervised_rpy_loss_weight}")
+                  f"  rpy_w={self.supervised_rpy_loss_weight}"
+                  f"  conf_w={self.supervised_conf_loss_weight}")
 
         # ── Teacher BC ────────────────────────────────────────────────────────
         if _teach:
@@ -1088,7 +1091,8 @@ class MOSAIC:
             if self.use_ppo: # 计算PPO Loss
                 # Surrogate loss 截断代理Loss防止更新步幅太大
                 # 计算新旧策略比值 (若ratio>1则新网络更倾向执行这个动作)
-                ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+                log_ratio = actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
+                ratio = torch.exp(log_ratio.clamp(-10.0, 10.0))
 
                 # advantages_batch优势函数 (该动作比均值好多少, 正数说明更好, 负数说明更差)
                 # 负号是因为梯度下降是最小化Loss, 相当于最大化奖励值
@@ -1097,7 +1101,7 @@ class MOSAIC:
                 # ── Focal scaling: |A|² weights each sample by its advantage magnitude ──
                 # OU daily steps: |A|~0.1 → weight=0.01 → auto-muted
                 # IID rescue steps: |A|~10 → weight=100 → dominates learning
-                _focal = torch.squeeze(advantages_batch).pow(2)
+                _focal = torch.squeeze(advantages_batch).pow(2).clamp(max=25.0)
                 surrogate = surrogate * _focal
 
                 # 截断限制
@@ -1105,7 +1109,12 @@ class MOSAIC:
                     ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
                 surrogate_clipped = surrogate_clipped * _focal
 
-                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+                surrogate_terms = torch.max(surrogate, surrogate_clipped)
+                if _has_mask:
+                    _mask_flat = frontres_mask_batch.view(-1)
+                    surrogate_loss = (surrogate_terms * _mask_flat).sum() / _mask_flat.sum().clamp(min=1.0)
+                else:
+                    surrogate_loss = surrogate_terms.mean()
 
                 # Value function loss 训练Critic使得评分更准
                 if self.use_clipped_value_loss: # 截断限制: 防止更新过大导致网络崩溃
@@ -1445,9 +1454,26 @@ class MOSAIC:
                 pos_sup = nn.functional.huber_loss(pred[:, :3], target[:, :3].detach())
                 rpy_sup = nn.functional.huber_loss(pred[:, 3:], target[:, 3:].detach())
                 supervised_loss = pos_sup + self.supervised_rpy_loss_weight * rpy_sup
+                if (
+                    hasattr(self.policy, 'num_task_corrections')
+                    and self.policy.num_task_corrections > 0
+                    and raw_pred.shape[-1] >= 8
+                    and self.supervised_conf_loss_weight > 0
+                ):
+                    target_conf = (target.norm(dim=-1, keepdim=True) > 1e-4).to(raw_pred.dtype)
+                    conf_logits = raw_pred[:, 6:8]
+                    conf_target = target_conf.expand(-1, 2)
+                    conf_sup = nn.functional.binary_cross_entropy_with_logits(
+                        conf_logits, conf_target.detach())
+                    supervised_loss = supervised_loss + self.supervised_conf_loss_weight * conf_sup
                 with torch.no_grad():
-                    _sup_cos_sim = nn.functional.cosine_similarity(
-                        pred, target, dim=-1).mean().item()
+                    target_norm = target.norm(dim=-1)
+                    valid = target_norm > 1e-4
+                    if valid.any():
+                        _sup_cos_sim = nn.functional.cosine_similarity(
+                            pred[valid], target[valid], dim=-1).mean().item()
+                    else:
+                        _sup_cos_sim = 0.0
 
             # ========== MOSAIC Combined Loss ==========
             # Loss相加与反向传播
