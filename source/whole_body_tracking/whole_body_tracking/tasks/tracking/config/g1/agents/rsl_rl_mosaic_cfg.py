@@ -460,6 +460,10 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval     = 500
     experiment_name   = "g1_flat_frontres_unified"
     empirical_normalization = True
+    # Resume semantics:
+    # True  = full checkpoint resume (actor + critic + optimizer + iteration).
+    # False = checkpoint as initialization (residual actor only; critic/optimizer/iteration reset).
+    is_full_resume = True
 
     # ── Curriculum Oracle ─────────────────────────────────────────────────────
     # Mixes oracle (-OU ground truth) with FrontRES output to bootstrap training.
