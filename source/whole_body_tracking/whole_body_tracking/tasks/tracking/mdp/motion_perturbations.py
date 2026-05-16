@@ -84,6 +84,18 @@ class MotionPerturbationCfg:
     iid_std_rp: float = 0.05   # Roll/Pitch jump std (radians) — ~2.9°
     iid_std_ya: float = 0.05   # Yaw jump std (radians)
 
+    # -- Local root-frame artifact bursts
+    local_root_artifact_prob: float = 0.0
+    """Probability per env per step of starting a short root XY/Yaw artifact burst."""
+    local_root_artifact_min_steps: int = 3
+    """Minimum duration of a local root artifact burst in sim steps."""
+    local_root_artifact_max_steps: int = 8
+    """Maximum duration of a local root artifact burst in sim steps."""
+    local_root_artifact_xy_std: float = 0.0
+    """Std of fixed XY offset sampled at burst start (metres), scaled by dr_scale."""
+    local_root_artifact_yaw_std: float = 0.0
+    """Std of fixed yaw offset sampled at burst start (radians), scaled by dr_scale."""
+
 
 class MotionPerturber:
     """
@@ -113,6 +125,14 @@ class MotionPerturber:
         self._pitch_state = torch.zeros(num_envs, device=device)   # root pitch (rad)
         self._joint_state: torch.Tensor | None = None              # (num_envs, num_joints)
 
+        # Short-window artifact state.  Unlike OU drift, this is a piecewise
+        # constant local error: the same wrong root XY/Yaw is held for a few
+        # frames, creating an executable discontinuity rather than a harmless
+        # global reference-frame shift.
+        self._artifact_steps = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self._artifact_xy = torch.zeros(num_envs, 2, device=device)
+        self._artifact_yaw = torch.zeros(num_envs, device=device)
+
         # Baseline env mask: these envs always receive zero perturbation.
         self._baseline_mask: torch.Tensor | None = None  # bool [num_envs]
 
@@ -135,6 +155,9 @@ class MotionPerturber:
         """
         self._baseline_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._baseline_mask[env_ids] = True
+        self._artifact_steps[env_ids] = 0
+        self._artifact_xy[env_ids] = 0.0
+        self._artifact_yaw[env_ids] = 0.0
 
     def reset_envs(self, env_ids: torch.Tensor) -> None:
         """Zero OU states for terminated or resampled environments."""
@@ -145,6 +168,9 @@ class MotionPerturber:
         self._y_state[env_ids]     = 0.0
         self._roll_state[env_ids]  = 0.0
         self._pitch_state[env_ids] = 0.0
+        self._artifact_steps[env_ids] = 0
+        self._artifact_xy[env_ids] = 0.0
+        self._artifact_yaw[env_ids] = 0.0
         if self._joint_state is not None:
             self._joint_state[env_ids] = 0.0
 
@@ -184,6 +210,8 @@ class MotionPerturber:
             perturbed[:, 2] += self._z_state
 
         # ── Superimpose IID step-jumps ──────────────────────────────────────
+        self._update_local_root_artifact(root_pos_ref, left_foot_pos_ref, right_foot_pos_ref)
+        perturbed[:, :2] += self._artifact_xy
         perturbed = self._apply_iid_xy(perturbed)
         perturbed = self._apply_iid_z(perturbed)
 
@@ -211,6 +239,7 @@ class MotionPerturber:
 
         # IID jitter (roll/pitch/yaw)
         result = self._apply_iid_quat(result)
+        result = self._apply_artifact_yaw(result)
         return result
 
     def apply_joint_perturbation(self, joint_pos: torch.Tensor) -> torch.Tensor:
@@ -283,6 +312,87 @@ class MotionPerturber:
         tx = tw1 * sr + tx1 * cr
         ty = ty1 * cr + tz1 * sr
         tz = -ty1 * sr + tz1 * cr
+        w2, x2, y2, z2 = root_quat[:, 0], root_quat[:, 1], root_quat[:, 2], root_quat[:, 3]
+        return torch.stack([
+            tw * w2 - tx * x2 - ty * y2 - tz * z2,
+            tw * x2 + tx * w2 + ty * z2 - tz * y2,
+            tw * y2 - tx * z2 + ty * w2 + tz * x2,
+            tw * z2 + tx * y2 - ty * x2 + tz * w2,
+        ], dim=-1)
+
+    def _update_local_root_artifact(
+        self,
+        root_pos_ref: torch.Tensor,
+        left_foot_pos_ref: torch.Tensor,
+        right_foot_pos_ref: torch.Tensor,
+    ) -> None:
+        """Update short-window root XY/Yaw artifact state.
+
+        We intentionally do not translate the full reference body together with
+        the anchor.  The anchor jumps while body/contact references remain tied
+        to the original motion, which exposes the contact/heading inconsistency
+        that a visual pose toolchain can create.
+        """
+        prob = float(getattr(self.cfg, "local_root_artifact_prob", 0.0))
+        xy_std = float(getattr(self.cfg, "local_root_artifact_xy_std", 0.0))
+        yaw_std = float(getattr(self.cfg, "local_root_artifact_yaw_std", 0.0))
+        if prob <= 0.0 or (xy_std <= 0.0 and yaw_std <= 0.0) or self._dr_scale <= 0.0:
+            self._artifact_steps.zero_()
+            self._artifact_xy.zero_()
+            self._artifact_yaw.zero_()
+            return
+
+        active = self._artifact_steps > 0
+        self._artifact_steps[active] -= 1
+        ended = self._artifact_steps <= 0
+        self._artifact_xy[ended] = 0.0
+        self._artifact_yaw[ended] = 0.0
+        if self._baseline_mask is not None:
+            self._artifact_steps[self._baseline_mask] = 0
+            self._artifact_xy[self._baseline_mask] = 0.0
+            self._artifact_yaw[self._baseline_mask] = 0.0
+
+        inactive = self._artifact_steps <= 0
+        min_foot_z = torch.minimum(left_foot_pos_ref[:, 2], right_foot_pos_ref[:, 2])
+        contact_like = min_foot_z < 0.12
+        # Contact frames are most informative, but do not make the signal depend
+        # on a brittle height threshold.  Non-contact frames still receive a
+        # smaller probability so every motion family can produce artifacts.
+        effective_prob = torch.where(
+            contact_like,
+            torch.full((self.num_envs,), prob, device=self.device),
+            torch.full((self.num_envs,), prob * 0.25, device=self.device),
+        )
+        start = inactive & (torch.rand(self.num_envs, device=self.device) < effective_prob)
+        if self._baseline_mask is not None:
+            start = start & ~self._baseline_mask
+        if not start.any():
+            return
+
+        min_steps = max(1, int(getattr(self.cfg, "local_root_artifact_min_steps", 3)))
+        max_steps = max(min_steps, int(getattr(self.cfg, "local_root_artifact_max_steps", 8)))
+        num_start = int(start.sum().item())
+        durations = torch.randint(min_steps, max_steps + 1, (num_start,), device=self.device)
+        self._artifact_steps[start] = durations
+        if xy_std > 0.0:
+            self._artifact_xy[start] = (
+                torch.randn(num_start, 2, device=self.device) * xy_std * self._dr_scale
+            )
+        if yaw_std > 0.0:
+            self._artifact_yaw[start] = (
+                torch.randn(num_start, device=self.device) * yaw_std * self._dr_scale
+            )
+
+    def _apply_artifact_yaw(self, root_quat: torch.Tensor) -> torch.Tensor:
+        """Right-multiply the active local artifact yaw onto root_quat."""
+        yaw = self._artifact_yaw
+        if yaw.abs().max() == 0:
+            return root_quat
+        cy, sy = torch.cos(yaw * 0.5), torch.sin(yaw * 0.5)
+        tw = cy
+        tx = torch.zeros_like(yaw)
+        ty = torch.zeros_like(yaw)
+        tz = sy
         w2, x2, y2, z2 = root_quat[:, 0], root_quat[:, 1], root_quat[:, 2], root_quat[:, 3]
         return torch.stack([
             tw * w2 - tx * x2 - ty * y2 - tz * z2,

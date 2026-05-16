@@ -1276,6 +1276,10 @@ class MultiMotionCommand(CommandTerm):
             self.perturber._y_state[base_ids] = self.perturber._y_state[train_ids]
             self.perturber._roll_state[base_ids] = self.perturber._roll_state[train_ids]
             self.perturber._pitch_state[base_ids] = self.perturber._pitch_state[train_ids]
+            if hasattr(self.perturber, "_artifact_steps"):
+                self.perturber._artifact_steps[base_ids] = self.perturber._artifact_steps[train_ids]
+                self.perturber._artifact_xy[base_ids] = self.perturber._artifact_xy[train_ids]
+                self.perturber._artifact_yaw[base_ids] = self.perturber._artifact_yaw[train_ids]
             if self.perturber._joint_state is not None:
                 self.perturber._joint_state[base_ids] = self.perturber._joint_state[train_ids]
             if clean_ids is not None:
@@ -1289,6 +1293,10 @@ class MultiMotionCommand(CommandTerm):
                 self.perturber._y_state[clean_ids] = 0.0
                 self.perturber._roll_state[clean_ids] = 0.0
                 self.perturber._pitch_state[clean_ids] = 0.0
+                if hasattr(self.perturber, "_artifact_steps"):
+                    self.perturber._artifact_steps[clean_ids] = 0
+                    self.perturber._artifact_xy[clean_ids] = 0.0
+                    self.perturber._artifact_yaw[clean_ids] = 0.0
                 if self.perturber._joint_state is not None:
                     self.perturber._joint_state[clean_ids] = 0.0
 

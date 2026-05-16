@@ -540,14 +540,14 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     #   Critic: E(s_noisy) ≈ max(R_clean - R_noisy, 0)
     # PPO still keeps an online supervised anchor afterwards, so the transition
     # is gradual rather than a hard switch.
-    supervised_warmup_iterations   = 800
+    supervised_warmup_iterations   = 600
     supervised_warmup_steps_per_iter = 8
     supervised_warmup_max_envs_per_step = 4096
-    supervised_warmup_dr_scale_start = 0.40  # curriculum start: easy enough for stable direction learning
+    supervised_warmup_dr_scale_start = 0.35  # curriculum start: easy enough for stable direction learning
     supervised_warmup_dr_scale      = 1.00   # curriculum end: match Actor-takeover DR difficulty
     supervised_warmup_lr           = 1e-4
     supervised_warmup_epochs       = 3
-    supervised_warmup_diag_interval = 80
+    supervised_warmup_diag_interval = 60
 
     # ── Adaptive DR: r_delta-sign PI controller ────────────────────────────
     dr_scale_init                  = 1.0    # fixed during Actor takeover; calibrated near repairable GMT damage
@@ -566,13 +566,18 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # active action mask is [dx, dy, dyaw].  Z/RP are disabled here so the
     # repair reward does not ask Actor to fix channels it cannot control.
     iid_prob_z                     = 0.0    # disabled for xy/yaw alignment
-    iid_prob_xy                    = 0.3    # XY: stronger debug signal
+    iid_prob_xy                    = 0.0    # local root artifact carries the aligned XY signal
     iid_prob_rp                    = 0.0    # disabled for xy/yaw alignment
-    iid_prob_ya                    = 0.3    # Yaw: stronger debug signal
+    iid_prob_ya                    = 0.0    # local root artifact carries the aligned yaw signal
     iid_std_z                      = 0.05   # Z jump std (m), scaled by dr_scale
-    iid_std_xy                     = 0.15   # XY jump std (m), calibrated from robustness validation
+    iid_std_xy                     = 0.15   # unused when iid_prob_xy=0
     iid_std_rp                     = 0.05   # RP jump std (rad)
-    iid_std_ya                     = 0.15   # Yaw jump std (rad), calibrated from robustness validation
+    iid_std_ya                     = 0.15   # unused when iid_prob_ya=0
+    local_root_artifact_prob       = 0.08   # per-step burst start prob; contact-like frames are emphasized
+    local_root_artifact_min_steps  = 6
+    local_root_artifact_max_steps  = 12
+    local_root_artifact_xy_std     = 0.18   # metres at dr_scale=1; local contact/heading inconsistency
+    local_root_artifact_yaw_std    = 0.24   # radians at dr_scale=1
 
     # ── Legacy Critic warmup ───────────────────────────────────────────────
     # Disabled because Critic now learns executable damage during joint warmup.

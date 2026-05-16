@@ -708,6 +708,9 @@ class OnPolicyRunner:
                     iid_std_rp           = float(getattr(_pt, 'iid_std_rp',           0.0)),
                     iid_prob_ya          = float(getattr(_pt, 'iid_prob_ya',          0.0)),
                     iid_std_ya           = float(getattr(_pt, 'iid_std_ya',           0.0)),
+                    local_root_artifact_prob = float(getattr(_pt, 'local_root_artifact_prob', 0.0)),
+                    local_root_artifact_xy_std = float(getattr(_pt, 'local_root_artifact_xy_std', 0.0)),
+                    local_root_artifact_yaw_std = float(getattr(_pt, 'local_root_artifact_yaw_std', 0.0)),
                 )
                 print(
                     f"[Runner] Adaptive DR (PI controller): "
@@ -754,6 +757,11 @@ class OnPolicyRunner:
             _mcmd.perturber.cfg.iid_std_rp          = _pt('iid_std_rp')          * scale
             _mcmd.perturber.cfg.iid_prob_ya         = _pt('iid_prob_ya')
             _mcmd.perturber.cfg.iid_std_ya          = _pt('iid_std_ya')          * scale
+            _mcmd.perturber.cfg.local_root_artifact_prob = _pt('local_root_artifact_prob')
+            # Local artifact magnitudes are multiplied by perturber._dr_scale
+            # at burst sampling time, so keep cfg as the unscaled base value.
+            _mcmd.perturber.cfg.local_root_artifact_xy_std = _pt('local_root_artifact_xy_std')
+            _mcmd.perturber.cfg.local_root_artifact_yaw_std = _pt('local_root_artifact_yaw_std')
             _mcmd.perturber._dr_scale = float(scale)
 
         # ── FrontRES supervised warmup (Stage 1 → Stage 2 merge) ──────────────────
