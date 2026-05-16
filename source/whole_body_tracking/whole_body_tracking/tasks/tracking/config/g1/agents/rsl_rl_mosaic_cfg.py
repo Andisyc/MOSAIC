@@ -524,7 +524,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     debug_critic_warmup_iterations = 0
     debug_ppo_actor_warmup_iterations = 0
     debug_ppo_actor_ramp_iterations = 100
-    debug_dr_scale_init            = 0.5
+    debug_dr_scale_init            = 1.0
     debug_dr_min_scale             = 0.3
     debug_dr_ema_alpha             = 0.90
     debug_dr_p_gain                = 0.20
@@ -549,7 +549,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     supervised_warmup_diag_interval = 60
 
     # ── Adaptive DR: r_delta-sign PI controller ────────────────────────────
-    dr_scale_init                  = 0.5    # fixed during Actor takeover; strong enough for visible repair gap
+    dr_scale_init                  = 1.0    # fixed during Actor takeover; calibrated near repairable GMT damage
     dr_adapt_speed                 = 0.001  # per-iteration step size
     dr_max_scale                   = 4.0    # upper limit
     dr_min_scale                   = 0.30   # do not collapse below the xy/yaw debug signal floor
@@ -569,9 +569,9 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     iid_prob_rp                    = 0.0    # disabled for xy/yaw alignment
     iid_prob_ya                    = 0.3    # Yaw: stronger debug signal
     iid_std_z                      = 0.05   # Z jump std (m), scaled by dr_scale
-    iid_std_xy                     = 0.08   # XY jump std (m)
+    iid_std_xy                     = 0.15   # XY jump std (m), calibrated from robustness validation
     iid_std_rp                     = 0.05   # RP jump std (rad)
-    iid_std_ya                     = 0.12   # Yaw jump std (rad)
+    iid_std_ya                     = 0.15   # Yaw jump std (rad), calibrated from robustness validation
 
     # ── Legacy Critic warmup ───────────────────────────────────────────────
     # Disabled because Critic now learns executable damage during joint warmup.
