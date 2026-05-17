@@ -488,23 +488,48 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_perturbation_channels = "xy_yaw"  # align damage source with active correction dims
 
     # "More executable" reward, clean-gap normalized:
-    #   damage_gap  = R_clean - R_noisy
-    #   repair_gain = R_frontres - R_noisy
+    #   damage_gap  = R_clean - R_perturbed
+    #   repair_gain = R_frontres - R_perturbed
     #   repair_ratio = repair_gain / max(damage_gap, gap_floor)
     # Smooth gates split samples into safe / repairable / broken instead of
     # using hard thresholds, so PPO still sees a continuous learning signal.
     frontres_exec_reward_weight    = 1.0
     frontres_exec_reward_temp      = 1.0
+    # Keep repair_ratio diagnostic in [-1, 1], but amplify its PPO signal.
+    # The per-step executable gain is intentionally small; without this scale
+    # PPO mostly sees rollout noise and the minimum-intervention prior.
+    frontres_repair_reward_scale   = 5.0
     # FrontRES-specific executability score.  This deliberately excludes
     # teleop rewards and actuator penalties from RewardsExpertCfg.
-    frontres_exec_stability_weight = 1.0
-    frontres_exec_task_weight      = 0.25
+    #
+    # Planar executability is the primary signal for the active dx/dy/dyaw
+    # correction branch.  Vertical/rp executability is retained as a weak
+    # safety prior, not as the dominant reward.
+    frontres_exec_planar_weight    = 1.0
+    frontres_exec_vertical_weight  = 0.05
+    frontres_exec_task_weight      = 0.20
+    frontres_exec_anchor_xy_threshold = 0.35
+    frontres_exec_anchor_yaw_threshold = 0.45
+    frontres_exec_anchor_xy_vel_std = 1.0
+    frontres_exec_anchor_yaw_rate_std = 1.0
+    frontres_exec_anchor_xy_weight = 1.0
+    frontres_exec_anchor_yaw_weight = 1.0
+    frontres_exec_anchor_xy_vel_weight = 0.5
+    frontres_exec_anchor_yaw_rate_weight = 0.5
+    frontres_exec_foot_phase_weight = 0.5
+    frontres_exec_foot_body_names = [
+        "left_ankle_roll_link",
+        "right_ankle_roll_link",
+    ]
+    frontres_exec_foot_phase_z_threshold = 0.12
+    frontres_exec_foot_phase_gate_temp = 0.03
+    frontres_exec_foot_phase_xy_threshold = 0.25
     frontres_exec_anchor_z_threshold = 0.25
     frontres_exec_anchor_ori_threshold = 0.20
     frontres_exec_ee_z_threshold   = 0.25
-    frontres_exec_anchor_z_weight  = 1.0
-    frontres_exec_anchor_ori_weight = 1.0
-    frontres_exec_ee_z_weight      = 1.0
+    frontres_exec_anchor_z_weight  = 0.0
+    frontres_exec_anchor_ori_weight = 0.25
+    frontres_exec_ee_z_weight      = 0.0
     frontres_exec_body_lin_vel_std = 1.0
     frontres_exec_body_ang_vel_std = 3.14
     frontres_exec_anchor_lin_vel_std = 1.0
@@ -565,14 +590,14 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     #   Critic: E(s_noisy) ≈ max(R_clean - R_noisy, 0)
     # PPO still keeps an online supervised anchor afterwards, so the transition
     # is gradual rather than a hard switch.
-    supervised_warmup_iterations   = 600
+    supervised_warmup_iterations   = 400
     supervised_warmup_steps_per_iter = 8
     supervised_warmup_max_envs_per_step = 4096
     supervised_warmup_dr_scale_start = 0.35  # curriculum start: easy enough for stable direction learning
     supervised_warmup_dr_scale      = 1.00   # curriculum end: match Actor-takeover DR difficulty
     supervised_warmup_lr           = 1e-4
     supervised_warmup_epochs       = 3
-    supervised_warmup_diag_interval = 60
+    supervised_warmup_diag_interval = 40
 
     # ── Adaptive DR: r_delta-sign PI controller ────────────────────────────
     dr_scale_init                  = 1.0    # fixed during Actor takeover; calibrated near repairable GMT damage
@@ -692,7 +717,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         # distribution.  Ramp slowly so PPO does not push the warmup solution
         # out of its executable neighborhood in the first few hundred iters.
         ppo_actor_warmup_iterations   = 0,
-        ppo_actor_ramp_iterations     = 800,
+        ppo_actor_ramp_iterations     = 400,
         ppo_advantage_focal_power     = 0.0,
         frontres_active_task_dims      = [0, 1, 5],
         diagnose_gradient_conflict    = True,
