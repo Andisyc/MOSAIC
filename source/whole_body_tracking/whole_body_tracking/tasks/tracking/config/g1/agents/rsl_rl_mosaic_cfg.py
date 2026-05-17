@@ -487,8 +487,8 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_active_task_dims      = [2, 3, 4, 6, 7]
     frontres_perturbation_channels = "z_rp"  # align damage source with active correction dims
 
-    # "More executable" reward, clean-gap normalized:
-    #   damage_gap  = R_clean - R_perturbed
+    # "More executable" reward, feasible-gap normalized:
+    #   damage_gap  = R_feasible_oracle - R_perturbed
     #   repair_gain = R_frontres - R_perturbed
     #   repair_ratio = repair_gain / max(damage_gap, gap_floor)
     # Smooth gates split samples into safe / repairable / broken instead of
@@ -589,7 +589,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # ── Joint warmup before PPO loop ───────────────────────────────────────
     # Same rollout batch trains both halves of the concept:
     #   Actor:  Δ ≈ -noise
-    #   Critic: E(s_noisy) ≈ max(R_clean - R_noisy, 0)
+    #   Critic: E(s_noisy) ≈ max(R_feasible_oracle - R_noisy, 0)
     # PPO still keeps an online supervised anchor afterwards, so the transition
     # is gradual rather than a hard switch.
     supervised_warmup_iterations   = 400
@@ -632,7 +632,11 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     local_root_artifact_yaw_std    = 0.24   # radians at dr_scale=1
     float_prob                     = 0.3
     float_ratio                    = 0.05
-    sink_prob                      = 0.3    # supervised/runtime positive Δz is contact-blocked
+    # Sink artifacts are kept in the DR distribution, but the executable-gap
+    # oracle only credits the part that is feasible under the active action cone
+    # (mostly roll/pitch repair and jump-time penetration removal).  Root-level
+    # upward Δz remains blocked during action application.
+    sink_prob                      = 0.3
     sink_ratio                     = 0.04
     root_tilt_prob                 = 0.3
     root_tilt_max_rad              = 0.05

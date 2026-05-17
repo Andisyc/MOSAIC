@@ -31,7 +31,16 @@ from rsl_rl.modules import (
     FrontRESActorCritic, # 引入第二阶段模型
 )
 from rsl_rl.utils import store_code_state
-from isaaclab.utils.math import quat_error_magnitude, quat_from_euler_xyz, quat_rotate_inverse
+from isaaclab.utils.math import (
+    quat_error_magnitude,
+    quat_from_euler_xyz,
+    quat_rotate_inverse,
+    euler_xyz_from_quat,
+    quat_mul,
+    quat_inv,
+    quat_apply,
+    yaw_quat,
+)
 
 
 class OnPolicyRunner:
@@ -349,9 +358,9 @@ class OnPolicyRunner:
         def cfg_float(name: str, default: float) -> float:
             return float(self.cfg.get(name, default))
 
-        def quat_to_yaw_xyzw(q: torch.Tensor) -> torch.Tensor:
-            x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-            return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        def quat_to_yaw_wxyz(q: torch.Tensor) -> torch.Tensor:
+            _, _, yaw = euler_xyz_from_quat(q)
+            return yaw
 
         def wrap_pi(a: torch.Tensor) -> torch.Tensor:
             return torch.atan2(torch.sin(a), torch.cos(a))
@@ -363,7 +372,7 @@ class OnPolicyRunner:
 
         anchor_xy_err = torch.norm(command.anchor_pos_w[:, :2] - command.robot_anchor_pos_w[:, :2], dim=-1)
         anchor_xy_score = (1.0 - anchor_xy_err / max(anchor_xy_th, 1e-6)).clamp(-1.0, 1.0)
-        anchor_yaw_err = wrap_pi(quat_to_yaw_xyzw(command.anchor_quat_w) - quat_to_yaw_xyzw(command.robot_anchor_quat_w)).abs()
+        anchor_yaw_err = wrap_pi(quat_to_yaw_wxyz(command.anchor_quat_w) - quat_to_yaw_wxyz(command.robot_anchor_quat_w)).abs()
         anchor_yaw_score = (1.0 - anchor_yaw_err / max(anchor_yaw_th, 1e-6)).clamp(-1.0, 1.0)
         anchor_xy_vel_err = torch.square(
             command.anchor_lin_vel_w[:, :2] - command.robot_anchor_lin_vel_w[:, :2]
@@ -487,6 +496,97 @@ class OnPolicyRunner:
                 "task": torch.nan_to_num(task_score, nan=0.0, posinf=1.0, neginf=0.0),
             }
         return score
+
+    def _frontres_feasible_oracle_exec_score(self, command, start: int, count: int) -> torch.Tensor:
+        """Executability score after the best correction allowed by the active action cone.
+
+        This is the reward-side oracle, not an action target for the policy.  It
+        projects the clean-reference correction into the same feasible cone used
+        when applying FrontRES actions: z can move down freely, but upward z is
+        limited to jump-time penetration removal; roll/pitch may be repaired;
+        x/y/yaw are left untouched in the current z/rp experiment.
+        """
+        if count <= 0:
+            return torch.empty(0, device=self.device)
+
+        needed = (
+            "anchor_pos_w_original",
+            "anchor_pos_w_raw",
+            "anchor_quat_w_original",
+            "anchor_quat_w_raw",
+            "_frontres_pos_correction",
+            "_frontres_quat_correction",
+        )
+        if not all(hasattr(command, name) for name in needed):
+            return self._frontres_exec_score(command)[start:start + count]
+
+        env_slice = slice(start, start + count)
+        raw_pos = command.anchor_pos_w_raw[env_slice]
+        clean_pos = command.anchor_pos_w_original[env_slice]
+        raw_quat = command.anchor_quat_w_raw[env_slice]
+        clean_quat = command.anchor_quat_w_original[env_slice]
+
+        max_delta_pos = float(getattr(getattr(self.alg, "policy", None), "max_delta_pos", 0.3))
+        max_delta_rpy = float(getattr(getattr(self.alg, "policy", None), "max_delta_rpy", 0.1))
+
+        oracle_pos = torch.zeros_like(raw_pos)
+        dz_clean = clean_pos[:, 2] - raw_pos[:, 2]
+        z_upper = torch.zeros_like(dz_clean)
+        if hasattr(command, "jump_degree") and hasattr(command, "anchor_penetration_depth"):
+            jump_degree = command.jump_degree[env_slice].to(raw_pos.device).to(raw_pos.dtype).clamp(0.0, 1.0)
+            penetration = command.anchor_penetration_depth[env_slice].to(raw_pos.device).to(raw_pos.dtype)
+            z_upper = (jump_degree * penetration).clamp(max=max_delta_pos)
+        z_lower = torch.full_like(dz_clean, -max_delta_pos)
+        oracle_pos[:, 2] = torch.minimum(torch.maximum(dz_clean, z_lower), z_upper)
+
+        correction_quat = quat_mul(quat_inv(raw_quat), clean_quat)
+        roll, pitch, _ = euler_xyz_from_quat(correction_quat)
+        roll = roll.clamp(-max_delta_rpy, max_delta_rpy)
+        pitch = pitch.clamp(-max_delta_rpy, max_delta_rpy)
+        yaw = torch.zeros_like(roll)
+        oracle_quat = quat_from_euler_xyz(roll, pitch, yaw)
+
+        saved_pos = command._frontres_pos_correction[env_slice].clone()
+        saved_quat = command._frontres_quat_correction[env_slice].clone()
+        saved_body_pos = None
+        saved_body_quat = None
+        try:
+            command._frontres_pos_correction[env_slice].copy_(oracle_pos)
+            command._frontres_quat_correction[env_slice].copy_(oracle_quat)
+            if hasattr(command, "body_pos_relative_w") and hasattr(command, "body_quat_relative_w"):
+                saved_body_pos = command.body_pos_relative_w[env_slice].clone()
+                saved_body_quat = command.body_quat_relative_w[env_slice].clone()
+
+                body_count = len(getattr(command.cfg, "body_names", []))
+                if body_count > 0:
+                    anchor_pos = command.anchor_pos_w[env_slice]
+                    anchor_quat = command.anchor_quat_w[env_slice]
+                    robot_anchor_pos = command.robot_anchor_pos_w[env_slice]
+                    robot_anchor_quat = command.robot_anchor_quat_w[env_slice]
+                    body_pos = command.body_pos_w[env_slice]
+                    body_quat = command.body_quat_w[env_slice]
+
+                    anchor_pos_repeat = anchor_pos[:, None, :].repeat(1, body_count, 1)
+                    anchor_quat_repeat = anchor_quat[:, None, :].repeat(1, body_count, 1)
+                    robot_anchor_pos_repeat = robot_anchor_pos[:, None, :].repeat(1, body_count, 1)
+                    robot_anchor_quat_repeat = robot_anchor_quat[:, None, :].repeat(1, body_count, 1)
+
+                    delta_pos = robot_anchor_pos_repeat.clone()
+                    delta_pos[..., 2] = anchor_pos_repeat[..., 2]
+                    delta_ori = yaw_quat(quat_mul(robot_anchor_quat_repeat, quat_inv(anchor_quat_repeat)))
+                    command.body_quat_relative_w[env_slice].copy_(quat_mul(delta_ori, body_quat))
+                    command.body_pos_relative_w[env_slice].copy_(
+                        delta_pos + quat_apply(delta_ori, body_pos - anchor_pos_repeat)
+                    )
+            feasible_score = self._frontres_exec_score(command)[env_slice].clone()
+        finally:
+            command._frontres_pos_correction[env_slice].copy_(saved_pos)
+            command._frontres_quat_correction[env_slice].copy_(saved_quat)
+            if saved_body_pos is not None:
+                command.body_pos_relative_w[env_slice].copy_(saved_body_pos)
+            if saved_body_quat is not None:
+                command.body_quat_relative_w[env_slice].copy_(saved_body_quat)
+        return feasible_score
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         print("[Runner] learn() entered — initializing logger...", flush=True)
@@ -746,8 +846,8 @@ class OnPolicyRunner:
         #   [0:N_train)                  FrontRES on noisy reference
         #   [N_train:N_train+N_base)      GMT on the same noisy reference
         #   [N_train+N_base:...)          GMT on the clean reference
-        # This exposes the executable gap:
-        #   R_clean - R_noisy
+        # This exposes the feasible executable gap:
+        #   R_feasible_oracle - R_noisy
         # and the repair gain:
         #   R_frontres - R_noisy
         if _is_frontres:
@@ -1023,13 +1123,14 @@ class OnPolicyRunner:
                         _target = _get_warmup_target(_env_raw, "motion").to(self.device)
                         if "N_train" in locals() and N_train > 0 and N_base > 0 and N_clean > 0:
                             _n_energy = min(N_train, N_base, N_clean)
-                            _clean_start_wu = N_train + N_base
                             _mcmd_wu = _env_raw.command_manager._terms.get("motion")
                             if _mcmd_wu is not None:
                                 _exec_wu = self._frontres_exec_score(_mcmd_wu).to(self.device)
                                 _r_perturbed_wu = _exec_wu[N_train:N_train + _n_energy].view(-1)
-                                _r_clean_wu = _exec_wu[_clean_start_wu:_clean_start_wu + _n_energy].view(-1)
-                                _energy_target = (_r_clean_wu - _r_perturbed_wu).clamp(min=0.0).unsqueeze(-1)
+                                _r_feasible_wu = self._frontres_feasible_oracle_exec_score(
+                                    _mcmd_wu, N_train, _n_energy
+                                ).to(self.device).view(-1)
+                                _energy_target = (_r_feasible_wu - _r_perturbed_wu).clamp(min=0.0).unsqueeze(-1)
                             else:
                                 _energy_target = torch.zeros(_n_energy, 1, device=self.device)
                             _p_obs = _p_obs[:_n_energy]
@@ -1054,7 +1155,7 @@ class OnPolicyRunner:
 
                 # Joint SGD over collected rollout data:
                 #   Actor:  Δ ≈ -noise
-                #   Critic: E(s_perturbed) ≈ max(R_exec_clean - R_exec_perturbed, 0)
+                #   Critic: E(s_perturbed) ≈ max(R_exec_feasible_oracle - R_exec_perturbed, 0)
                 _all_obs = torch.cat(_wo_list, dim=0)      # (S*E, _nfo)
                 _all_tgt = torch.cat(_wt_list, dim=0)      # (S*E, 6)
                 _all_critic_obs = torch.cat(_wc_list, dim=0)
@@ -1726,24 +1827,20 @@ class OnPolicyRunner:
                             _dr_xy_fr   = _a_raw[:N_train, :2] - _a_w[:N_train, :2]
                             _corr_xy_fr = _a_fr[:N_train,  :2] - _a_raw[:N_train, :2]
                             _r_xy = _r_vec(_dr_xy_fr, _corr_xy_fr)
-                            def _quat_to_rpy_xyzw(q: torch.Tensor):
-                                # IsaacLab tensors here are xyzw. Keep yaw separate below so
-                                # roll/pitch reward does not double-count heading errors.
-                                x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-                                roll = torch.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
-                                pitch_arg = 2.0 * (w * y - z * x)
-                                pitch = torch.asin(torch.clamp(pitch_arg, -1.0, 1.0))
-                                yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-                                return roll, pitch, yaw
+                            def _quat_to_rpy_wxyz(q: torch.Tensor):
+                                # IsaacLab quaternions are wxyz.  Use the same helper as
+                                # supervised_target construction to keep diagnostics/reward
+                                # aligned with the command term.
+                                return euler_xyz_from_quat(q)
 
                             def _wrap_pi(a: torch.Tensor):
                                 return torch.atan2(torch.sin(a), torch.cos(a))
 
                             # Roll/Pitch only.  The previous full-quaternion error also
                             # included yaw, which made the 0.4 RP term dominate r_delta.
-                            _roll_raw, _pitch_raw, _yaw_raw = _quat_to_rpy_xyzw(_q_raw[:N_train])
-                            _roll_fr,  _pitch_fr,  _yaw_fr  = _quat_to_rpy_xyzw(_q_fr[:N_train])
-                            _roll_w,   _pitch_w,   _yaw_w   = _quat_to_rpy_xyzw(_q_w[:N_train])
+                            _roll_raw, _pitch_raw, _yaw_raw = _quat_to_rpy_wxyz(_q_raw[:N_train])
+                            _roll_fr,  _pitch_fr,  _yaw_fr  = _quat_to_rpy_wxyz(_q_fr[:N_train])
+                            _roll_w,   _pitch_w,   _yaw_w   = _quat_to_rpy_wxyz(_q_w[:N_train])
                             _rp_raw = torch.stack(
                                 [_wrap_pi(_roll_raw - _roll_w), _wrap_pi(_pitch_raw - _pitch_w)], dim=-1
                             )
@@ -1802,7 +1899,9 @@ class OnPolicyRunner:
                             )
                             _exec_frontres = _exec_score_all[:_n_exec]
                             _exec_perturbed = _exec_score_all[_base_start:_base_start + _n_exec]
-                            _exec_clean = _exec_score_all[_clean_start:_clean_start + _n_exec]
+                            _exec_feasible = self._frontres_feasible_oracle_exec_score(
+                                _mcmd_rdelta, _base_start, _n_exec
+                            ).to(self.device).view(-1)
                             _exec_planar_log = _exec_components["planar"][:_n_exec].mean()
                             _exec_vertical_log = _exec_components["vertical"][:_n_exec].mean()
                             _exec_task_log = _exec_components["task"][:_n_exec].mean()
@@ -1838,9 +1937,14 @@ class OnPolicyRunner:
                             _w_geom = float(self.cfg.get("frontres_geometry_reward_weight", 0.05))
                             _w_rescue = float(self.cfg.get("frontres_rescue_reward_weight", 1.0))
                             # Executable-gap reward:
-                            #   damage_gap  = R_clean_exec - R_perturbed_exec
+                            #   damage_gap  = R_feasible_oracle_exec - R_perturbed_exec
                             #   repair_gain = R_frontres_exec - R_perturbed_exec
                             #   repair_ratio = repair_gain / damage_gap
+                            #
+                            # The feasible oracle is the clean-reference repair
+                            # projected into the active action cone.  This prevents
+                            # root sink artifacts from becoming false "repairable"
+                            # targets when upward Δz is blocked for dynamics safety.
                             #
                             # This makes the scale of r_delta invariant to the raw
                             # score magnitude.  Safe/no-op, repairable, and
@@ -1848,7 +1952,7 @@ class OnPolicyRunner:
                             #   safe:    no meaningful damage -> learn minimum intervention
                             #   fragile: damage exists and is repairable -> learn repair
                             #   broken:  damage too large or currently unrepaired -> learn abstention cost
-                            _gap_raw = _exec_clean - _exec_perturbed
+                            _gap_raw = _exec_feasible - _exec_perturbed
                             _damage_gap = _gap_raw.clamp(min=0.0)
                             _repair_gain = _exec_frontres - _exec_perturbed
                             _gap_floor = float(self.cfg.get("frontres_gap_floor_per_step", 0.005))
@@ -2701,7 +2805,7 @@ class OnPolicyRunner:
         # is_full_resume=True  (Stage2→Stage2 断点续训): 恢复优化器矩估计+学习率, 保留 std
         # is_full_resume=False (Stage1→Stage2 权重迁移): 仅权重, 重置优化器和 std.
         # Joint-warmup checkpoints are a special case: their critic has already
-        # learned E(s)=R_clean-R_noisy and should be transferred into RL.
+        # learned E(s)=R_feasible_oracle-R_noisy and should be transferred into RL.
         # load_optimizer 参数仍可从外部显式覆盖（例如强制跳过优化器加载）。
         is_full_resume: bool = self.cfg.get('is_full_resume', True)
         if not is_full_resume:
