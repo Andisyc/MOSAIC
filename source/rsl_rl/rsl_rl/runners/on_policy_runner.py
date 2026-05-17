@@ -1062,6 +1062,14 @@ class OnPolicyRunner:
                 _N = _all_obs.shape[0]
                 _last_actor_loss = torch.tensor(0.0, device=self.device)
                 _last_energy_loss = torch.tensor(0.0, device=self.device)
+                _sup_mask = None
+                _active_sup_dims = getattr(self.alg, "frontres_active_task_dims", None)
+                if _active_sup_dims is not None:
+                    _sup_mask = torch.zeros(_all_tgt.shape[-1], device=self.device, dtype=_all_tgt.dtype)
+                    for _dim in _active_sup_dims:
+                        _dim = int(_dim)
+                        if 0 <= _dim < _sup_mask.numel():
+                            _sup_mask[_dim] = 1.0
 
                 for epoch in range(_warmup_epochs):
                     perm = torch.randperm(_N, device=self.device)
@@ -1084,6 +1092,9 @@ class OnPolicyRunner:
                         else:
                             pred_sup = pred[:, :_all_tgt.shape[-1]]
                             target_sup = _all_tgt[idx]
+                        if _sup_mask is not None:
+                            pred_sup = pred_sup * _sup_mask.view(1, -1)
+                            target_sup = target_sup * _sup_mask.view(1, -1)
 
                         target_norm = target_sup.norm(dim=-1)
                         valid = target_norm > 1e-4
@@ -1138,6 +1149,9 @@ class OnPolicyRunner:
                         else:
                             _pred_all = _pred_all_raw[:, :_all_tgt.shape[-1]]
                             _target_all = _all_tgt
+                        if _sup_mask is not None:
+                            _pred_all = _pred_all * _sup_mask.view(1, -1)
+                            _target_all = _target_all * _sup_mask.view(1, -1)
 
                         _valid_all = _target_all.norm(dim=-1) > 1e-4
                         _valid_pos = _target_all[:, :3].norm(dim=-1) > 1e-4
