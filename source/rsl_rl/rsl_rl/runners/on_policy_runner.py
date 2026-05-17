@@ -1070,6 +1070,13 @@ class OnPolicyRunner:
                         _dim = int(_dim)
                         if 0 <= _dim < _sup_mask.numel():
                             _sup_mask[_dim] = 1.0
+                    if _wu == 0:
+                        print(
+                            "[Runner] Joint warmup supervised active mask: "
+                            f"{[float(x) for x in _sup_mask.detach().cpu().tolist()]} "
+                            "(dx,dy,dz,droll,dpitch,dyaw)",
+                            flush=True,
+                        )
 
                 for epoch in range(_warmup_epochs):
                     perm = torch.randperm(_N, device=self.device)
@@ -1173,6 +1180,16 @@ class OnPolicyRunner:
                                 return a[mask].norm(dim=-1).mean().item()
                             return 0.0
 
+                        def _masked_abs_mean(a, mask):
+                            if mask.any():
+                                return a[mask].abs().mean().item()
+                            return 0.0
+
+                        def _sign_agreement(a, b, mask):
+                            if mask.any():
+                                return ((a[mask] * b[mask]) > 0.0).float().mean().item()
+                            return 0.0
+
                         if _valid_all.any():
                             _warmup_cos = torch.nn.functional.cosine_similarity(
                                 _pred_all[_valid_all], _target_all[_valid_all], dim=-1).mean().item()
@@ -1183,6 +1200,21 @@ class OnPolicyRunner:
                         _valid_rpy_frac = _valid_rpy.float().mean().item()
                         _cos_pos = _masked_cos(_pred_all[:, :3], _target_all[:, :3], _valid_pos)
                         _cos_rpy = _masked_cos(_pred_all[:, 3:], _target_all[:, 3:], _valid_rpy)
+                        _valid_roll = _target_all[:, 3].abs() > 1e-4
+                        _valid_pitch = _target_all[:, 4].abs() > 1e-4
+                        _valid_yaw = _target_all[:, 5].abs() > 1e-4
+                        _sign_roll = _sign_agreement(_pred_all[:, 3], _target_all[:, 3], _valid_roll)
+                        _sign_pitch = _sign_agreement(_pred_all[:, 4], _target_all[:, 4], _valid_pitch)
+                        _sign_yaw = _sign_agreement(_pred_all[:, 5], _target_all[:, 5], _valid_yaw)
+                        _abs_tgt_roll = _masked_abs_mean(_target_all[:, 3], _valid_roll)
+                        _abs_tgt_pitch = _masked_abs_mean(_target_all[:, 4], _valid_pitch)
+                        _abs_tgt_yaw = _masked_abs_mean(_target_all[:, 5], _valid_yaw)
+                        _abs_pred_roll = _masked_abs_mean(_pred_all[:, 3], _valid_roll)
+                        _abs_pred_pitch = _masked_abs_mean(_pred_all[:, 4], _valid_pitch)
+                        _abs_pred_yaw = _masked_abs_mean(_pred_all[:, 5], _valid_yaw)
+                        _valid_roll_frac = _valid_roll.float().mean().item()
+                        _valid_pitch_frac = _valid_pitch.float().mean().item()
+                        _valid_yaw_frac = _valid_yaw.float().mean().item()
                         _mae_pos = _masked_mae(_pred_all[:, :3], _target_all[:, :3], _valid_pos)
                         _mae_rpy = _masked_mae(_pred_all[:, 3:], _target_all[:, 3:], _valid_rpy)
                         _pred_pos_norm = _masked_norm(_pred_all[:, :3], _valid_pos)
@@ -1223,6 +1255,12 @@ class OnPolicyRunner:
                           f"mae_pos={_mae_pos:.5f}m, mae_rpy={_mae_rpy:.5f}rad, "
                           f"|pred_pos|/|tgt_pos|={_pred_pos_norm:.5f}/{_tgt_pos_norm:.5f}, "
                           f"|pred_rpy|/|tgt_rpy|={_pred_rpy_norm:.5f}/{_tgt_rpy_norm:.5f}",
+                          flush=True)
+                    print(f"[Runner]      diag_rpy: "
+                          f"sign_r/p/y={_sign_roll:.3f}/{_sign_pitch:.3f}/{_sign_yaw:.3f}, "
+                          f"valid_r/p/y={_valid_roll_frac:.3f}/{_valid_pitch_frac:.3f}/{_valid_yaw_frac:.3f}, "
+                          f"|pred_r/p/y|={_abs_pred_roll:.5f}/{_abs_pred_pitch:.5f}/{_abs_pred_yaw:.5f}, "
+                          f"|tgt_r/p/y|={_abs_tgt_roll:.5f}/{_abs_tgt_pitch:.5f}/{_abs_tgt_yaw:.5f}",
                           flush=True)
                     print(f"[Runner]      energy: "
                           f"loss={_energy_loss_all:.6f}, mae={_energy_mae:.6f}, "
