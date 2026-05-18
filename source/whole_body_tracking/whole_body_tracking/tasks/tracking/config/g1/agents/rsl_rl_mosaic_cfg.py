@@ -479,13 +479,14 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # ── Fix 2: Low-pass filter on anchor corrections ──────────────────────────
     correction_smooth_alpha        = 0.4
 
-    # ── FrontRES experiment 2: vertical/tilt residual only ────────────────────
+    # ── FrontRES full-output joint test ───────────────────────────────────────
     # Task-space action layout:
     #   [dx, dy, dz, droll, dpitch, dyaw, c_pos, c_rpy]
-    # Only Δz and Δroll/Δpitch are allowed to reach the command term.  Δxy/Δyaw
-    # are structurally zeroed so this run independently tests vertical repair.
-    frontres_active_task_dims      = [2, 3, 4, 6, 7]
-    frontres_perturbation_channels = "z_rp"  # align damage source with active correction dims
+    # All correction and confidence heads are enabled here.  This is expected to
+    # expose reward competition between planar and vertical repair, which is the
+    # point of the joint test after the separated branches have been validated.
+    frontres_active_task_dims      = [0, 1, 2, 3, 4, 5, 6, 7]
+    frontres_perturbation_channels = "all"
 
     # "More executable" reward, feasible-gap normalized:
     #   damage_gap  = R_feasible_oracle - R_perturbed
@@ -502,10 +503,10 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # FrontRES-specific executability score.  This deliberately excludes
     # teleop rewards and actuator penalties from RewardsExpertCfg.
     #
-    # Vertical/rp executability is the primary signal for the active dz/droll/
-    # dpitch correction branch.  Planar executability is retained as a weak
-    # safety prior, not as the dominant reward.
-    frontres_exec_planar_weight    = 0.0
+    # Full-output test: planar and vertical executability are both active.  Task
+    # velocity consistency remains a weak anti-cheat prior so the policy cannot
+    # simply make the reference easier by erasing motion.
+    frontres_exec_planar_weight    = 1.0
     frontres_exec_vertical_weight  = 1.0
     frontres_exec_task_weight      = 0.10
     frontres_exec_anchor_xy_threshold = 0.35
@@ -564,7 +565,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # Calibration run: make the minimum-intervention prior visible but not
     # dominant.  Current repair_gain is O(1e-3), so the previous weights
     # produced O(1e-1) costs and overwhelmed the gain diagnostics.
-    frontres_intervention_cost_weights = [0.0, 0.0, 0.002, 0.01, 0.01, 0.0]
+    frontres_intervention_cost_weights = [0.005, 0.005, 0.002, 0.01, 0.01, 0.005]
 
     # ── Fast debug mode: shortens the feedback loop for reward/DR tuning ─────
     # Formal training leaves this False.  Enable with:
@@ -614,22 +615,28 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # command term.  Stability is handled by conservative projection, confidence,
     # supervised warmup, and low initial DR scale.
     # ── IID step-jump perturbation probabilities (per-axis, per-step) ──────
-    # Alignment experiment: only Z/Roll/Pitch perturbations are enabled because
-    # the active action mask is [dz, droll, dpitch].  XY/Yaw are disabled here
-    # so the repair reward does not ask Actor to fix channels it cannot control.
+    # Full-output test: use both local root artifacts (clear planar/yaw signal)
+    # and vertical/tilt artifacts (clear z/rp signal).  IID channels are kept as
+    # short shocks; OU-like float/sink/root tilt maintain persistent damage.
     iid_prob_z                     = 0.3
-    iid_prob_xy                    = 0.0
+    iid_prob_xy                    = 0.1
     iid_prob_rp                    = 0.2
-    iid_prob_ya                    = 0.0
+    iid_prob_ya                    = 0.1
     iid_std_z                      = 0.06   # Z jump std (m), scaled by dr_scale
-    iid_std_xy                     = 0.15   # unused when iid_prob_xy=0
+    iid_std_xy                     = 0.15
     iid_std_rp                     = 0.05   # RP jump std (rad)
-    iid_std_ya                     = 0.15   # unused when iid_prob_ya=0
-    local_root_artifact_prob       = 0.0    # xy/yaw artifact disabled in z/rp experiment
+    iid_std_ya                     = 0.15
+    local_root_artifact_prob       = 0.3
     local_root_artifact_min_steps  = 6
     local_root_artifact_max_steps  = 12
     local_root_artifact_xy_std     = 0.18   # metres at dr_scale=1; local contact/heading inconsistency
     local_root_artifact_yaw_std    = 0.24   # radians at dr_scale=1
+    foot_slip_prob                 = 0.2
+    foot_slip_ratio                = 0.008
+    lateral_drift_prob             = 0.3
+    lateral_drift_std              = 0.02
+    joint_noise_prob               = 0.0
+    joint_noise_std                = 0.0
     float_prob                     = 0.3
     float_ratio                    = 0.05
     # Sink artifacts are kept in the DR distribution, but the executable-gap
@@ -731,7 +738,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         ppo_actor_warmup_iterations   = 0,
         ppo_actor_ramp_iterations     = 400,
         ppo_advantage_focal_power     = 0.0,
-        frontres_active_task_dims      = [2, 3, 4],
+        frontres_active_task_dims      = [0, 1, 2, 3, 4, 5, 6, 7],
         diagnose_gradient_conflict    = True,
 
         # ── Misc ─────────────────────────────────────────────────────────────

@@ -216,6 +216,54 @@ def _configure_frontres_motion_perturbations(env_cfg, agent_cfg) -> None:
     pt = env_cfg.motion_perturbations
 
     if mode in ("all", "composite", "full"):
+        # Explicitly mirror the agent-side full-output test settings into the
+        # environment perturbation config.  Without this, "all" silently falls
+        # back to whatever the task cfg default happens to contain, making it
+        # hard to tell whether the joint test is really exercising every
+        # controllable channel.
+        for name in (
+            "float_prob",
+            "float_ratio",
+            "sink_prob",
+            "sink_ratio",
+            "foot_slip_prob",
+            "foot_slip_ratio",
+            "lateral_drift_prob",
+            "lateral_drift_std",
+            "root_tilt_prob",
+            "root_tilt_max_rad",
+            "joint_noise_prob",
+            "joint_noise_std",
+            "iid_prob_z",
+            "iid_std_z",
+            "iid_prob_xy",
+            "iid_std_xy",
+            "iid_prob_rp",
+            "iid_std_rp",
+            "iid_prob_ya",
+            "iid_std_ya",
+            "local_root_artifact_prob",
+            "local_root_artifact_xy_std",
+            "local_root_artifact_yaw_std",
+        ):
+            if hasattr(agent_cfg, name) and hasattr(pt, name):
+                setattr(pt, name, type(getattr(pt, name))(getattr(agent_cfg, name)))
+        for name in ("local_root_artifact_min_steps", "local_root_artifact_max_steps"):
+            if hasattr(agent_cfg, name) and hasattr(pt, name):
+                setattr(pt, name, int(getattr(agent_cfg, name)))
+        print(
+            "[INFO] FrontRES perturbation alignment: all "
+            f"(float={pt.float_prob}/{pt.float_ratio}, sink={pt.sink_prob}/{pt.sink_ratio}, "
+            f"foot_slip={pt.foot_slip_prob}/{pt.foot_slip_ratio}, "
+            f"lateral={pt.lateral_drift_prob}/{pt.lateral_drift_std}, "
+            f"root_tilt={pt.root_tilt_prob}/{pt.root_tilt_max_rad}, "
+            f"iid_xy={pt.iid_prob_xy}/{pt.iid_std_xy}, iid_z={pt.iid_prob_z}/{pt.iid_std_z}, "
+            f"iid_rp={pt.iid_prob_rp}/{pt.iid_std_rp}, iid_yaw={pt.iid_prob_ya}/{pt.iid_std_ya}, "
+            f"local_artifact={pt.local_root_artifact_prob}/"
+            f"{pt.local_root_artifact_xy_std}/{pt.local_root_artifact_yaw_std}/"
+            f"{pt.local_root_artifact_min_steps}-{pt.local_root_artifact_max_steps})",
+            flush=True,
+        )
         return
     if mode not in ("xy_yaw", "xy-yaw", "xyyaw", "z_rp", "z-rp", "zrp"):
         raise ValueError(

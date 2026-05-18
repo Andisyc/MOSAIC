@@ -526,9 +526,13 @@ class OnPolicyRunner:
 
         This is the reward-side oracle, not an action target for the policy.  It
         projects the clean-reference correction into the same feasible cone used
-        when applying FrontRES actions: z can move down freely, but upward z is
-        limited to jump-time penetration removal; roll/pitch may be repaired;
-        x/y/yaw are left untouched in the current z/rp experiment.
+        when applying FrontRES actions.  The cone is determined by
+        frontres_active_task_dims:
+
+        * x/y/yaw are repairable only when their action dims are active.
+        * roll/pitch are repairable only when their action dims are active.
+        * z can move downward freely when active, but upward z is limited to
+          jump-time penetration removal to avoid artificial root lift.
         """
         if count <= 0:
             return torch.empty(0, device=self.device)
@@ -553,21 +557,35 @@ class OnPolicyRunner:
         max_delta_pos = float(getattr(getattr(self.alg, "policy", None), "max_delta_pos", 0.3))
         max_delta_rpy = float(getattr(getattr(self.alg, "policy", None), "max_delta_rpy", 0.1))
 
+        active_dims = getattr(self.alg, "frontres_active_task_dims", self.cfg.get("frontres_active_task_dims", None))
+        active_set = None if active_dims is None else {int(dim) for dim in active_dims}
+
+        def _active(dim: int) -> bool:
+            return active_set is None or dim in active_set
+
         oracle_pos = torch.zeros_like(raw_pos)
+        dpos_clean = clean_pos - raw_pos
+        if _active(0):
+            oracle_pos[:, 0] = dpos_clean[:, 0].clamp(-max_delta_pos, max_delta_pos)
+        if _active(1):
+            oracle_pos[:, 1] = dpos_clean[:, 1].clamp(-max_delta_pos, max_delta_pos)
         dz_clean = clean_pos[:, 2] - raw_pos[:, 2]
         z_upper = torch.zeros_like(dz_clean)
         if hasattr(command, "jump_degree") and hasattr(command, "anchor_penetration_depth"):
             jump_degree = command.jump_degree[env_slice].to(raw_pos.device).to(raw_pos.dtype).clamp(0.0, 1.0)
             penetration = command.anchor_penetration_depth[env_slice].to(raw_pos.device).to(raw_pos.dtype)
             z_upper = (jump_degree * penetration).clamp(max=max_delta_pos)
-        z_lower = torch.full_like(dz_clean, -max_delta_pos)
-        oracle_pos[:, 2] = torch.minimum(torch.maximum(dz_clean, z_lower), z_upper)
+        if _active(2):
+            z_lower = torch.full_like(dz_clean, -max_delta_pos)
+            oracle_pos[:, 2] = torch.minimum(torch.maximum(dz_clean, z_lower), z_upper)
 
         correction_quat = quat_mul(quat_inv(raw_quat), clean_quat)
         correction_rotvec = _quat_to_rotvec_wxyz(correction_quat)
         oracle_rotvec = torch.zeros_like(correction_rotvec)
-        oracle_rotvec[:, 0] = correction_rotvec[:, 0].clamp(-max_delta_rpy, max_delta_rpy)
-        oracle_rotvec[:, 1] = correction_rotvec[:, 1].clamp(-max_delta_rpy, max_delta_rpy)
+        for dim in (3, 4, 5):
+            if _active(dim):
+                axis = dim - 3
+                oracle_rotvec[:, axis] = correction_rotvec[:, axis].clamp(-max_delta_rpy, max_delta_rpy)
         oracle_quat = _rotvec_to_quat_wxyz(oracle_rotvec)
 
         saved_pos = command._frontres_pos_correction[env_slice].clone()
