@@ -1273,20 +1273,41 @@ class OnPolicyRunner:
 
                         target_norm = target_sup.norm(dim=-1)
                         valid = target_norm > 1e-4
-                        sample_weight = torch.ones_like(target_norm)
-                        if valid.any():
-                            sample_weight[valid] = _warmup_valid_w
-                        sample_weight = sample_weight / sample_weight.mean().clamp(min=1e-6)
+                        pos_valid = target_sup[:, :3].norm(dim=-1) > 1e-4
+                        rpy_valid = target_sup[:, 3:].norm(dim=-1) > 1e-4
+                        pos_weight = torch.ones_like(target_norm)
+                        rpy_weight = torch.ones_like(target_norm)
+                        if pos_valid.any():
+                            pos_weight[pos_valid] = _warmup_valid_w
+                        if rpy_valid.any():
+                            rpy_weight[rpy_valid] = _warmup_valid_w
+                        pos_weight = pos_weight / pos_weight.mean().clamp(min=1e-6)
+                        rpy_weight = rpy_weight / rpy_weight.mean().clamp(min=1e-6)
 
                         pos_err = torch.nn.functional.huber_loss(
                             pred_sup[:, :3], target_sup[:, :3].detach(), reduction="none").mean(dim=-1)
                         rpy_err = torch.nn.functional.huber_loss(
                             pred_sup[:, 3:], target_sup[:, 3:].detach(), reduction="none").mean(dim=-1)
                         _rpy_w = float(getattr(self.alg, 'supervised_rpy_loss_weight', 1.0))
-                        loss = (pos_err * sample_weight).mean() + _rpy_w * (rpy_err * sample_weight).mean()
-                        if valid.any() and _warmup_dir_w > 0.0:
-                            direction_loss = 1.0 - torch.nn.functional.cosine_similarity(
-                                pred_sup[valid], target_sup[valid].detach(), dim=-1).mean()
+                        loss = (pos_err * pos_weight).mean() + _rpy_w * (rpy_err * rpy_weight).mean()
+                        if _warmup_dir_w > 0.0:
+                            direction_loss = torch.zeros((), device=self.device)
+                            if pos_valid.any():
+                                direction_loss = direction_loss + (
+                                    1.0 - torch.nn.functional.cosine_similarity(
+                                        pred_sup[pos_valid, :3],
+                                        target_sup[pos_valid, :3].detach(),
+                                        dim=-1,
+                                    ).mean()
+                                )
+                            if rpy_valid.any():
+                                direction_loss = direction_loss + (
+                                    1.0 - torch.nn.functional.cosine_similarity(
+                                        pred_sup[rpy_valid, 3:],
+                                        target_sup[rpy_valid, 3:].detach(),
+                                        dim=-1,
+                                    ).mean()
+                                )
                             loss = loss + _warmup_dir_w * direction_loss
                         _conf_w = float(getattr(self.alg, 'supervised_conf_loss_weight', 0.0))
                         if getattr(self.alg.policy, 'num_task_corrections', 0) > 0 and pred.shape[-1] >= 8 and _conf_w > 0:

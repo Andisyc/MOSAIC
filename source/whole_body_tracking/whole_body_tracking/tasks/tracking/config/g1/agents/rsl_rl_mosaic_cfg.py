@@ -720,7 +720,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         lambda_supervised_min         = 0.20,  # floor: keep Actor near the feasible warmup cone
         lambda_supervised_decay       = 0.997, # per-iter decay after trigger
         supervised_trigger_cosine_sim = 0.85,  # EMA threshold to start decay
-        supervised_rpy_loss_weight    = 0.25,
+        supervised_rpy_loss_weight    = 1.0,
         supervised_conf_loss_weight   = 0.0,   # BCE drives c→1 always (OU≠0); let PPO learn gating
         supervised_direction_loss_weight = 0.1,
         supervised_valid_loss_weight     = 4.0,

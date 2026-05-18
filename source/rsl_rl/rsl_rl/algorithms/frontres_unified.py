@@ -622,22 +622,38 @@ class FrontRESUnified:
         target_norm = target_detached.norm(dim=-1)
         valid = target_norm > 1e-4
 
-        sample_weight = torch.ones_like(target_norm)
-        if valid.any():
-            sample_weight[valid] = float(self.supervised_valid_loss_weight)
-        sample_weight = sample_weight / sample_weight.mean().clamp(min=1e-6)
+        pos_valid = target_detached[:, :3].norm(dim=-1) > 1e-4
+        rpy_valid = target_detached[:, 3:].norm(dim=-1) > 1e-4
+        pos_weight = torch.ones_like(target_norm)
+        rpy_weight = torch.ones_like(target_norm)
+        valid_weight = float(self.supervised_valid_loss_weight)
+        if pos_valid.any():
+            pos_weight[pos_valid] = valid_weight
+        if rpy_valid.any():
+            rpy_weight[rpy_valid] = valid_weight
+        pos_weight = pos_weight / pos_weight.mean().clamp(min=1e-6)
+        rpy_weight = rpy_weight / rpy_weight.mean().clamp(min=1e-6)
 
         pos_err = nn.functional.huber_loss(
             pred[:, :3], target_detached[:, :3], reduction="none").mean(dim=-1)
         rpy_err = nn.functional.huber_loss(
             pred[:, 3:], target_detached[:, 3:], reduction="none").mean(dim=-1)
-        pos_sup = (pos_err * sample_weight).mean()
-        rpy_sup = (rpy_err * sample_weight).mean()
+        pos_sup = (pos_err * pos_weight).mean()
+        rpy_sup = (rpy_err * rpy_weight).mean()
         supervised_loss = pos_sup + self.supervised_rpy_loss_weight * rpy_sup
 
-        if valid.any() and self.supervised_direction_loss_weight > 0:
-            direction_loss = 1.0 - nn.functional.cosine_similarity(
-                pred[valid], target_detached[valid], dim=-1).mean()
+        if self.supervised_direction_loss_weight > 0:
+            direction_loss = torch.zeros((), device=self.device)
+            if pos_valid.any():
+                direction_loss = direction_loss + (
+                    1.0 - nn.functional.cosine_similarity(
+                        pred[pos_valid, :3], target_detached[pos_valid, :3], dim=-1).mean()
+                )
+            if rpy_valid.any():
+                direction_loss = direction_loss + (
+                    1.0 - nn.functional.cosine_similarity(
+                        pred[rpy_valid, 3:], target_detached[rpy_valid, 3:], dim=-1).mean()
+                )
             supervised_loss = supervised_loss + self.supervised_direction_loss_weight * direction_loss
 
         if (
