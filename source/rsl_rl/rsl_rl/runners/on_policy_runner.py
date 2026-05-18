@@ -588,6 +588,47 @@ class OnPolicyRunner:
                 command.body_quat_relative_w[env_slice].copy_(saved_body_quat)
         return feasible_score
 
+    def _frontres_project_task_target_to_action_cone(self, command, target: torch.Tensor) -> torch.Tensor:
+        """Project supervised ΔSE3 targets into the same cone as applied actions.
+
+        The supervised target is the anti-perturbation, but not every
+        anti-perturbation is dynamically admissible.  In particular, ordinary
+        root sink would require upward Δz, which the runtime projection blocks
+        to avoid artificial lift.  Training the actor on that unexecutable
+        target creates an actor/reward mismatch, so the warmup and online
+        supervised anchor use this projected target instead.
+        """
+        if target.numel() == 0 or target.shape[-1] < 6:
+            return target
+
+        projected = target.clone()
+        n = min(projected.shape[0], command._frontres_pos_correction.shape[0])
+        if n <= 0:
+            return projected
+
+        max_delta_pos = float(getattr(getattr(self.alg, "policy", None), "max_delta_pos", 0.3))
+        max_delta_rpy = float(getattr(getattr(self.alg, "policy", None), "max_delta_rpy", 0.1))
+        projected[:n, :3] = projected[:n, :3].clamp(-max_delta_pos, max_delta_pos)
+        projected[:n, 3:6] = projected[:n, 3:6].clamp(-max_delta_rpy, max_delta_rpy)
+
+        active_dims = getattr(self.alg, "frontres_active_task_dims", self.cfg.get("frontres_active_task_dims", None))
+        if active_dims is not None:
+            mask = torch.zeros(6, device=projected.device, dtype=projected.dtype)
+            for dim in active_dims:
+                dim = int(dim)
+                if 0 <= dim < 6:
+                    mask[dim] = 1.0
+            projected[:n, :6] = projected[:n, :6] * mask.view(1, 6)
+
+        z_upper = torch.zeros(n, device=projected.device, dtype=projected.dtype)
+        if hasattr(command, "jump_degree") and hasattr(command, "anchor_penetration_depth"):
+            jump_degree = command.jump_degree[:n].to(projected.device).to(projected.dtype).clamp(0.0, 1.0)
+            penetration = command.anchor_penetration_depth[:n].to(projected.device).to(projected.dtype)
+            z_upper = (jump_degree * penetration).clamp(max=max_delta_pos)
+        z_lower = torch.full_like(z_upper, -max_delta_pos)
+        projected[:n, 2] = torch.minimum(torch.maximum(projected[:n, 2], z_lower), z_upper)
+        return projected
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         print("[Runner] learn() entered — initializing logger...", flush=True)
         # initialize writer
@@ -1121,9 +1162,11 @@ class OnPolicyRunner:
                         else:
                             _c_obs = _p_obs
                         _target = _get_warmup_target(_env_raw, "motion").to(self.device)
+                        _mcmd_wu = _env_raw.command_manager._terms.get("motion")
+                        if _mcmd_wu is not None:
+                            _target = self._frontres_project_task_target_to_action_cone(_mcmd_wu, _target)
                         if "N_train" in locals() and N_train > 0 and N_base > 0 and N_clean > 0:
                             _n_energy = min(N_train, N_base, N_clean)
-                            _mcmd_wu = _env_raw.command_manager._terms.get("motion")
                             if _mcmd_wu is not None:
                                 _exec_wu = self._frontres_exec_score(_mcmd_wu).to(self.device)
                                 _r_perturbed_wu = _exec_wu[N_train:N_train + _n_energy].view(-1)
@@ -1753,8 +1796,11 @@ class OnPolicyRunner:
                         _env_for_sup = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
                         for _cmd_sup in _env_for_sup.command_manager._terms.values():
                             if hasattr(_cmd_sup, 'supervised_target'):
-                                self.alg.transition.supervised_target = \
-                                    _cmd_sup.supervised_target.clone().to(self.device)
+                                _sup_target = _cmd_sup.supervised_target.clone().to(self.device)
+                                _sup_target = self._frontres_project_task_target_to_action_cone(
+                                    _cmd_sup, _sup_target
+                                )
+                                self.alg.transition.supervised_target = _sup_target
                                 break
 
                     # Step the environment 仿真环境更新观测量/动作评分/序列结束与否/监控数据

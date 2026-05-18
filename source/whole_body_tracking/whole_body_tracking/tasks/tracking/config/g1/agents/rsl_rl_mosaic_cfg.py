@@ -717,7 +717,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
 
         # ── Supervised auxiliary loss (λ_sup schedule) ────────────────────────
         lambda_supervised             = 1.0,   # initial weight
-        lambda_supervised_min         = 0.05,  # floor (regulariser)
+        lambda_supervised_min         = 0.20,  # floor: keep Actor near the feasible warmup cone
         lambda_supervised_decay       = 0.997, # per-iter decay after trigger
         supervised_trigger_cosine_sim = 0.85,  # EMA threshold to start decay
         supervised_rpy_loss_weight    = 0.25,
