@@ -1415,50 +1415,74 @@ class OnPolicyRunner:
                         _obs_rpy_best_neg_cos = 0.0
                         _obs_rpy_best_norm = 0.0
                         # FrontRES-only anchor error observations occupy the first 30 dims
-                        # after _apply_obs_normalizer(): [extra | normalized_gmt].  The extra
-                        # block is five history frames of [pos_error(3), rpy_error(3)].  Compare
-                        # it to the supervised target to catch observation/target mismatch.
+                        # after _apply_obs_normalizer(): [extra | normalized_gmt].  IsaacLab
+                        # history flattening can be either term-blocked
+                        #   [pos_hist(5*3), rpy_hist(5*3)]
+                        # or frame-interleaved
+                        #   [[pos(3), rpy(3)] * 5],
+                        # depending on the obs manager version/config.  Check both layouts so
+                        # the diagnostic itself does not become another moving target.
                         if _all_obs.shape[-1] >= 30:
-                            _extra = _all_obs[:, :30].reshape(_all_obs.shape[0], 5, 6)
-                            _obs_pos_frames = _extra[:, :, :3]
-                            _obs_rpy_frames = _extra[:, :, 3:]
+                            _extra = _all_obs[:, :30]
                             _target_pos = _target_all[:, :3]
                             _target_rpy = _target_all[:, 3:]
-                            _pos_cos_vals = []
-                            _rpy_cos_vals = []
-                            _rpy_neg_cos_vals = []
-                            _rpy_norm_vals = []
-                            for _hist_i in range(5):
-                                _pos_mask_i = _valid_pos & (_obs_pos_frames[:, _hist_i].norm(dim=-1) > 1e-4)
-                                _rpy_mask_i = _valid_rpy & (_obs_rpy_frames[:, _hist_i].norm(dim=-1) > 1e-4)
-                                if _pos_mask_i.any():
-                                    _pos_cos_vals.append(torch.nn.functional.cosine_similarity(
-                                        _obs_pos_frames[_pos_mask_i, _hist_i],
-                                        _target_pos[_pos_mask_i],
-                                        dim=-1,
-                                    ).mean())
-                                if _rpy_mask_i.any():
-                                    _obs_rpy_i = _obs_rpy_frames[_rpy_mask_i, _hist_i]
-                                    _target_rpy_i = _target_rpy[_rpy_mask_i]
-                                    _rpy_cos_vals.append(torch.nn.functional.cosine_similarity(
-                                        _obs_rpy_i,
-                                        _target_rpy_i,
-                                        dim=-1,
-                                    ).mean())
-                                    _rpy_neg_cos_vals.append(torch.nn.functional.cosine_similarity(
-                                        -_obs_rpy_i,
-                                        _target_rpy_i,
-                                        dim=-1,
-                                    ).mean())
-                                    _rpy_norm_vals.append(_obs_rpy_i.norm(dim=-1).mean())
-                            if _pos_cos_vals:
-                                _obs_pos_best_cos = torch.stack(_pos_cos_vals).max().item()
-                            if _rpy_cos_vals:
-                                _obs_rpy_best_cos = torch.stack(_rpy_cos_vals).max().item()
-                            if _rpy_neg_cos_vals:
-                                _obs_rpy_best_neg_cos = torch.stack(_rpy_neg_cos_vals).max().item()
-                            if _rpy_norm_vals:
-                                _obs_rpy_best_norm = torch.stack(_rpy_norm_vals).max().item()
+
+                            def _score_extra_layout(_pos_frames, _rpy_frames):
+                                _pos_cos_vals = []
+                                _rpy_cos_vals = []
+                                _rpy_neg_cos_vals = []
+                                _rpy_norm_vals = []
+                                for _hist_i in range(_pos_frames.shape[1]):
+                                    _pos_mask_i = _valid_pos & (_pos_frames[:, _hist_i].norm(dim=-1) > 1e-4)
+                                    _rpy_mask_i = _valid_rpy & (_rpy_frames[:, _hist_i].norm(dim=-1) > 1e-4)
+                                    if _pos_mask_i.any():
+                                        _pos_cos_vals.append(torch.nn.functional.cosine_similarity(
+                                            _pos_frames[_pos_mask_i, _hist_i],
+                                            _target_pos[_pos_mask_i],
+                                            dim=-1,
+                                        ).mean())
+                                    if _rpy_mask_i.any():
+                                        _obs_rpy_i = _rpy_frames[_rpy_mask_i, _hist_i]
+                                        _target_rpy_i = _target_rpy[_rpy_mask_i]
+                                        _rpy_cos_vals.append(torch.nn.functional.cosine_similarity(
+                                            _obs_rpy_i,
+                                            _target_rpy_i,
+                                            dim=-1,
+                                        ).mean())
+                                        _rpy_neg_cos_vals.append(torch.nn.functional.cosine_similarity(
+                                            -_obs_rpy_i,
+                                            _target_rpy_i,
+                                            dim=-1,
+                                        ).mean())
+                                        _rpy_norm_vals.append(_obs_rpy_i.norm(dim=-1).mean())
+                                _pos_cos = torch.stack(_pos_cos_vals).max() if _pos_cos_vals else torch.tensor(0.0, device=self.device)
+                                _rpy_cos = torch.stack(_rpy_cos_vals).max() if _rpy_cos_vals else torch.tensor(0.0, device=self.device)
+                                _rpy_neg_cos = (
+                                    torch.stack(_rpy_neg_cos_vals).max()
+                                    if _rpy_neg_cos_vals else torch.tensor(0.0, device=self.device)
+                                )
+                                _rpy_norm = (
+                                    torch.stack(_rpy_norm_vals).max()
+                                    if _rpy_norm_vals else torch.tensor(0.0, device=self.device)
+                                )
+                                return _pos_cos, _rpy_cos, _rpy_neg_cos, _rpy_norm
+
+                            _frame_extra = _extra.reshape(_all_obs.shape[0], 5, 6)
+                            _frame_scores = _score_extra_layout(
+                                _frame_extra[:, :, :3],
+                                _frame_extra[:, :, 3:],
+                            )
+                            _term_scores = _score_extra_layout(
+                                _extra[:, :15].reshape(_all_obs.shape[0], 5, 3),
+                                _extra[:, 15:30].reshape(_all_obs.shape[0], 5, 3),
+                            )
+                            _best_scores = _frame_scores
+                            if _term_scores[0] > _frame_scores[0]:
+                                _best_scores = _term_scores
+                            _obs_pos_best_cos = _best_scores[0].item()
+                            _obs_rpy_best_cos = _best_scores[1].item()
+                            _obs_rpy_best_neg_cos = _best_scores[2].item()
+                            _obs_rpy_best_norm = _best_scores[3].item()
                         _energy_pred_all = self.alg.policy.evaluate(_all_critic_obs)
                         _energy_loss_all = torch.nn.functional.huber_loss(
                             _energy_pred_all, _all_energy, reduction="mean").item()
