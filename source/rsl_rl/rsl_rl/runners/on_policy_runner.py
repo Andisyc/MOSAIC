@@ -1171,26 +1171,35 @@ class OnPolicyRunner:
             _hash ^= (_hash >> 16)
             return _hash
 
-        def _set_frontres_warmup_perturbation_modes(seq_idx: int) -> None:
-            """Warmup uses clean supervised labels, so prefer clear balanced modes.
+        def _set_frontres_curriculum_modes(modes: tuple[str, ...]) -> None:
+            self._frontres_curriculum_active_modes = tuple(modes)
+            if len(modes) <= 1:
+                self._frontres_curriculum_complexity = "single"
+            elif len(modes) == 2:
+                self._frontres_curriculum_complexity = "two"
+            elif len(modes) == 3:
+                self._frontres_curriculum_complexity = "three"
+            else:
+                self._frontres_curriculum_complexity = "full"
 
-            PPO benefits from gradually mixing perturbation families, but joint
-            warmup is a label-fitting phase.  Keeping each warmup rollout on a
-            single repair family avoids making the supervised target a noisy
-            composite before the actor has learned the individual directions.
+        def _frontres_warmup_perturbation_mode_groups(seq_idx: int) -> list[tuple[str, ...]]:
+            """Return perturbation families to mix inside one warmup update.
+
+            Warmup should fit all active repair directions together.  Cycling
+            single-family samples inside each update avoids serial forgetting
+            while keeping the supervised target cleaner than a full composite.
             """
             _bases = _frontres_curriculum_allowed_bases()
             _mode = str(self.cfg.get(
                 "frontres_warmup_perturbation_schedule",
-                self.cfg.get("supervised_warmup_perturbation_schedule", "balanced_single"),
+                self.cfg.get("supervised_warmup_perturbation_schedule", "mixed_single"),
             ))
             if _mode == "rl_curriculum":
-                return
+                _active = tuple(getattr(self, "_frontres_curriculum_active_modes", tuple(_bases)))
+                return [_active] if _active else [tuple(_bases)]
             if _mode == "full":
-                self._frontres_curriculum_active_modes = tuple(_bases)
-                self._frontres_curriculum_complexity = "full"
-                return
-            if _mode == "balanced_pair":
+                return [tuple(_bases)]
+            if _mode in ("mixed_pair", "balanced_pair"):
                 _canonical_two = [
                     ("planar", "yaw"),
                     ("planar", "local_rp"),
@@ -1202,13 +1211,15 @@ class OnPolicyRunner:
                 _base_set = set(_bases)
                 _pairs = [m for m in _canonical_two if set(m).issubset(_base_set)]
                 if _pairs:
-                    _choice = _pairs[_choice_hash(seq_idx) % len(_pairs)]
-                    self._frontres_curriculum_active_modes = tuple(_choice)
-                    self._frontres_curriculum_complexity = "two"
-                    return
-            _choice = _bases[_choice_hash(seq_idx) % len(_bases)]
-            self._frontres_curriculum_active_modes = (_choice,)
-            self._frontres_curriculum_complexity = "single"
+                    if _mode == "balanced_pair":
+                        return [_pairs[_choice_hash(seq_idx) % len(_pairs)]]
+                    return _pairs
+            if _mode == "single":
+                return [(_bases[_choice_hash(seq_idx) % len(_bases)],)]
+            # New default: every warmup SGD update contains each active single
+            # perturbation family.  Keep "balanced_single" as an alias so older
+            # configs inherit the corrected non-serial behavior.
+            return [(base,) for base in _bases]
 
         def _apply_frontres_dr_scale(scale: float) -> None:
             if not (_is_frontres and _perturb_target is not None):
@@ -1320,7 +1331,7 @@ class OnPolicyRunner:
                   f"steps_per_iter={_warmup_steps}, "
                   f"max_envs_per_step={_warmup_max_envs}, "
                   f"frontres_input={_nfo} dims, energy_w={_warmup_energy_w}, "
-                  f"perturb_schedule={self.cfg.get('supervised_warmup_perturbation_schedule', self.cfg.get('frontres_warmup_perturbation_schedule', 'balanced_single'))}) ===",
+                  f"perturb_schedule={self.cfg.get('supervised_warmup_perturbation_schedule', self.cfg.get('frontres_warmup_perturbation_schedule', 'mixed_single'))}) ===",
                   flush=True)
 
             for _wu in range(_warmup_iters):
@@ -1336,8 +1347,9 @@ class OnPolicyRunner:
                     + (_warmup_dr_scale_end - _warmup_dr_scale_start) * _warmup_frac
                 )
                 _set_frontres_perturbation_curriculum(_warmup_frac, _wu)
-                _set_frontres_warmup_perturbation_modes(_wu)
-                _apply_frontres_dr_scale(_warmup_dr_scale)
+                _warmup_mode_groups = _frontres_warmup_perturbation_mode_groups(_wu)
+                if not _warmup_mode_groups:
+                    _warmup_mode_groups = [tuple(_frontres_curriculum_allowed_bases())]
 
                 _wo_list: list[torch.Tensor] = []
                 _wt_list: list[torch.Tensor] = []
@@ -1348,7 +1360,12 @@ class OnPolicyRunner:
                 # later fed back through trainable actor/critic networks, and
                 # some PyTorch versions reject inference tensors in backward.
                 with torch.no_grad():
-                    for _ in range(_warmup_steps):
+                    for _step in range(_warmup_steps):
+                        _mode_group = _warmup_mode_groups[
+                            (_wu * max(_warmup_steps, 1) + _step) % len(_warmup_mode_groups)
+                        ]
+                        _set_frontres_curriculum_modes(tuple(_mode_group))
+                        _apply_frontres_dr_scale(_warmup_dr_scale)
                         obs, extras = self.env.get_observations()
                         obs_dict = extras.get("observations", {})
                         _p_obs_raw = obs_dict.get(self.policy_obs_type, obs).to(self.device)
@@ -1589,6 +1606,12 @@ class OnPolicyRunner:
                         _valid_roll_frac = _valid_roll.float().mean().item()
                         _valid_pitch_frac = _valid_pitch.float().mean().item()
                         _valid_yaw_frac = _valid_yaw.float().mean().item()
+                        _valid_x = _target_all[:, 0].abs() > 1e-4
+                        _valid_y = _target_all[:, 1].abs() > 1e-4
+                        _valid_z = _target_all[:, 2].abs() > 1e-4
+                        _valid_x_frac = _valid_x.float().mean().item()
+                        _valid_y_frac = _valid_y.float().mean().item()
+                        _valid_z_frac = _valid_z.float().mean().item()
                         _mae_pos = _masked_mae(_pred_all[:, :3], _target_all[:, :3], _valid_pos)
                         _mae_rpy = _masked_mae(_pred_all[:, 3:], _target_all[:, 3:], _valid_rpy)
                         _pred_pos_norm = _masked_norm(_pred_all[:, :3], _valid_pos)
@@ -1747,7 +1770,7 @@ class OnPolicyRunner:
                         _energy_broken_frac = (_all_energy.view(-1) > _broken_gap_diag).float().mean().item()
                     print(f"[Runner]   warmup {_wu + 1}/{_warmup_iters}: "
                           f"dr_scale={_warmup_dr_scale:.3f}, "
-                          f"modes={getattr(self, '_frontres_curriculum_active_modes', ())}, "
+                          f"mode_mix={tuple(_warmup_mode_groups)}, "
                           f"loss={loss.item():.6f}, actor={_last_actor_loss.item():.6f}, "
                           f"energy={_last_energy_loss.item():.6f}, cos={_warmup_cos:.4f}, "
                           f"valid={_valid_frac:.3f}",
@@ -1755,6 +1778,10 @@ class OnPolicyRunner:
                     print(f"[Runner]      diag: "
                           f"cos_pos={_cos_pos:+.4f}, cos_rpy={_cos_rpy:+.4f}, "
                           f"valid_pos={_valid_pos_frac:.3f}, valid_rpy={_valid_rpy_frac:.3f}",
+                          flush=True)
+                    print(f"[Runner]      diag_valid_axes: "
+                          f"x/y/z={_valid_x_frac:.3f}/{_valid_y_frac:.3f}/{_valid_z_frac:.3f}, "
+                          f"r/p/yaw={_valid_roll_frac:.3f}/{_valid_pitch_frac:.3f}/{_valid_yaw_frac:.3f}",
                           flush=True)
                     print(f"[Runner]      diag: "
                           f"mae_pos={_mae_pos:.5f}m, mae_rpy={_mae_rpy:.5f}rad, "
