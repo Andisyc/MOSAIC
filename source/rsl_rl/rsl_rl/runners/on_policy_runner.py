@@ -441,14 +441,15 @@ class OnPolicyRunner:
         w_xy_vel = cfg_float("frontres_exec_anchor_xy_vel_weight", 0.5)
         w_yaw_rate = cfg_float("frontres_exec_anchor_yaw_rate_weight", 0.5)
         w_foot_phase = cfg_float("frontres_exec_foot_phase_weight", 0.5)
-        w_planar_sum = max(w_xy + w_yaw + w_xy_vel + w_yaw_rate + w_foot_phase, 1e-6)
-        planar_score = (
+        w_xy_sum = max(w_xy + w_xy_vel + w_foot_phase, 1e-6)
+        xy_score = (
             w_xy * anchor_xy_score
-            + w_yaw * anchor_yaw_score
             + w_xy_vel * anchor_xy_vel_score
-            + w_yaw_rate * anchor_yaw_rate_score
             + w_foot_phase * foot_phase_score
-        ) / w_planar_sum
+        ) / w_xy_sum
+        w_yaw_sum = max(w_yaw + w_yaw_rate, 1e-6)
+        yaw_score = (w_yaw * anchor_yaw_score + w_yaw_rate * anchor_yaw_rate_score) / w_yaw_sum
+        planar_score = 0.5 * (xy_score + yaw_score)
 
         anchor_z_th = cfg_float("frontres_exec_anchor_z_threshold", 0.25)
         anchor_ori_th = cfg_float("frontres_exec_anchor_ori_threshold", 0.20)
@@ -460,12 +461,15 @@ class OnPolicyRunner:
         if gravity is None:
             gravity = torch.zeros(n_envs, 3, device=self.device, dtype=dtype)
             gravity[:, 2] = -1.0
-        robot_g = quat_rotate_inverse(command.robot_anchor_quat_w, gravity)
-        # Roll/pitch executability is a stability margin, not a reference-tracking
-        # reward.  The horizontal gravity norm is first-order in tilt angle and
-        # directly measures how close the robot is to the upright basin.
-        anchor_ori_err = torch.norm(robot_g[:, :2], dim=-1)
-        anchor_ori_score = (1.0 - anchor_ori_err / max(anchor_ori_th, 1e-6)).clamp(-1.0, 1.0)
+        # Roll/pitch executability must be tied to the reference the frozen GMT
+        # is asked to track.  A pure robot-upright margin is mostly independent
+        # of the current Δr/Δp action and can give stale or wrong credit during
+        # Actor takeover.
+        rp_error_rotvec = _quat_to_rotvec_wxyz(
+            quat_mul(quat_inv(command.robot_anchor_quat_w), command.anchor_quat_w)
+        )
+        anchor_rp_err = torch.norm(rp_error_rotvec[:, :2], dim=-1)
+        anchor_rp_score = (1.0 - anchor_rp_err / max(anchor_ori_th, 1e-6)).clamp(-1.0, 1.0)
 
         ee_names = self.cfg.get(
             "frontres_exec_ee_body_names",
@@ -487,8 +491,11 @@ class OnPolicyRunner:
         w_z = cfg_float("frontres_exec_anchor_z_weight", 1.0)
         w_ori = cfg_float("frontres_exec_anchor_ori_weight", 1.0)
         w_ee = cfg_float("frontres_exec_ee_z_weight", 1.0)
+        w_z_sum = max(w_z + w_ee, 1e-6)
+        z_score = (w_z * anchor_z_score + w_ee * ee_z_score) / w_z_sum
+        rp_score = anchor_rp_score
         w_stab_sum = max(w_z + w_ori + w_ee, 1e-6)
-        vertical_score = (w_z * anchor_z_score + w_ori * anchor_ori_score + w_ee * ee_z_score) / w_stab_sum
+        vertical_score = (w_z * anchor_z_score + w_ori * rp_score + w_ee * ee_z_score) / w_stab_sum
 
         vel_body_names = self.cfg.get("frontres_exec_velocity_body_names", None)
         if vel_body_names is None:
@@ -521,6 +528,10 @@ class OnPolicyRunner:
             return score, {
                 "planar": torch.nan_to_num(planar_score, nan=-1.0, posinf=1.0, neginf=-1.0),
                 "vertical": torch.nan_to_num(vertical_score, nan=-1.0, posinf=1.0, neginf=-1.0),
+                "xy": torch.nan_to_num(xy_score, nan=-1.0, posinf=1.0, neginf=-1.0),
+                "yaw": torch.nan_to_num(yaw_score, nan=-1.0, posinf=1.0, neginf=-1.0),
+                "z": torch.nan_to_num(z_score, nan=-1.0, posinf=1.0, neginf=-1.0),
+                "rp": torch.nan_to_num(rp_score, nan=-1.0, posinf=1.0, neginf=-1.0),
                 "task": torch.nan_to_num(task_score, nan=0.0, posinf=1.0, neginf=0.0),
             }
         return score
@@ -685,27 +696,37 @@ class OnPolicyRunner:
                     active_modes = tuple(inferred) if inferred else ("planar", "yaw", "global_z", "local_rp")
             mode_groups = [tuple(active_modes)] * count
 
-        planar = components["planar"][start:start + count]
-        vertical = components["vertical"][start:start + count]
+        xy = components.get("xy", components["planar"])[start:start + count]
+        yaw = components.get("yaw", components["planar"])[start:start + count]
+        z = components.get("z", components["vertical"])[start:start + count]
+        rp = components.get("rp", components["vertical"])[start:start + count]
         task = components["task"][start:start + count]
-        score = torch.zeros(count, device=planar.device, dtype=planar.dtype)
+        score = torch.zeros(count, device=xy.device, dtype=xy.dtype)
         denom = torch.zeros_like(score)
 
         planar_weight = float(self.cfg.get("frontres_exec_cone_planar_weight", 1.0))
+        yaw_weight = float(self.cfg.get("frontres_exec_cone_yaw_weight", planar_weight))
         vertical_weight = float(self.cfg.get("frontres_exec_cone_vertical_weight", 1.0))
+        rp_weight = float(self.cfg.get("frontres_exec_cone_rp_weight", vertical_weight))
         task_weight = float(self.cfg.get("frontres_exec_cone_task_weight", 0.0))
         for idx, modes in enumerate(mode_groups[:count]):
             mode_set = set(modes)
-            if mode_set & {"planar", "yaw"}:
-                score[idx] += planar_weight * planar[idx]
+            if "planar" in mode_set:
+                score[idx] += planar_weight * xy[idx]
                 denom[idx] += planar_weight
-            if mode_set & {"global_z", "local_rp"}:
-                score[idx] += vertical_weight * vertical[idx]
+            if "yaw" in mode_set:
+                score[idx] += yaw_weight * yaw[idx]
+                denom[idx] += yaw_weight
+            if "global_z" in mode_set:
+                score[idx] += vertical_weight * z[idx]
                 denom[idx] += vertical_weight
+            if "local_rp" in mode_set:
+                score[idx] += rp_weight * rp[idx]
+                denom[idx] += rp_weight
             if task_weight > 0.0:
                 score[idx] += task_weight * task[idx]
                 denom[idx] += task_weight
-        fallback = 0.5 * (planar + vertical)
+        fallback = 0.25 * (xy + yaw + z + rp)
         score = torch.where(denom > 0.0, score / denom.clamp(min=1e-6), fallback)
         return torch.nan_to_num(score, nan=-1.0, posinf=1.0, neginf=-1.0)
 
@@ -1071,7 +1092,7 @@ class OnPolicyRunner:
 
         # ── Adaptive DR controller ───────────────────────────────────────────
         # Primary path: boundary sampler keeps perturbations near the repairable
-        # GMT boundary using safe/fragile/broken/positive-gain diagnostics.
+        # GMT boundary using safe/repair/broken/positive-gain diagnostics.
         # Fallback path: legacy r_delta PI before boundary diagnostics exist.
         _dr_max         = float(self.cfg.get("dr_max_scale",    4.0))
         _dr_min         = float(self.cfg.get("dr_min_scale",    0.0))
@@ -2031,15 +2052,21 @@ class OnPolicyRunner:
                     self._frontres_boundary_ema = _ema
 
                     _safe = float(_ema.get("safe", 0.0))
-                    _fragile = float(_ema.get("fragile", 0.0))
+                    _repair = float(_ema.get("repair", _ema.get("fragile", 0.0)))
                     _broken = float(_ema.get("broken", 0.0))
                     _gainpos = float(_ema.get("positive_gain", 0.5))
 
                     _safe_hi = float(self.cfg.get("frontres_boundary_safe_high", 0.45))
                     _broken_hi = float(self.cfg.get("frontres_boundary_broken_high", 0.35))
                     _broken_target = float(self.cfg.get("frontres_boundary_broken_target", 0.25))
-                    _fragile_lo = float(self.cfg.get("frontres_boundary_fragile_low", 0.45))
-                    _fragile_hi = float(self.cfg.get("frontres_boundary_fragile_high", 0.70))
+                    _repair_lo = float(self.cfg.get(
+                        "frontres_boundary_repair_low",
+                        self.cfg.get("frontres_boundary_fragile_low", 0.45),
+                    ))
+                    _repair_hi = float(self.cfg.get(
+                        "frontres_boundary_repair_high",
+                        self.cfg.get("frontres_boundary_fragile_high", 0.70),
+                    ))
                     _gain_hi = float(self.cfg.get("frontres_boundary_positive_gain_high", 0.55))
                     _gain_lo = float(self.cfg.get("frontres_boundary_positive_gain_low", 0.45))
                     _step = float(self.cfg.get("frontres_boundary_dr_step", 0.03))
@@ -2053,7 +2080,7 @@ class OnPolicyRunner:
                         _factor = 1.0 - _step * min(3.0, 1.0 + (_broken - _broken_hi) / max(1.0 - _broken_hi, 1e-6))
                     elif _safe > _safe_hi and _broken < _broken_target:
                         _factor = 1.0 + _step
-                    elif (_fragile_lo <= _fragile <= _fragile_hi) and _gainpos > _gain_hi and _broken < _broken_hi:
+                    elif (_repair_lo <= _repair <= _repair_hi) and _gainpos > _gain_hi and _broken < _broken_hi:
                         _factor = 1.0 + 0.5 * _step
                     elif _gainpos < _gain_lo and _broken > _broken_target:
                         _factor = 1.0 - 0.5 * _step
@@ -2115,10 +2142,13 @@ class OnPolicyRunner:
             _frontres_repair_gain_sum:    float = 0.0
             _frontres_positive_gain_frac_sum: float = 0.0
             _frontres_repair_ratio_sum:   float = 0.0
-            _frontres_safe_gate_sum:      float = 0.0
-            _frontres_fragile_gate_sum:   float = 0.0
-            _frontres_damage_gate_sum:    float = 0.0
-            _frontres_broken_gate_sum:    float = 0.0
+            _frontres_exec_signal_sum:     float = 0.0
+            _frontres_weighted_exec_signal_sum: float = 0.0
+            _frontres_train_reward_sum:    float = 0.0
+            _frontres_window_mu_sum:      float = 0.0
+            _frontres_safe_frac_sum:      float = 0.0
+            _frontres_repair_frac_sum:    float = 0.0
+            _frontres_broken_frac_sum:    float = 0.0
             _frontres_actor_gate_sum:     float = 0.0
             _frontres_exec_gate_sum:      float = 0.0
             _frontres_cost_gate_sum:      float = 0.0
@@ -2501,46 +2531,52 @@ class OnPolicyRunner:
                             # root sink artifacts from becoming false "repairable"
                             # targets when upward Δz is blocked for dynamics safety.
                             #
-                            # This makes the scale of r_delta invariant to the raw
-                            # score magnitude.  Safe/no-op, repairable, and
-                            # broken cases are separated with smooth sigmoid gates:
-                            #   safe:    no meaningful damage -> learn minimum intervention
-                            #   fragile: damage exists and is repairable -> learn repair
-                            #   broken:  damage too large or currently unrepaired -> learn abstention cost
+                            # Safe/no-op and deeply broken samples should not
+                            # drive the repair reward.  A double-sigmoid window
+                            # gives one smooth repairability weight:
+                            #   mu ~= 0 below safe_gap
+                            #   mu ~= 1 between safe_gap and broken_gap
+                            #   mu ~= 0 above broken_gap
                             _gap_raw = _exec_feasible - _exec_perturbed
                             _damage_gap = _gap_raw.clamp(min=0.0)
                             _repair_gain = _exec_frontres - _exec_perturbed
                             _gap_floor = float(self.cfg.get("frontres_gap_floor_per_step", 0.005))
                             _repair_ratio = (_repair_gain / _damage_gap.clamp(min=_gap_floor)).clamp(-1.0, 1.0)
-                            _r_exec[:_n_exec] = _repair_ratio
+                            _reward_signal_mode = str(self.cfg.get("frontres_exec_reward_signal", "gain")).lower()
+                            if _reward_signal_mode == "ratio":
+                                _exec_signal = _repair_ratio
+                            else:
+                                _exec_signal = _repair_gain
+                            _r_exec[:_n_exec] = _exec_signal
 
                             _safe_gap = float(self.cfg.get("frontres_safe_gap_per_step", 0.003))
                             _broken_gap = float(self.cfg.get("frontres_broken_gap_per_step", 0.08))
+                            _broken_gap = max(_broken_gap, _safe_gap + 1e-6)
                             _gate_temp = float(self.cfg.get("frontres_gap_gate_temp", 0.005))
-                            _ratio_temp = float(self.cfg.get("frontres_repair_ratio_gate_temp", 0.20))
-                            _broken_ratio_ref = float(self.cfg.get("frontres_broken_repair_ratio_ref", -0.25))
-                            _damage_gate = torch.sigmoid((_damage_gap - _safe_gap) / max(_gate_temp, 1e-6))
-                            _safe_gate = 1.0 - _damage_gate
-                            _gap_broken_gate = torch.sigmoid((_damage_gap - _broken_gap) / max(_gate_temp, 1e-6))
-                            _bad_repair_gate = torch.sigmoid(
-                                (_broken_ratio_ref - _repair_ratio) / max(_ratio_temp, 1e-6)
+                            _gate_temp = max(_gate_temp, 1e-6)
+                            _enter_window = torch.sigmoid((_damage_gap - _safe_gap) / _gate_temp)
+                            _exit_window = torch.sigmoid((_broken_gap - _damage_gap) / _gate_temp)
+                            _window_mu_raw = _enter_window * _exit_window
+                            _gap_mid = 0.5 * (_safe_gap + _broken_gap)
+                            _peak_enter_arg = max(-60.0, min(60.0, (_gap_mid - _safe_gap) / _gate_temp))
+                            _peak_exit_arg = max(-60.0, min(60.0, (_broken_gap - _gap_mid) / _gate_temp))
+                            _window_peak = (
+                                1.0 / (1.0 + math.exp(-_peak_enter_arg))
+                                * 1.0 / (1.0 + math.exp(-_peak_exit_arg))
                             )
-                            _broken_gate = (_damage_gate * _gap_broken_gate * _bad_repair_gate).clamp(0.0, 1.0)
-                            _fragile_gate = (_damage_gate * (1.0 - _broken_gate)).clamp(0.0, 1.0)
+                            _window_mu = (_window_mu_raw / max(_window_peak, 1e-6)).clamp(0.0, 1.0)
 
-                            _safe_cost = float(self.cfg.get("frontres_safe_cost_weight", 1.0))
-                            _fragile_cost = float(self.cfg.get("frontres_fragile_cost_weight", 0.10))
-                            _broken_cost = float(self.cfg.get("frontres_broken_cost_weight", 1.0))
-                            _cost_gate = _safe_cost * _safe_gate + _fragile_cost * _fragile_gate + _broken_cost * _broken_gate
-                            _exec_gate = _fragile_gate
+                            _safe_frac = (_damage_gap < _safe_gap).float().mean()
+                            _repair_frac = ((_damage_gap >= _safe_gap) & (_damage_gap <= _broken_gap)).float().mean()
+                            _broken_frac = (_damage_gap > _broken_gap).float().mean()
 
-                            _actor_gate_floor = float(self.cfg.get("frontres_actor_gate_floor", 0.02))
-                            _safe_actor_weight = float(self.cfg.get("frontres_safe_actor_gate_weight", 0.20))
-                            _broken_actor_weight = float(self.cfg.get("frontres_broken_actor_gate_weight", 0.20))
+                            _exec_gate = _window_mu
+                            _cost_gate = (1.0 - _window_mu).clamp(0.0, 1.0)
+
+                            _side_actor_weight = float(self.cfg.get("frontres_side_actor_gate_weight", 0.05))
+                            _side_actor_weight = max(0.0, min(1.0, _side_actor_weight))
                             _actor_gate = (
-                                _actor_gate_floor
-                                + (1.0 - _actor_gate_floor)
-                                * (_fragile_gate + _safe_actor_weight * _safe_gate + _broken_actor_weight * _broken_gate)
+                                _window_mu + _side_actor_weight * (1.0 - _window_mu)
                             ).clamp(0.0, 1.0)
                             _exec_weight = torch.zeros(N_train, device=self.device)
                             _cost_weight = torch.ones(N_train, device=self.device)
@@ -2550,7 +2586,7 @@ class OnPolicyRunner:
                             _frontres_actor_gate[:_n_exec, 0] = _actor_gate
                             self.alg.transition.frontres_actor_gate = _frontres_actor_gate
                             r_delta = (
-                                _w_exec * _repair_scale * _exec_weight * _repair_ratio
+                                _w_exec * _repair_scale * _exec_weight * _r_exec
                                 + _w_geom * _r_step
                                 + _w_rescue * _r_rescue
                                 - _cost_weight * _intervention_cost
@@ -2569,7 +2605,7 @@ class OnPolicyRunner:
                                 _r_base_log = r_raw_gmt.mean()
                             _r_rescue_log = 0.0
                             _r_z = _r_xy = _r_rp = _r_ya = None
-                            _damage_gate = _broken_gate = _actor_gate = None
+                            _actor_gate = None
                             _exec_planar_log = _exec_vertical_log = _exec_task_log = None
                             _frontres_actor_gate = torch.zeros(self.env.num_envs, 1, device=self.device)
                             _frontres_actor_gate[:N_train, 0] = 1.0
@@ -2631,10 +2667,15 @@ class OnPolicyRunner:
                             _frontres_repair_gain_sum  += _repair_gain.mean().item()
                             _frontres_positive_gain_frac_sum += (_repair_gain > 0.0).float().mean().item()
                             _frontres_repair_ratio_sum += _repair_ratio.mean().item()
-                            _frontres_safe_gate_sum    += _safe_gate.mean().item()
-                            _frontres_fragile_gate_sum += _fragile_gate.mean().item()
-                            _frontres_damage_gate_sum  += _damage_gate.mean().item()
-                            _frontres_broken_gate_sum  += _broken_gate.mean().item()
+                            _frontres_exec_signal_sum += _r_exec[:_n_exec].mean().item()
+                            _frontres_weighted_exec_signal_sum += (
+                                _exec_weight[:_n_exec] * _r_exec[:_n_exec]
+                            ).mean().item()
+                            _frontres_train_reward_sum += r_delta[:_n_exec].mean().item()
+                            _frontres_window_mu_sum    += _window_mu.mean().item()
+                            _frontres_safe_frac_sum    += _safe_frac.item()
+                            _frontres_repair_frac_sum  += _repair_frac.item()
+                            _frontres_broken_frac_sum  += _broken_frac.item()
                             _frontres_actor_gate_sum   += _actor_gate.mean().item()
                             _frontres_exec_gate_sum    += _exec_gate.mean().item()
                             _frontres_cost_gate_sum    += _cost_gate.mean().item()
@@ -2851,20 +2892,32 @@ class OnPolicyRunner:
                 _frontres_repair_ratio_sum / _frontres_reward_diag_steps
                 if _is_frontres and _frontres_reward_diag_steps > 0 else None
             )
-            frontres_safe_gate_mean = (
-                _frontres_safe_gate_sum / _frontres_reward_diag_steps
+            frontres_exec_signal_mean = (
+                _frontres_exec_signal_sum / _frontres_reward_diag_steps
                 if _is_frontres and _frontres_reward_diag_steps > 0 else None
             )
-            frontres_fragile_gate_mean = (
-                _frontres_fragile_gate_sum / _frontres_reward_diag_steps
+            frontres_weighted_exec_signal_mean = (
+                _frontres_weighted_exec_signal_sum / _frontres_reward_diag_steps
                 if _is_frontres and _frontres_reward_diag_steps > 0 else None
             )
-            frontres_damage_gate_mean = (
-                _frontres_damage_gate_sum / _frontres_reward_diag_steps
+            frontres_train_reward_mean = (
+                _frontres_train_reward_sum / _frontres_reward_diag_steps
                 if _is_frontres and _frontres_reward_diag_steps > 0 else None
             )
-            frontres_broken_gate_mean = (
-                _frontres_broken_gate_sum / _frontres_reward_diag_steps
+            frontres_window_mu_mean = (
+                _frontres_window_mu_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_safe_frac_mean = (
+                _frontres_safe_frac_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_repair_frac_mean = (
+                _frontres_repair_frac_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_broken_frac_mean = (
+                _frontres_broken_frac_sum / _frontres_reward_diag_steps
                 if _is_frontres and _frontres_reward_diag_steps > 0 else None
             )
             frontres_actor_gate_mean = (
@@ -2914,15 +2967,15 @@ class OnPolicyRunner:
             if frontres_rdelta_mean is not None:
                 self._last_r_delta_mean = frontres_rdelta_mean
             if (
-                frontres_safe_gate_mean is not None
-                and frontres_fragile_gate_mean is not None
-                and frontres_broken_gate_mean is not None
+                frontres_safe_frac_mean is not None
+                and frontres_repair_frac_mean is not None
+                and frontres_broken_frac_mean is not None
                 and frontres_positive_gain_frac_mean is not None
             ):
                 self._last_frontres_boundary_stats = {
-                    "safe": float(frontres_safe_gate_mean),
-                    "fragile": float(frontres_fragile_gate_mean),
-                    "broken": float(frontres_broken_gate_mean),
+                    "safe": float(frontres_safe_frac_mean),
+                    "repair": float(frontres_repair_frac_mean),
+                    "broken": float(frontres_broken_frac_mean),
                     "positive_gain": float(frontres_positive_gain_frac_mean),
                 }
 
@@ -3072,7 +3125,8 @@ class OnPolicyRunner:
                 "r_exec", "r_geom", "r_rescue", "intervention_cost",
                 "reward_frontres", "exec_planar", "exec_vertical", "exec_task",
                 "damage_gap", "repair_gain", "positive_gain_frac", "repair_ratio",
-                "safe_gate", "fragile_gate", "damage_gate", "broken_gate",
+                "exec_signal", "weighted_exec_signal", "train_reward",
+                "window_mu", "safe_frac", "repair_frac", "broken_frac",
                 "actor_gate", "exec_gate", "cost_gate",
                 "r_z", "r_xy", "r_rp", "r_yaw",
                 "dr_z_abs", "dr_xy_abs", "dr_rp_abs", "dr_yaw_abs",
@@ -3256,20 +3310,26 @@ class OnPolicyRunner:
                             f"{locs['frontres_repair_gain_mean']:+.4f} / "
                             f"{locs['frontres_repair_ratio_mean']:+.4f}\n"
                         )
+                        if locs.get("frontres_train_reward_mean") is not None:
+                            log_string += f"""{'signal/w_signal/train_r:':>{pad}} """
+                            log_string += (
+                                f"{locs['frontres_exec_signal_mean']:+.4f} / "
+                                f"{locs['frontres_weighted_exec_signal_mean']:+.4f} / "
+                                f"{locs['frontres_train_reward_mean']:+.4f}\n"
+                            )
                         if locs.get("frontres_positive_gain_frac_mean") is not None:
                             log_string += f"""{'positive_gain_frac:':>{pad}} """
                             log_string += f"{locs['frontres_positive_gain_frac_mean']:.3f}\n"
-                        log_string += f"""{'safe/fragile/broken:':>{pad}} """
+                        log_string += f"""{'safe/repair/broken frac:':>{pad}} """
                         log_string += (
-                            f"{locs['frontres_safe_gate_mean']:.3f} / "
-                            f"{locs['frontres_fragile_gate_mean']:.3f} / "
-                            f"{locs['frontres_broken_gate_mean']:.3f}\n"
+                            f"{locs['frontres_safe_frac_mean']:.3f} / "
+                            f"{locs['frontres_repair_frac_mean']:.3f} / "
+                            f"{locs['frontres_broken_frac_mean']:.3f}\n"
                         )
-                    if locs.get("frontres_damage_gate_mean") is not None:
-                        log_string += f"""{'damage/broken/actor gate:':>{pad}} """
+                    if locs.get("frontres_window_mu_mean") is not None:
+                        log_string += f"""{'mu/actor gate:':>{pad}} """
                         log_string += (
-                            f"{locs['frontres_damage_gate_mean']:.3f} / "
-                            f"{locs['frontres_broken_gate_mean']:.3f} / "
+                            f"{locs['frontres_window_mu_mean']:.3f} / "
                             f"{locs['frontres_actor_gate_mean']:.3f}\n"
                         )
                         log_string += f"""{'exec/cost gate:':>{pad}} """

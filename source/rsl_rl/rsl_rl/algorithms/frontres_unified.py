@@ -556,7 +556,11 @@ class FrontRESUnified:
                 mask_flat = (frontres_mask_batch * frontres_actor_gate_batch).view(-1)
             else:
                 mask_flat = frontres_mask_batch.view(-1)
-            surrogate_loss = (surrogate_terms * mask_flat).sum() / mask_flat.sum().clamp(min=1.0)
+            # Normalize by the sum of sample weights, not by minibatch size.
+            # This makes actor_gate redistribute actor-gradient contribution
+            # without shrinking the whole PPO step when most samples are outside
+            # the repairability window.
+            surrogate_loss = (surrogate_terms * mask_flat).sum() / mask_flat.sum().clamp(min=1e-6)
         else:
             surrogate_loss = surrogate_terms.mean()
 

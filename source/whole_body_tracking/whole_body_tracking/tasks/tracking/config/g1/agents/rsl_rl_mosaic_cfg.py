@@ -488,18 +488,20 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_active_task_dims      = [0, 1, 2, 3, 4, 5, 6, 7]
     frontres_perturbation_channels = "all"
 
-    # "More executable" reward, feasible-gap normalized:
+    # "More executable" reward:
     #   damage_gap  = R_feasible_oracle - R_perturbed
     #   repair_gain = R_frontres - R_perturbed
     #   repair_ratio = repair_gain / max(damage_gap, gap_floor)
-    # Smooth gates split samples into safe / repairable / broken instead of
-    # using hard thresholds, so PPO still sees a continuous learning signal.
+    # A double-sigmoid window maps executable damage to one repairability
+    # weight mu.  Safe and deeply broken samples are suppressed; only the
+    # middle repairable band receives the executable-gain reward.
     frontres_exec_reward_weight    = 1.0
     frontres_exec_reward_temp      = 1.0
-    # Keep repair_ratio diagnostic in [-1, 1], but amplify its PPO signal.
-    # The per-step executable gain is intentionally small; without this scale
-    # PPO mostly sees rollout noise and the minimum-intervention prior.
-    frontres_repair_reward_scale   = 5.0
+    # Train on direct executable gain by default.  The normalized ratio is still
+    # logged as a difficulty diagnostic, but using it as reward divided by small
+    # gaps and over-amplified tiny per-step noise during Actor takeover.
+    frontres_exec_reward_signal    = "gain"  # "gain" or "ratio"
+    frontres_repair_reward_scale   = 1.0
     # FrontRES-specific executability score.  This deliberately excludes
     # teleop rewards and actuator penalties from RewardsExpertCfg.
     #
@@ -509,12 +511,13 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_exec_planar_weight    = 1.0
     frontres_exec_vertical_weight  = 1.0
     frontres_exec_task_weight      = 0.10
-    # Cone-aware scalarization used by reward/gap/gain after the planar,
-    # vertical, and task diagnostics are computed.  The task term is logged but
-    # excluded by default so each perturbation cone optimizes its matching
-    # executable component instead of a global blended score.
+    # Cone-aware scalarization used by reward/gap/gain after executable
+    # diagnostics are computed.  Each perturbation family reads its matching
+    # component: planar->xy, yaw->yaw, global_z->z, local_rp->rp.
     frontres_exec_cone_planar_weight = 1.0
+    frontres_exec_cone_yaw_weight = 1.0
     frontres_exec_cone_vertical_weight = 1.0
+    frontres_exec_cone_rp_weight = 1.0
     frontres_exec_cone_task_weight = 0.0
     frontres_exec_anchor_xy_threshold = 0.35
     frontres_exec_anchor_yaw_threshold = 0.45
@@ -554,17 +557,10 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_safe_gap_per_step     = 0.003
     frontres_broken_gap_per_step   = 0.08
     frontres_gap_gate_temp         = 0.005
-    frontres_repair_ratio_gate_temp = 0.20
-    frontres_broken_repair_ratio_ref = -0.25
-    frontres_safe_cost_weight      = 1.0
-    frontres_fragile_cost_weight   = 0.0
-    frontres_broken_cost_weight    = 1.0
-    frontres_actor_gate_floor      = 0.02
-    frontres_safe_actor_gate_weight = 0.20
-    frontres_broken_actor_gate_weight = 0.20
+    frontres_side_actor_gate_weight = 0.05
     frontres_warmup_energy_loss_weight = 1.0
     # Alignment debug reward:
-    #   r = fragile_gate * repair_ratio - safe/broken minimum-intervention cost
+    #   r = mu * exec_signal - (1 - mu) * minimum-intervention cost
     # Geometry and rescue terms are disabled here so the only positive signal is
     # "corrected reference is easier for frozen GMT than noisy reference".
     frontres_geometry_reward_weight = 0.0
@@ -626,8 +622,8 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_boundary_dr_ema_alpha = 0.90
     frontres_boundary_dr_step      = 0.03
     frontres_boundary_safe_high    = 0.45
-    frontres_boundary_fragile_low  = 0.45
-    frontres_boundary_fragile_high = 0.70
+    frontres_boundary_repair_low   = 0.45
+    frontres_boundary_repair_high  = 0.70
     frontres_boundary_broken_target = 0.25
     frontres_boundary_broken_high  = 0.35
     frontres_boundary_positive_gain_low = 0.45
