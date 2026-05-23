@@ -265,10 +265,10 @@ def _configure_frontres_motion_perturbations(env_cfg, agent_cfg) -> None:
             flush=True,
         )
         return
-    if mode not in ("xy_yaw", "xy-yaw", "xyyaw", "z_rp", "z-rp", "zrp"):
+    if mode not in ("xy_yaw", "xy-yaw", "xyyaw", "z_rp", "z-rp", "zrp", "rp_z", "rp-z", "rpz", "vertical_contact"):
         raise ValueError(
             "frontres_perturbation_channels must be one of "
-            "{'all', 'composite', 'full', 'xy_yaw', 'z_rp'}; got "
+            "{'all', 'composite', 'full', 'xy_yaw', 'z_rp', 'rp_z', 'vertical_contact'}; got "
             f"{mode!r}."
         )
 
