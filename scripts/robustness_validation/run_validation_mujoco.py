@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as _datetime
+import gc
 import json
+import logging
 import math
 import os
 
@@ -88,6 +90,27 @@ def _quat_mul_xyzw(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     return out / np.maximum(norm, 1e-12)
 
 
+def _quat_inv_xyzw(q: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float64)
+    out = q.copy()
+    out[..., :3] *= -1.0
+    denom = np.sum(q * q, axis=-1, keepdims=True)
+    return out / np.maximum(denom, 1e-12)
+
+
+def _quat_to_rotvec_xyzw(q: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float64).reshape(4)
+    q = q / max(np.linalg.norm(q), eps)
+    if q[3] < 0.0:
+        q = -q
+    xyz = q[:3]
+    xyz_norm = np.linalg.norm(xyz)
+    angle = 2.0 * math.atan2(xyz_norm, q[3])
+    if xyz_norm <= eps:
+        return (2.0 * xyz).astype(np.float64)
+    return (xyz * (angle / xyz_norm)).astype(np.float64)
+
+
 def _quat_to_matrix_xyzw(q: np.ndarray) -> np.ndarray:
     x, y, z, w = [float(v) for v in np.asarray(q, dtype=np.float64).reshape(4)]
     xx, yy, zz = x * x, y * y, z * z
@@ -109,7 +132,9 @@ def _apply_task_delta_pos(pos: np.ndarray, delta: np.ndarray) -> np.ndarray:
 
 def _apply_task_delta_quat(quat_xyzw: np.ndarray, delta: np.ndarray) -> np.ndarray:
     q_delta = _quat_from_euler_xyz(np.asarray(delta, dtype=np.float64).reshape(6)[3:6])
-    return _quat_mul_xyzw(q_delta, np.asarray(quat_xyzw, dtype=np.float64).reshape(4)).astype(np.float64)
+    # Match MOSAIC: FrontRES predicts a local-frame correction that is
+    # right-multiplied onto the perturbed anchor quaternion.
+    return _quat_mul_xyzw(np.asarray(quat_xyzw, dtype=np.float64).reshape(4), q_delta).astype(np.float64)
 
 
 def _apply_task_delta_body_pos(body_pos: np.ndarray, anchor_pos: np.ndarray, delta: np.ndarray) -> np.ndarray:
@@ -124,7 +149,7 @@ def _apply_task_delta_body_quat(body_quat_xyzw: np.ndarray, delta: np.ndarray) -
     q_delta = _quat_from_euler_xyz(np.asarray(delta, dtype=np.float64).reshape(6)[3:6])
     body_q = np.asarray(body_quat_xyzw, dtype=np.float64).reshape(-1, 4)
     q_delta_batch = np.broadcast_to(q_delta.reshape(1, 4), body_q.shape)
-    return _quat_mul_xyzw(q_delta_batch, body_q).astype(np.float64)
+    return _quat_mul_xyzw(body_q, q_delta_batch).astype(np.float64)
 
 
 def _write_status(output_dir: Path, status: str, **extra) -> None:
@@ -270,25 +295,13 @@ def install_robotbridge_perturbation_patch(robotbridge_deploy: Path) -> None:
         return _apply_task_delta_quat(out, _frontres_delta(self)).astype(np.float64)
 
     def body_pos_w_aligned(self):
-        clean = orig_body_pos(self)
-        clean_anchor = orig_anchor_pos(self)
-        pert = _pert(self)
-        out = np.asarray(clean, dtype=np.float64)
-        anchor_after_pert = np.asarray(clean_anchor, dtype=np.float64)
-        if pert is not None:
-            pert.value(int(self.timestep))
-            out = pert.transform_body_pos(out, clean_anchor)
-            anchor_after_pert = pert.apply_pos(clean_anchor)
-        return _apply_task_delta_body_pos(out, anchor_after_pert, _frontres_delta(self))
+        # Match MOSAIC: FrontRES/DR changes the anchor command, not the full
+        # clean motion library body poses. RobotBridge later computes relative
+        # body targets from clean body poses and the perturbed/corrected anchor.
+        return np.asarray(orig_body_pos(self), dtype=np.float64)
 
     def body_quat_w_aligned(self):
-        clean = orig_body_quat(self)
-        pert = _pert(self)
-        out = np.asarray(clean, dtype=np.float64)
-        if pert is not None:
-            pert.value(int(self.timestep))
-            out = pert.transform_body_quat(out)
-        return _apply_task_delta_body_quat(out, _frontres_delta(self))
+        return np.asarray(orig_body_quat(self), dtype=np.float64)
 
     MotionDataset.anchor_pos_w = property(anchor_pos_w)
     MotionDataset.anchor_quat_w = property(anchor_quat_w)
@@ -340,6 +353,33 @@ def _instantiate_robotbridge_agent(args: argparse.Namespace):
     return instantiate(cfg.agent)
 
 
+def _close_robotbridge_agent(agent) -> None:
+    """Release MuJoCo video/rendering resources before Python teardown."""
+    if agent is None:
+        return
+    env = getattr(agent, "env", None)
+    recorder = getattr(env, "video_recorder", None)
+    if recorder is not None and hasattr(recorder, "close"):
+        try:
+            recorder.close()
+        except Exception as exc:
+            logging.warning("Ignoring RobotBridge video recorder close error: %r", exc)
+    simulator = getattr(env, "simulator", None)
+    close_sim = getattr(simulator, "close", None)
+    if callable(close_sim):
+        try:
+            close_sim()
+        except Exception as exc:
+            logging.warning("Ignoring RobotBridge simulator close error: %r", exc)
+    close_env = getattr(env, "close", None)
+    if callable(close_env):
+        try:
+            close_env()
+        except Exception as exc:
+            logging.warning("Ignoring RobotBridge env close error: %r", exc)
+    gc.collect()
+
+
 def _patch_no_auto_reset(env) -> None:
     def _check_termination_no_reset(self):
         self.validation_terminated = bool(self.simulator.check_termination())
@@ -370,17 +410,51 @@ def _set_frontres_delta(env, delta: np.ndarray | None) -> None:
     )
 
 
-def _refresh_obs_with_frontres(agent, obs_buf_dict, frontres_runtime):
+def _set_frontres_anchor_error_from_perturber(env, perturber: ReferenceFramePerturber | None) -> None:
+    if perturber is None:
+        return
+    loader = env.motion_loader
+    timestep = int(getattr(loader, "timestep", 0))
+    delta = perturber.value(timestep)
+
+    # Match IsaacLab training: FrontRES observes the correction that undoes the
+    # injected reference-frame artifact, not the robot tracking residual.
+    anchor_idx = int(loader.motion_anchor_body_index)
+    clean_raw = loader.motion.body_quat_w[timestep, anchor_idx].copy()[[1, 2, 3, 0]]
+    clean_quat = loader.motion_init_align.align_quat(clean_raw)
+    pert_quat = perturber.apply_quat(clean_quat)
+    corr_quat = _quat_mul_xyzw(_quat_inv_xyzw(pert_quat), clean_quat)
+
+    target = np.zeros(6, dtype=np.float64)
+    target[:3] = -delta[:3]
+    target[3:6] = _quat_to_rotvec_xyzw(corr_quat)
+    env.frontres_anchor_error = target.astype(np.float32)
+
+
+def _refresh_obs_with_frontres(agent, obs_buf_dict, frontres_runtime, perturber=None):
     if frontres_runtime is None:
         return obs_buf_dict
+    _set_frontres_anchor_error_from_perturber(agent.env, perturber)
     delta = frontres_runtime.compute(agent.env, obs_buf_dict)
+    if getattr(agent.env, "_frontres_debug_delta", False):
+        step = int(getattr(agent.env.motion_loader, "timestep", 0))
+        if step % 30 == 0:
+            target = getattr(agent.env, "frontres_anchor_error", np.zeros(6, dtype=np.float32))
+            bias = getattr(frontres_runtime, "last_bias_delta", np.zeros(6, dtype=np.float32))
+            print(
+                "[FrontRESDebug] "
+                f"t={step} target={np.asarray(target).round(4).tolist()} "
+                f"delta={np.asarray(delta).round(4).tolist()} "
+                f"bias={np.asarray(bias).round(4).tolist()}",
+                flush=True,
+            )
     _set_frontres_delta(agent.env, delta)
     agent.env.compute_observation()
     return agent.env.obs_buf_dict
 
 
-def _run_policy_step(agent, obs_buf_dict, frontres_runtime=None):
-    obs_buf_dict = _refresh_obs_with_frontres(agent, obs_buf_dict, frontres_runtime)
+def _run_policy_step(agent, obs_buf_dict, frontres_runtime=None, perturber=None):
+    obs_buf_dict = _refresh_obs_with_frontres(agent, obs_buf_dict, frontres_runtime, perturber)
     inputs = {key: obs_buf_dict[key].astype(np.float32) for key in obs_buf_dict}
     action = agent.policy.run(None, inputs)[0]
     return agent.env.step(action)
@@ -422,7 +496,7 @@ def run_trial(agent, perturber: ReferenceFramePerturber, push_velocity: float, s
             pre_push_margin = last_margin if last_margin is not None else _upright_margin(env)
             _apply_root_velocity_push(env, push_dir, push_velocity)
 
-        obs = _run_policy_step(agent, obs, frontres_runtime)
+        obs = _run_policy_step(agent, obs, frontres_runtime, perturber)
         margin = _upright_margin(env)
         if step < push_step_abs:
             settle_margins.append(margin)
@@ -476,8 +550,14 @@ def main() -> int:
     parser.add_argument("--frontres_history_length", type=int, default=5)
     parser.add_argument("--frontres_max_delta_pos", type=float, default=0.3)
     parser.add_argument("--frontres_max_delta_rpy", type=float, default=0.1)
+    parser.add_argument("--frontres_active_task_dims", type=int, nargs="+", default=[2, 3, 4, 6, 7],
+                        help="Task-space output dims enabled for FEMR. Default matches rp_z specialist.")
     parser.add_argument("--frontres_allow_upward_dz", action="store_true")
     parser.add_argument("--frontres_ignore_conf", action="store_true")
+    parser.add_argument("--frontres_subtract_zero_error_bias", action="store_true",
+                        help="Enable deployment-only zero-error FEMR output subtraction.")
+    parser.add_argument("--frontres_debug_delta", action="store_true",
+                        help="Print FEMR target/delta/bias values every 30 motion steps.")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--run_name", type=str, default=None,
                         help="Shared run folder name. Use the same value for baseline and FrontRES.")
@@ -556,8 +636,11 @@ def main() -> int:
         "frontres_history_length": args.frontres_history_length,
         "frontres_max_delta_pos": args.frontres_max_delta_pos,
         "frontres_max_delta_rpy": args.frontres_max_delta_rpy,
+        "frontres_active_task_dims": args.frontres_active_task_dims,
         "frontres_allow_upward_dz": args.frontres_allow_upward_dz,
         "frontres_ignore_conf": args.frontres_ignore_conf,
+        "frontres_subtract_zero_error_bias": args.frontres_subtract_zero_error_bias,
+        "frontres_debug_delta": args.frontres_debug_delta,
         "epsilon_values": args.epsilon_values,
         "push_velocities": args.push_velocities,
         "perturbation_modes": args.perturbation_modes,
@@ -573,6 +656,7 @@ def main() -> int:
     store = ResultsStore(meta)
     _write_status(output_dir, "running", **meta)
 
+    agent = None
     try:
         agent = _instantiate_robotbridge_agent(args)
         _patch_no_auto_reset(agent.env)
@@ -588,12 +672,15 @@ def main() -> int:
                 max_delta_rpy=args.frontres_max_delta_rpy,
                 allow_upward_dz=args.frontres_allow_upward_dz,
                 ignore_conf=args.frontres_ignore_conf,
+                active_task_dims=args.frontres_active_task_dims,
+                subtract_zero_error_bias=args.frontres_subtract_zero_error_bias,
             )
             print(
                 f"[MuJoCoValidation] FrontRES enabled: {frontres_runtime.checkpoint} "
                 f"(device={args.frontres_device}, history={args.frontres_history_length})",
                 flush=True,
             )
+        agent.env._frontres_debug_delta = bool(args.frontres_debug_delta)
 
         dt = float(getattr(agent.env.simulator, "high_dt", 0.02))
         for mode_idx, mode in enumerate(args.perturbation_modes):
@@ -640,6 +727,8 @@ def main() -> int:
     except Exception as exc:
         _write_status(output_dir, "failed", error=repr(exc), **meta)
         raise
+    finally:
+        _close_robotbridge_agent(agent)
 
 
 if __name__ == "__main__":

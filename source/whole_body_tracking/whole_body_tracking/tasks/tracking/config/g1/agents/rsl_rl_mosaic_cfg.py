@@ -481,15 +481,14 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # ── Fix 2: Low-pass filter on anchor corrections ──────────────────────────
     correction_smooth_alpha        = 0.4
 
-    # ── FrontRES rp-z demo specialist ─────────────────────────────────────────
+    # ── FrontRES rp demo specialist ───────────────────────────────────────────
     # Task-space action layout:
     #   [dx, dy, dz, droll, dpitch, dyaw, c_pos, c_rpy]
-    # RobotBridge tests show rp+z is the failure mode that visibly hurts GMT.
-    # This specialist run keeps the selective abstain behavior but concentrates
-    # warmup/PPO on vertical-contact repair.
-    frontres_specialist_mode       = "rp_z"
-    frontres_active_task_dims      = [2, 3, 4, 6, 7]
-    frontres_perturbation_channels = "rp_z"
+    # Isolate roll/pitch first so we can measure GMT's angular robustness limit
+    # without coupling the signal to root-z contact discontinuities.
+    frontres_specialist_mode       = "rp"
+    frontres_active_task_dims      = [3, 4, 7]
+    frontres_perturbation_channels = "rp"
 
     # "More executable" reward:
     #   damage_gap  = R_feasible_oracle - R_perturbed
@@ -498,7 +497,10 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # A double-sigmoid window maps executable damage to one repairability
     # weight mu.  Safe and deeply broken samples are suppressed; only the
     # middle repairable band receives the executable-gain reward.
-    frontres_exec_reward_weight    = 1.0
+    # Demo-oriented FEMR: clean restoration is the primary objective.  The
+    # executable score remains a safety diagnostic/constraint, not the behavior
+    # target that PPO is allowed to hack.
+    frontres_exec_reward_weight    = 0.0
     frontres_exec_reward_temp      = 1.0
     # Train on direct executable gain by default.  The normalized ratio is still
     # logged as a difficulty diagnostic, but using it as reward divided by small
@@ -562,12 +564,15 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_gap_gate_temp         = 0.005
     frontres_side_actor_gate_weight = 0.05
     frontres_harm_epsilon          = 0.001
-    frontres_harm_penalty_weight   = 0.25
+    frontres_harm_penalty_weight   = 1.0
+    frontres_executable_harm_weight = 1.0
     frontres_side_harm_weight      = 0.0
     frontres_harm_action_cost_floor = 0.001
     frontres_harm_action_cost_ref   = 0.01
     frontres_state_supervised_controller_enabled = True
-    frontres_supervised_anchor_weight = 0.02
+    # Keep PPO near the supervised anti-perturbation cone.  A low anchor lets
+    # late-stage PPO drift into self-induced harmful corrections.
+    frontres_supervised_anchor_weight = 0.20
     frontres_supervised_decay_good = 0.985
     frontres_supervised_decay_conflict = 0.97
     frontres_supervised_positive_gain_trigger = 0.52
@@ -577,9 +582,9 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_exec_reward_signal = "gain"
     frontres_selective_reward_enabled = True
     frontres_min_effective_gain = 0.008
-    frontres_effective_gain_bonus_weight = 0.5
+    frontres_effective_gain_bonus_weight = 0.0
     frontres_safe_cost_weight = 1.0
-    frontres_repair_cost_weight = 0.15
+    frontres_repair_cost_weight = 0.0
     frontres_broken_cost_weight = 1.0
     frontres_broken_harm_weight = 1.0
     frontres_family_preference_scale = 0.02
@@ -591,18 +596,24 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_per_mode_supervised_mask = True
     frontres_adaptive_perturb_curriculum_enabled = True
     frontres_warmup_energy_loss_weight = 1.0
-    # Alignment debug reward:
-    #   r = mu * exec_signal
-    #       - harm_weight * harmful_repair
-    #       - (1 - mu) * minimum-intervention cost
-    # Geometry and rescue terms are disabled here so the only positive signal is
-    # "corrected reference is easier for frozen GMT than noisy reference".
-    frontres_geometry_reward_weight = 0.0
+    # Demo restoration reward:
+    #   r_restore = ||noisy - clean|| - ||corrected - clean||
+    # It is computed from the anchor error against the clean reference.  PPO now
+    # optimizes visual/reference restoration directly; executable harm is a
+    # constraint that prevents dynamically damaging corrections.
+    frontres_restore_z_weight = 0.0
+    frontres_restore_xy_weight = 0.0
+    frontres_restore_rp_weight = 1.0
+    frontres_restore_yaw_weight = 0.0
+    frontres_geometry_reward_weight = 1.0
     frontres_rescue_reward_weight  = 0.0
     # Calibration run: make the minimum-intervention prior visible but not
     # dominant.  Current repair_gain is O(1e-3), so the previous weights
     # produced O(1e-1) costs and overwhelmed the gain diagnostics.
-    frontres_intervention_cost_weights = [0.005, 0.005, 0.002, 0.01, 0.01, 0.005]
+    frontres_intervention_cost_weights = [0.0, 0.0, 0.0, 0.001, 0.001, 0.0]
+    frontres_overcorrection_margin = 0.02
+    frontres_overcorrection_weight = 0.5
+    frontres_restore_eval_min_error = 0.01
 
     # ── Fast debug mode: shortens the feedback loop for reward/DR tuning ─────
     # Formal training leaves this False.  Enable with:
@@ -634,7 +645,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     supervised_warmup_steps_per_iter = 8
     supervised_warmup_max_envs_per_step = 4096
     supervised_warmup_dr_scale_start = 0.35  # curriculum start: easy enough for stable direction learning
-    supervised_warmup_dr_scale      = 1.00   # curriculum end: match Actor-takeover DR difficulty
+    supervised_warmup_dr_scale      = 1.25   # curriculum end: expose rp beyond the easy GMT regime
     supervised_warmup_lr           = 1e-4
     supervised_warmup_epochs       = 3
     supervised_warmup_diag_interval = 40
@@ -647,12 +658,12 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # ── Adaptive DR: repairable-boundary controller ────────────────────────
     dr_scale_init                  = 1.0    # fixed during Actor takeover; calibrated near repairable GMT damage
     dr_adapt_speed                 = 0.001  # per-iteration step size
-    dr_max_scale                   = 4.0    # upper limit
+    dr_max_scale                   = 3.0    # upper limit; rp base 0.08 rad reaches 0.24 rad
     dr_min_scale                   = 0.30   # do not collapse below the xy/yaw debug signal floor
     dr_ema_alpha                   = 0.95   # r_delta EMA smoothing
-    dr_start_ppo_actor_weight      = 1.0    # freeze DR until PPO actor takeover completes
+    dr_start_ppo_actor_weight      = 1.0    # marks the actor-takeover phase for DR scheduling
     frontres_boundary_dr_enabled   = True
-    frontres_boundary_dr_during_actor_takeover = False
+    frontres_boundary_dr_during_actor_takeover = True
     frontres_boundary_dr_ema_alpha = 0.90
     frontres_boundary_dr_step      = 0.03
     frontres_boundary_safe_high    = 0.45
@@ -687,11 +698,11 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # short shocks; OU-like float/sink/root tilt maintain persistent damage.
     iid_prob_z                     = 0.3
     iid_prob_xy                    = 0.1
-    iid_prob_rp                    = 0.2
+    iid_prob_rp                    = 0.4
     iid_prob_ya                    = 0.1
     iid_std_z                      = 0.06   # Z jump std (m), scaled by dr_scale
     iid_std_xy                     = 0.15
-    iid_std_rp                     = 0.05   # RP jump std (rad)
+    iid_std_rp                     = 0.08   # RP jump std (rad)
     iid_std_ya                     = 0.15
     local_root_artifact_prob       = 0.3
     local_root_artifact_min_steps  = 6
@@ -712,8 +723,8 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # upward Δz remains blocked during action application.
     sink_prob                      = 0.3
     sink_ratio                     = 0.04
-    root_tilt_prob                 = 0.3
-    root_tilt_max_rad              = 0.05
+    root_tilt_prob                 = 0.5
+    root_tilt_max_rad              = 0.08
 
     # ── Legacy Critic warmup ───────────────────────────────────────────────
     # Disabled because Critic now learns executable damage during joint warmup.
@@ -805,7 +816,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         ppo_actor_warmup_iterations   = 0,
         ppo_actor_ramp_iterations     = 400,
         ppo_advantage_focal_power     = 0.0,
-        frontres_active_task_dims      = [2, 3, 4, 6, 7],
+        frontres_active_task_dims      = [3, 4, 7],
         diagnose_gradient_conflict    = True,
 
         # ── Misc ─────────────────────────────────────────────────────────────

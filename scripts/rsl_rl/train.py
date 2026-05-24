@@ -300,10 +300,14 @@ def _configure_frontres_motion_perturbations(env_cfg, agent_cfg) -> None:
             flush=True,
         )
         return
-    if mode not in ("xy_yaw", "xy-yaw", "xyyaw", "z_rp", "z-rp", "zrp", "rp_z", "rp-z", "rpz", "vertical_contact"):
+    if mode not in (
+        "xy_yaw", "xy-yaw", "xyyaw",
+        "z_rp", "z-rp", "zrp", "rp_z", "rp-z", "rpz", "vertical_contact",
+        "rp", "local_rp", "rp_only", "strong_rp",
+    ):
         raise ValueError(
             "frontres_perturbation_channels must be one of "
-            "{'all', 'composite', 'full', 'xy_yaw', 'z_rp', 'rp_z', 'vertical_contact'}; got "
+            "{'all', 'composite', 'full', 'xy_yaw', 'z_rp', 'rp_z', 'vertical_contact', 'rp'}; got "
             f"{mode!r}."
         )
 
@@ -351,6 +355,22 @@ def _configure_frontres_motion_perturbations(env_cfg, agent_cfg) -> None:
             f"{pt.local_root_artifact_xy_std}/{pt.local_root_artifact_yaw_std}/"
             f"{pt.local_root_artifact_min_steps}-{pt.local_root_artifact_max_steps}; "
             "z/rp/joint disabled)",
+            flush=True,
+        )
+        return
+
+    if mode in ("rp", "local_rp", "rp_only", "strong_rp"):
+        # RP-only specialist: isolate roll/pitch anchor artifacts so we can
+        # measure GMT's angular robustness limit without z-contact coupling.
+        pt.root_tilt_prob = float(getattr(agent_cfg, "root_tilt_prob", 0.3))
+        pt.root_tilt_max_rad = float(getattr(agent_cfg, "root_tilt_max_rad", 0.05))
+        pt.iid_prob_rp = float(getattr(agent_cfg, "iid_prob_rp", pt.iid_prob_rp))
+        pt.iid_std_rp = float(getattr(agent_cfg, "iid_std_rp", pt.iid_std_rp))
+        print(
+            "[INFO] FrontRES perturbation alignment: rp "
+            f"(root_tilt={pt.root_tilt_prob}/{pt.root_tilt_max_rad}, "
+            f"iid_rp={pt.iid_prob_rp}/{pt.iid_std_rp}; "
+            "xy/yaw/z/joint disabled)",
             flush=True,
         )
         return

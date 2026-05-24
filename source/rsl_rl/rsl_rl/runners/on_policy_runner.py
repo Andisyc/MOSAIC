@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import math
+import json
 import os
+import shutil
 import statistics
 import time
 import torch
@@ -75,6 +77,20 @@ class OnPolicyRunner:
         if self.training_type != "frontres":
             return
         mode = str(self.cfg.get("frontres_specialist_mode", "") or "").lower()
+        if mode in ("rp", "local_rp", "rp_only", "strong_rp"):
+            active_dims = [3, 4, 7]  # droll, dpitch, conf_rpy
+            self.cfg["frontres_specialist_mode"] = "rp"
+            self.cfg["frontres_active_task_dims"] = active_dims
+            self.cfg["frontres_perturbation_channels"] = "rp"
+            self.cfg["frontres_exec_task_weight"] = 0.0
+            self.cfg["frontres_exec_cone_task_weight"] = 0.0
+            self.alg_cfg["frontres_active_task_dims"] = active_dims
+            print(
+                "[Runner] FrontRES specialist mode enabled: rp "
+                "(local_rp only; active dims roll/pitch/conf)",
+                flush=True,
+            )
+            return
         if mode not in ("rp_z", "z_rp", "vertical_contact"):
             return
 
@@ -1379,7 +1395,10 @@ class OnPolicyRunner:
 
         def _frontres_curriculum_choices(progress: float, seq_idx: int) -> tuple[list[tuple[str, ...]], str]:
             _bases = _frontres_curriculum_allowed_bases()
-            if str(self.cfg.get("frontres_specialist_mode", "") or "").lower() in ("rp_z", "z_rp", "vertical_contact"):
+            _specialist_mode = str(self.cfg.get("frontres_specialist_mode", "") or "").lower()
+            if _specialist_mode in ("rp", "local_rp", "rp_only", "strong_rp"):
+                return [("local_rp",)], "single"
+            if _specialist_mode in ("rp_z", "z_rp", "vertical_contact"):
                 return [("global_z", "local_rp")], "two"
             if not (_is_frontres and bool(self.cfg.get("frontres_perturbation_curriculum_enabled", True))):
                 return [tuple(_bases)], "full"
@@ -1576,7 +1595,10 @@ class OnPolicyRunner:
                 "frontres_warmup_perturbation_schedule",
                 self.cfg.get("supervised_warmup_perturbation_schedule", "mixed_single"),
             ))
-            if str(self.cfg.get("frontres_specialist_mode", "") or "").lower() in ("rp_z", "z_rp", "vertical_contact"):
+            _specialist_mode = str(self.cfg.get("frontres_specialist_mode", "") or "").lower()
+            if _specialist_mode in ("rp", "local_rp", "rp_only", "strong_rp"):
+                return [("local_rp",)]
+            if _specialist_mode in ("rp_z", "z_rp", "vertical_contact"):
                 return [("global_z", "local_rp")]
             if _mode == "rl_curriculum":
                 _active = tuple(getattr(self, "_frontres_curriculum_active_modes", tuple(_bases)))
@@ -2392,6 +2414,10 @@ class OnPolicyRunner:
             _frontres_behavior_fit_sum:    float = 0.0
             _frontres_repair_fit_rate_sum: float = 0.0
             _frontres_repair_fit_gain_sum: float = 0.0
+            _frontres_restore_ratio_rp_sum: float = 0.0
+            _frontres_residual_rp_abs_sum: float = 0.0
+            _frontres_corr_roll_bias_sum: float = 0.0
+            _frontres_corr_pitch_bias_sum: float = 0.0
             _frontres_harm_rate_sum:       float = 0.0
             _frontres_harm_mag_sum:        float = 0.0
             _frontres_safe_harm_rate_sum:  float = 0.0
@@ -2690,7 +2716,16 @@ class OnPolicyRunner:
                             _yaw_corr = _wrap_pi(_yaw_fr - _yaw_raw)
                             _r_ya = _r_axis(_yaw_err_raw, _yaw_corr)
 
-                            _r_step = 0.3*_r_z + 0.3*_r_xy + 0.15*_r_rp + 0.02*_r_ya
+                            _restore_z_weight = float(self.cfg.get("frontres_restore_z_weight", 0.3))
+                            _restore_xy_weight = float(self.cfg.get("frontres_restore_xy_weight", 0.3))
+                            _restore_rp_weight = float(self.cfg.get("frontres_restore_rp_weight", 0.15))
+                            _restore_yaw_weight = float(self.cfg.get("frontres_restore_yaw_weight", 0.02))
+                            _r_step = (
+                                _restore_z_weight * _r_z
+                                + _restore_xy_weight * _r_xy
+                                + _restore_rp_weight * _r_rp
+                                + _restore_yaw_weight * _r_ya
+                            )
                             _dr_z_abs_log = _dr_z_fr.abs().mean()
                             _dr_xy_abs_log = _dr_xy_fr.norm(dim=-1).mean()
                             _dr_rp_abs_log = _e_raw.mean()
@@ -2755,6 +2790,7 @@ class OnPolicyRunner:
 
                             # ── Minimum-intervention cost ──────────────────────────
                             _intervention_cost = torch.zeros(N_train, device=self.device)
+                            _action_activity = torch.zeros(N_train, device=self.device)
                             if _is_task_space_mode and actions.shape[-1] >= 6:
                                 _delta = actions[:N_train, :6]
                                 _max_delta = torch.tensor(
@@ -2778,11 +2814,32 @@ class OnPolicyRunner:
                                     dtype=_delta.dtype,
                                 )
                                 _intervention_cost = (_weights * (_delta / _max_delta).pow(2)).sum(dim=-1)
+                                _active_dims_cfg = self.cfg.get("frontres_active_task_dims", None)
+                                if _active_dims_cfg is not None:
+                                    _active_delta_dims = [
+                                        int(_idx) for _idx in _active_dims_cfg
+                                        if 0 <= int(_idx) < min(6, _delta.shape[-1])
+                                    ]
+                                else:
+                                    _active_delta_dims = list(range(min(6, _delta.shape[-1])))
+                                if _active_delta_dims:
+                                    _active_idx = torch.tensor(_active_delta_dims, device=self.device, dtype=torch.long)
+                                    _action_activity = (_delta[:, _active_idx] / _max_delta[_active_idx]).pow(2).mean(dim=-1)
+                            _overcorrection_cost = torch.zeros(N_train, device=self.device)
+                            if _is_task_space_mode:
+                                _over_margin = float(self.cfg.get("frontres_overcorrection_margin", 0.0))
+                                _over_weight = float(self.cfg.get("frontres_overcorrection_weight", 0.0))
+                                if _over_weight > 0.0:
+                                    _rp_target_norm = _rp_raw.norm(dim=-1)
+                                    _rp_corr_norm = _rot_raw_to_fr[:, :2].norm(dim=-1)
+                                    _rp_over = torch.relu(_rp_corr_norm - _rp_target_norm - max(_over_margin, 0.0))
+                                    _overcorrection_cost = _over_weight * _rp_over.pow(2)
 
                             _w_exec = float(self.cfg.get("frontres_exec_reward_weight", 1.0))
                             _repair_scale = float(self.cfg.get("frontres_repair_reward_scale", 1.0))
                             _w_geom = float(self.cfg.get("frontres_geometry_reward_weight", 0.05))
                             _w_rescue = float(self.cfg.get("frontres_rescue_reward_weight", 1.0))
+                            _w_exec_harm = float(self.cfg.get("frontres_executable_harm_weight", 1.0))
                             # Executable-gap reward:
                             #   damage_gap  = R_feasible_oracle_exec - R_perturbed_exec
                             #   repair_gain = R_frontres_exec - R_perturbed_exec
@@ -2875,8 +2932,9 @@ class OnPolicyRunner:
                             _harm_action_floor = float(self.cfg.get("frontres_harm_action_cost_floor", 0.001))
                             _harm_action_ref = float(self.cfg.get("frontres_harm_action_cost_ref", 0.01))
                             _harm_action_ref = max(_harm_action_ref, _harm_action_floor + 1e-6)
+                            _harm_action_measure = _action_activity[:_n_exec]
                             _harm_action_gate = (
-                                (_cost_exec - _harm_action_floor) / (_harm_action_ref - _harm_action_floor)
+                                (_harm_action_measure - _harm_action_floor) / (_harm_action_ref - _harm_action_floor)
                             ).clamp(0.0, 1.0)
                             _harm_mag = _harm_mag_raw * _harm_action_gate
                             if _selective_reward:
@@ -2926,10 +2984,10 @@ class OnPolicyRunner:
                             r_delta = (
                                 _w_exec * _repair_scale * _exec_weight * _r_exec
                                 + _w_exec * _repair_scale * _effective_gain_bonus
-                                - _w_exec * _repair_scale * _harm_penalty
+                                - _w_exec_harm * _harm_penalty
                                 + _w_geom * _r_step
                                 + _w_rescue * _r_rescue
-                                - _cost_weight * _intervention_cost
+                                - _cost_weight * (_intervention_cost + _overcorrection_cost)
                             )
                             _r_frontres_log = _exec_frontres.mean()
                             _r_base_log   = _exec_perturbed.mean()
@@ -3053,6 +3111,18 @@ class OnPolicyRunner:
                             _frontres_behavior_fit_sum += _behavior_fit.item()
                             _frontres_repair_fit_rate_sum += _repair_fit_rate.item()
                             _frontres_repair_fit_gain_sum += _repair_fit_gain.item()
+                            _restore_eval_min = float(self.cfg.get("frontres_restore_eval_min_error", 1e-3))
+                            _restore_eval_mask = _e_raw > max(_restore_eval_min, 1e-8)
+                            if _restore_eval_mask.any():
+                                _restore_ratio_rp = 1.0 - (
+                                    _e_fr[_restore_eval_mask] / _e_raw[_restore_eval_mask].clamp(min=1e-6)
+                                )
+                                _frontres_restore_ratio_rp_sum += _restore_ratio_rp.mean().item()
+                            else:
+                                _frontres_restore_ratio_rp_sum += 0.0
+                            _frontres_residual_rp_abs_sum += _e_fr.mean().item()
+                            _frontres_corr_roll_bias_sum += _rot_raw_to_fr[:, 0].mean().item()
+                            _frontres_corr_pitch_bias_sum += _rot_raw_to_fr[:, 1].mean().item()
                             _frontres_harm_rate_sum += _harm_rate.item()
                             _frontres_harm_mag_sum += _harm_mag_fit.item()
                             _frontres_safe_harm_rate_sum += _safe_harm_rate.item()
@@ -3319,6 +3389,22 @@ class OnPolicyRunner:
                 _frontres_repair_fit_gain_sum / _frontres_reward_diag_steps
                 if _is_frontres and _frontres_reward_diag_steps > 0 else None
             )
+            frontres_restore_ratio_rp_mean = (
+                _frontres_restore_ratio_rp_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_residual_rp_abs_mean = (
+                _frontres_residual_rp_abs_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_corr_roll_bias_mean = (
+                _frontres_corr_roll_bias_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_corr_pitch_bias_mean = (
+                _frontres_corr_pitch_bias_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
             frontres_harm_rate_mean = (
                 _frontres_harm_rate_sum / _frontres_reward_diag_steps
                 if _is_frontres and _frontres_reward_diag_steps > 0 else None
@@ -3453,7 +3539,9 @@ class OnPolicyRunner:
 
                 # Save model
                 if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                    _checkpoint_path = os.path.join(self.log_dir, f"model_{it}.pt")
+                    self.save(_checkpoint_path)
+                    self._record_frontres_checkpoint_probe(locals(), _checkpoint_path)
 
             # Clear episode infos
             ep_infos.clear() # 清空记录机器人人得分和存活长度的字典
@@ -3470,7 +3558,9 @@ class OnPolicyRunner:
 
         # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
-            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+            _final_checkpoint_path = os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt")
+            self.save(_final_checkpoint_path)
+            self._record_frontres_checkpoint_probe(locals(), _final_checkpoint_path)
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         # Compute the collection size
@@ -3576,6 +3666,7 @@ class OnPolicyRunner:
                 "exec_signal", "weighted_exec_signal", "train_reward",
                 "effective_gain_bonus", "safe_cost", "repair_cost", "broken_cost",
                 "behavior_fit", "repair_fit_rate", "repair_fit_gain",
+                "restore_ratio_rp", "residual_rp_abs", "corr_roll_bias", "corr_pitch_bias",
                 "harm_rate", "harm_mag", "safe_harm_rate", "broken_harm_rate",
                 "safe_abstain_cost", "broken_abstain_cost",
                 "window_mu", "safe_frac", "repair_frac", "broken_frac",
@@ -3778,6 +3869,13 @@ class OnPolicyRunner:
                                 f"{locs['frontres_repair_fit_rate_mean']:+.3f} / "
                                 f"{locs['frontres_repair_fit_gain_mean']:+.4f}\n"
                             )
+                            log_string += f"""{'restore rp/res/bias:':>{pad}} """
+                            log_string += (
+                                f"{locs['frontres_restore_ratio_rp_mean']:+.3f} / "
+                                f"{locs['frontres_residual_rp_abs_mean']:.4f} / "
+                                f"{locs['frontres_corr_roll_bias_mean']:+.4f}, "
+                                f"{locs['frontres_corr_pitch_bias_mean']:+.4f}\n"
+                            )
                             log_string += f"""{'harm rate/mag:':>{pad}} """
                             log_string += (
                                 f"{locs['frontres_harm_rate_mean']:.3f} / "
@@ -3891,6 +3989,100 @@ class OnPolicyRunner:
                                locs['start_iter'] + locs['num_learning_iterations'] - locs['it'])))}\n""")
         
         print(log_string)
+
+    def _record_frontres_checkpoint_probe(self, locs: dict, checkpoint_path: str) -> None:
+        """Persist save-time FrontRES probe metrics and keep the best demo checkpoint.
+
+        This is a lightweight checkpoint selector: it records the triplet
+        rollout diagnostics already computed for the checkpoint iteration,
+        without resetting the simulator or replaying the full training set.
+        """
+        if self.training_type != "frontres" or self.log_dir is None:
+            return
+
+        def _float(name: str, default: float | None = None) -> float | None:
+            value = locs.get(name, default)
+            if value is None:
+                return default
+            try:
+                if isinstance(value, torch.Tensor):
+                    value = value.detach().mean().item()
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        restore_ratio = _float("frontres_restore_ratio_rp_mean")
+        if restore_ratio is None:
+            return
+
+        residual = _float("frontres_residual_rp_abs_mean", 0.0) or 0.0
+        roll_bias = _float("frontres_corr_roll_bias_mean", 0.0) or 0.0
+        pitch_bias = _float("frontres_corr_pitch_bias_mean", 0.0) or 0.0
+        harm_rate = _float("frontres_harm_rate_mean", 0.0) or 0.0
+        harm_mag = _float("frontres_harm_mag_mean", 0.0) or 0.0
+        survival = _float("frontres_survival_rate", 1.0)
+        r_delta = _float("frontres_rdelta_mean", 0.0) or 0.0
+        dr_scale = _float("frontres_dr_scale", None)
+
+        bias_abs = abs(roll_bias) + abs(pitch_bias)
+        survival_penalty = 0.0 if survival is None else max(0.0, 1.0 - survival)
+        score = (
+            restore_ratio
+            - 0.25 * harm_rate
+            - 2.0 * harm_mag
+            - 0.50 * bias_abs
+            - 0.10 * residual
+            - 2.0 * survival_penalty
+        )
+
+        record = {
+            "iteration": int(locs.get("it", self.current_learning_iteration)),
+            "checkpoint": os.path.basename(checkpoint_path),
+            "score": score,
+            "restore_ratio_rp": restore_ratio,
+            "residual_rp_abs": residual,
+            "corr_roll_bias": roll_bias,
+            "corr_pitch_bias": pitch_bias,
+            "bias_abs": bias_abs,
+            "harm_rate": harm_rate,
+            "harm_mag": harm_mag,
+            "survival_rate": survival,
+            "r_delta": r_delta,
+            "dr_scale": dr_scale,
+            "perturb_modes": locs.get("frontres_perturb_modes"),
+            "perturb_complexity": locs.get("frontres_perturb_complexity"),
+        }
+
+        probe_path = os.path.join(self.log_dir, "frontres_checkpoint_probe.jsonl")
+        with open(probe_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+
+        if self.writer is not None and not self.disable_logs:
+            self.writer.add_scalar("FrontRES/CheckpointProbe/demo_score", score, record["iteration"])
+            self.writer.add_scalar("FrontRES/CheckpointProbe/restore_ratio_rp", restore_ratio, record["iteration"])
+            self.writer.add_scalar("FrontRES/CheckpointProbe/bias_abs", bias_abs, record["iteration"])
+
+        best_score = getattr(self, "_frontres_best_probe_score", None)
+        best_meta_path = os.path.join(self.log_dir, "frontres_best_probe.json")
+        if best_score is None and os.path.exists(best_meta_path):
+            try:
+                with open(best_meta_path, "r", encoding="utf-8") as f:
+                    best_score = float(json.load(f).get("score"))
+                    self._frontres_best_probe_score = best_score
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                best_score = None
+        if best_score is None or score > float(best_score):
+            self._frontres_best_probe_score = score
+            best_path = os.path.join(self.log_dir, "model_best_probe.pt")
+            shutil.copyfile(checkpoint_path, best_path)
+            with open(best_meta_path, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2, sort_keys=True)
+            print(
+                "[Runner] New FrontRES probe best: "
+                f"score={score:+.4f}, restore_rp={restore_ratio:+.3f}, "
+                f"harm={harm_rate:.3f}, bias={bias_abs:.4f} -> {os.path.basename(best_path)}",
+                flush=True,
+            )
 
     def save(self, path: str, infos=None):
         # Check if using ResidualActorCritic (special handling)
