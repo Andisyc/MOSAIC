@@ -809,9 +809,10 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         max_grad_norm        = 0.5,
 
         # ── Supervised auxiliary loss (λ_sup schedule) ────────────────────────
+        frontres_training_objective  = "supervised_restore",
         lambda_supervised             = 1.0,   # initial weight
-        lambda_supervised_min         = 0.20,  # floor: keep Actor near the feasible warmup cone
-        lambda_supervised_decay       = 0.997, # per-iter decay after trigger
+        lambda_supervised_min         = 1.0,   # supervised_restore keeps the target as the main objective
+        lambda_supervised_decay       = 1.0,   # no decay in the supervised branch
         supervised_trigger_cosine_sim = 0.85,  # EMA threshold to start decay
         supervised_rpy_loss_weight    = 1.0,
         supervised_conf_loss_weight   = 0.0,   # BCE drives c→1 always (OU≠0); let PPO learn gating

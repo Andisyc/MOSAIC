@@ -1,1191 +1,1158 @@
-# On-line Motion Refiner
+# Front End Motion Refiner
 
+## 本工作版本演进总结
 
-- 架构：
-    - FrontRES 输出ΔSE3(task-space correction)+Conf_pos+Conf_rpy
-    - 执行约束：jump gate、Δz upward block (屏蔽向上输出修正)
-- 扰动项：
-    - xy/yaw
-    - z/rp
-    - sink/float/root tilt/IID/OU/local artifact
-    - 扰动是否与动作空间和 reward 对齐
-- 更新机制 & 奖励项：
-    - executability margin
-    - repair gain / repair ratio
-    - stability margin
-    - task preservation
-    - action cost
-    - double-sigmoid repairability window `mu`
-    - harmful repair penalty
-    - behavior fitting diagnostics
-- 训练 schedule：
-    - warmup
-    - DR scale
-    - actor takeover
-</aside>
+本工作研究一个放置在冻结 GMT tracker 前端的轻量 motion refiner。FEMR 不替代 GMT，而是在参考动作进入 GMT 之前输出 task-space residual correction：
 
-<aside>
-💡
+$$
+\Delta_\theta
+=
+[
+\Delta x,
+\Delta y,
+\Delta z,
+\Delta r,
+\Delta p,
+\Delta yaw
+].
+$$
 
-**Split Reference Branch**
+目标是修复视频/视觉动作提取产生的 reference-frame artifacts，使被污染的动作序列重新接近 clean motion，并保持 GMT 可执行。
 
-`R_perturbed = noisy-GMT reference 的 executable score`
+### 1. 基础架构：前端残差修复
 
-`R_frontres  = FrontRES 修正后 reference 的 executable score`
+最初设计将 FEMR 放在 GMT 前端：
 
-`R_feasible  = active cone 下 oracle 最优修正后的 executable score`
+$$
+x^{\mathrm{noisy}}
+\xrightarrow{\mathrm{FEMR}}
+x^{\mathrm{noisy}}+\Delta_\theta
+\xrightarrow{\mathrm{GMT}}
+\tau^{\mathrm{fr}}.
+$$
 
-</aside>
+这一设计保持 GMT 冻结，只训练 FEMR。这样可以把论文叙事固定为：
 
-<aside>
-💡
+$$
+\text{reference-frame error consumes robustness budget},
+$$
 
-**Gap & Gain & Ratio**
+而不是重新训练一个新的 tracker。
 
-`damage_gap  = max(R_feasible - R_perturbed, 0)`
+### 2. Task-Space Correction：从通用残差到可解释动作锥
 
-`repair_gain = R_frontres - R_perturbed`
+FEMR 使用 task-space correction，而不是直接输出 joint-space residual：
 
-`repair_ratio = repair_gain / max(damage_gap, gap_floor)`
+$$
+\Delta_\theta \in SE(3)
+$$
 
-</aside>
+主要原因是 reference-frame artifacts 通常表现为 root position、root orientation、yaw、roll/pitch 等可解释扰动。
 
-<aside>
-💡
+当前 rp demo 分支只激活：
 
-**Sample Regions**
+$$
+M_{\mathrm{rp}}
+=
+[0,0,0,1,1,0],
+$$
 
-当前代码不再使用旧的 `safe_gate / fragile_gate / broken_gate / bad_repair_gate` 参与 reward。
+即只允许 FEMR 修复 roll/pitch 方向误差。这样可以先验证单一扰动分支的极限，避免 xy、z、yaw 与接触动力学混在一起。
 
-现在只保留一个连续修复窗口权重：
+### 3. 三分支 Rollout：Clean / Noisy / FEMR
 
-`mu = repairability window weight`
+为了给 FEMR 提供稳定训练信号，代码使用三分支 rollout：
 
-它回答一个问题：
+$$
+\tau^{\mathrm{clean}}
+=
+\mathrm{GMT}(x^{\mathrm{clean}}),
+$$
 
-`当前样本有多适合作为“学习修复”的样本？`
+$$
+\tau^{\mathrm{noisy}}
+=
+\mathrm{GMT}(x^{\mathrm{noisy}}),
+$$
 
-硬分区只作为诊断项：
+$$
+\tau^{\mathrm{fr}}
+=
+\mathrm{GMT}(x^{\mathrm{noisy}}+\Delta_\theta).
+$$
 
-`safe   : damage_gap < safe_gap`
+Clean 分支表示原始动作序列在仿真中的执行结果，是最终目标。Noisy 分支表示不修复时 GMT 的 baseline。FEMR 分支表示修复后的执行结果。
 
-`repair : safe_gap <= damage_gap <= broken_gap`
+### 4. Oracle 分支：从修复上限改为可信度估计
 
-`broken : damage_gap > broken_gap`
+早期版本引入 feasible oracle：
+
+$$
+\tau^{\mathrm{oracle}}
+=
+\mathrm{GMT}
+\left(
+x^{\mathrm{noisy}}
++
+\Pi_{\mathcal{A}}(\Delta^\star)
+\right),
+$$
+
+其中 \(\Pi_{\mathcal{A}}\) 将 clean repair target 投影到当前 active action cone。
+
+这个 oracle 原本用于估计可修上限：
+
+$$
+R_{\mathrm{oracle}} - R_{\mathrm{noisy}}.
+$$
+
+但后续发现，如果 oracle 因动作锥、clip、projection 或奇异约束低于 Clean，那么它会错误限制 FEMR 的修复幅度。因此当前版本改为：
+
+$$
+\text{Clean is the target, oracle is trust.}
+$$
+
+Oracle 只用于判断样本是否可信：
+
+$$
+g_{\mathrm{oc}}
+=
+\max(R_{\mathrm{clean}}-R_{\mathrm{oracle}},0),
+$$
+
+$$
+c_{\mathrm{oracle}}
+=
+\exp
+\left(
+-
+\frac{g_{\mathrm{oc}}}{\tau_{\mathrm{oc}}}
+\right).
+$$
+
+### 5. Reward 目标：从 executability gain 转向 Clean restoration
+
+早期强化学习目标主要基于 executable gain：
+
+$$
+R_{\mathrm{fr}} - R_{\mathrm{noisy}}.
+$$
+
+这个目标能鼓励 FEMR 提高可执行性，但存在 reward hacking 风险：FEMR 可能学到“更容易被 GMT 执行”的 reference，而不是“更接近原始 Clean motion”的 reference。
+
+当前版本将主目标改为 Clean restoration：
+
+$$
+r_{\mathrm{restore}}
+=
+e_{\mathrm{raw}} - e_{\mathrm{fr}},
+$$
 
 其中：
 
-`safe` 表示几乎没坏，期望 FrontRES 少动。
+$$
+e_{\mathrm{raw}}
+=
+d(x^{\mathrm{noisy}},x^{\mathrm{clean}}),
+$$
 
-`repair` 表示损伤在可修范围内，期望 FrontRES 提高 executability。
+$$
+e_{\mathrm{fr}}
+=
+d(x^{\mathrm{noisy}}+\Delta_\theta,x^{\mathrm{clean}}).
+$$
 
-`broken` 表示损伤太深，期望 FrontRES 不要硬修。
+也就是说，FEMR 获得正收益当且仅当它让 corrupted reference 更接近 Clean。
 
-</aside>
+### 6. Sample Selection：用 Clean Damage 选择可修样本
 
-<aside>
-💡
+样本难度不再由 oracle gap 决定，而由 clean damage 决定：
 
-**Executable Score**
+$$
+d_{\mathrm{clean}}
+=
+\max(R_{\mathrm{clean}}-R_{\mathrm{noisy}},0).
+$$
 
-`planar   -> xy_score`
+然后通过 double-sigmoid repairability window 得到：
 
-`yaw      -> yaw_score`
+$$
+\mu_{\mathrm{repair}}.
+$$
 
-`global_z -> z_score`
+PPO actor 的样本权重为：
 
-`local_rp -> rp_score`
+$$
+w_{\mathrm{actor}}
+=
+c_{\mathrm{oracle}}\mu_{\mathrm{repair}}
++
+\alpha_{\mathrm{side}}
+\left(
+\mu_{\mathrm{safe}}+\mu_{\mathrm{broken}}
+\right).
+$$
 
-`xy_score:`
+这表示：真正主导 PPO 更新的是 clean damage 明显、处于可修区间、且 oracle 不明显低于 Clean 的样本。
 
-`anchor xy tracking`
+### 7. Action Cost：从最小动作改为 Clean-Bounded 修正
 
-`anchor xy velocity`
+旧 action cost 惩罚修正幅度：
 
-`foot phase xy consistency`
+$$
+P_{\mathrm{mag}}
+=
+\sum_i w_i
+\left(
+\frac{\Delta_i}{\Delta_i^{\max}}
+\right)^2.
+$$
 
-`yaw_score:`
+这会压制必要修正，导致 FEMR 输出很小，不适合 demo。
 
-`anchor yaw tracking`
+当前版本默认关闭普通 magnitude cost：
 
-`yaw rate tracking`
+$$
+w_i=0.
+$$
 
-`z_score:`
+新的约束是 Clean-bounded action cost。它不惩罚“修得大”，只惩罚：
 
-`anchor z tracking`
+$$
+\text{超过 Clean 目标}
+\quad\text{和}\quad
+\text{偏离 Clean 方向}.
+$$
 
-`end-effector z consistency`
+因此：
 
-`rp_score:`
+$$
+P_{\mathrm{clean\text{-}bound}}
+=
+P_{\mathrm{side}}
++
+P_{\mathrm{over}}.
+$$
 
-`command anchor roll/pitch 与 robot anchor roll/pitch 的误差`
+这一机制同时解决两个问题：safe 区域不允许乱修，fragile 区域不压制必要修正。
 
-</aside>
+### 8. Under-Repair Penalty：让 Demo 修复更明显
 
-<aside>
-💡
+仅有 restoration reward 时，FEMR 可能只做小幅改善。为了让修复在 demo 中更明显，当前版本加入 under-repair penalty：
 
-**Double-Sigmoid Repairability Window**
+$$
+\rho_{\mathrm{restore}}
+=
+\frac{
+e_{\mathrm{raw}}-e_{\mathrm{fr}}
+}{
+e_{\mathrm{raw}}+\epsilon
+},
+$$
 
-`enter = sigmoid((damage_gap - safe_gap) / temp)`
+$$
+P_{\mathrm{under}}
+=
+\lambda_{\mathrm{under}}
+\mu_{\mathrm{repair}}
+\left[
+\max
+(\rho_{\min}-\rho_{\mathrm{restore}},0)
+\right]^2.
+$$
 
-`exit  = sigmoid((broken_gap - damage_gap) / temp)`
+它只在 repairable 区域要求 FEMR 达到最低恢复比例。
 
-`mu_raw = enter * exit`
+### 9. Harmful Penalty：防止动态上修坏
 
-为了避免两个 sigmoid 相乘后峰值小于 1，代码会用窗口中心处的峰值做归一化：
+虽然主目标是 Clean restoration，但 FEMR 仍然不能输出会破坏 GMT 执行的修正。因此保留 harmful repair penalty：
 
-`mu = clamp(mu_raw / peak, 0, 1)`
+$$
+P_{\mathrm{harm}}
+\propto
+\max(R_{\mathrm{noisy}}-R_{\mathrm{fr}}-\epsilon_{\mathrm{harm}},0).
+$$
 
-直观含义：
+该项通过 action gate 过滤 no-op 噪声。只有 FEMR 确实输出了修正，并且让 executability 变差时，才认为是 harmful repair。
 
-`damage_gap < safe_gap  -> mu ≈ 0`
+### 10. 训练策略：监督学习为主，PPO 作为物理约束微调
 
-`safe_gap < damage_gap < broken_gap -> mu ≈ 1`
+训练分为三阶段：
 
-`damage_gap > broken_gap -> mu ≈ 0`
+1. Supervised warmup：学习 clean anti-perturbation target。
+2. Actor takeover：逐步提高 PPO actor weight。
+3. PPO fine-tuning：在 supervised anchor 下用 intrinsic reward 微调。
 
-因此 `mu` 是唯一的主 reward gate：
+总优化目标为：
 
-`exec_gate = mu`
+$$
+L_{\mathrm{total}}
+=
+w_{\mathrm{ppo}}L_{\mathrm{PPO}}
++
+\lambda_VL_V
+-
+\lambda_HH(\pi_\theta)
++
+\lambda_{\mathrm{sup}}L_{\mathrm{sup,total}}.
+$$
 
-`cost_gate = 1 - mu`
+这里 supervised loss 提供 clean restoration 方向，PPO reward 提供可执行性和物理约束。
 
-</aside>
+### 11. 当前代码中的核心模块
 
-<aside>
-💡
+当前代码实际包含以下机制：
 
-**Harmful Repair Penalty**
+1. FrontRES task-space actor。
+2. rp-only specialist mode。
+3. Clean / Noisy / FEMR / Oracle 分支。
+4. Clean restoration reward。
+5. Clean damage based repairability window。
+6. Oracle-Clean trust gate。
+7. Clean-bounded action cost。
+8. Under-repair penalty。
+9. Harmful repair penalty。
+10. PPO actor sample weighting。
+11. Supervised anchor。
+12. Checkpoint probe。
+13. TensorBoard / console diagnostics。
 
-FrontRES 不能只追求平均 gain，它还必须避免“修正后比不修更差”。
+这些机制共同服务于一个目标：
 
-`repair_gain = R_frontres - R_perturbed`
+$$
+\boxed{
+\text{learn to restore corrupted references toward Clean while remaining executable by GMT.}
+}
+$$
+
+## 预期修改后的公式与流程
+
+### 1. 三分支 Rollout
+
+对同一段 motion，构造三条主分支：
+
+$$
+\tau^{\mathrm{clean}}
+=
+\mathrm{GMT}(x^{\mathrm{clean}}),
+$$
+
+$$
+\tau^{\mathrm{noisy}}
+=
+\mathrm{GMT}(x^{\mathrm{noisy}}),
+$$
+
+$$
+\tau^{\mathrm{fr}}
+=
+\mathrm{GMT}(x^{\mathrm{noisy}}+\Delta_\theta).
+$$
+
+FEMR 输出 task-space residual correction：
+
+$$
+\Delta_\theta
+=
+f_\theta(o).
+$$
+
+当前 task-space action layout 为：
+
+$$
+\Delta_\theta
+=
+[
+\Delta x_\theta,
+\Delta y_\theta,
+\Delta z_\theta,
+\Delta r_\theta,
+\Delta p_\theta,
+\Delta yaw_\theta
+].
+$$
+
+rp-only 分支使用 action mask：
+
+$$
+M_{\mathrm{rp}}
+=
+[0,0,0,1,1,0].
+$$
+
+因此有效修正为：
+
+$$
+\bar{\Delta}_\theta
+=
+M_{\mathrm{rp}}\odot\Delta_\theta.
+$$
+
+### 2. Clean Restoration Target
+
+Clean 是最终目标。Noisy 到 Clean 的真实修复目标为：
+
+$$
+\Delta^\star
+=
+x^{\mathrm{clean}} - x^{\mathrm{noisy}}.
+$$
+
+在 rp-only 分支中：
+
+$$
+\bar{\Delta}^{\star}
+=
+M_{\mathrm{rp}}\odot\Delta^\star.
+$$
+
+FEMR 的核心目标是：
+
+$$
+\bar{\Delta}_\theta
+\approx
+\bar{\Delta}^{\star}.
+$$
+
+### 3. Restoration Reward
+
+rp 误差使用局部旋转切空间计算。
+
+Noisy 到 Clean 的 rp error：
+
+$$
+e_{\mathrm{raw}}^{\mathrm{rp}}
+=
+\left\|
+\log\left(
+(q^{\mathrm{noisy}})^{-1}q^{\mathrm{clean}}
+\right)_{\mathrm{rp}}
+\right\|_2.
+$$
+
+FEMR 修正后到 Clean 的 rp error：
+
+$$
+e_{\mathrm{fr}}^{\mathrm{rp}}
+=
+\left\|
+\log\left(
+(q^{\mathrm{fr}})^{-1}q^{\mathrm{clean}}
+\right)_{\mathrm{rp}}
+\right\|_2.
+$$
+
+rp restoration reward：
+
+$$
+r_{\mathrm{restore}}^{\mathrm{rp}}
+=
+e_{\mathrm{raw}}^{\mathrm{rp}}
+-
+e_{\mathrm{fr}}^{\mathrm{rp}}.
+$$
+
+一般形式为：
+
+$$
+r_{\mathrm{restore}}
+=
+\sum_{k\in\{xy,z,rp,yaw\}}
+w_k
+\left(
+e_{\mathrm{raw}}^k
+-
+e_{\mathrm{fr}}^k
+\right).
+$$
+
+当前 rp-only 配置为：
+
+$$
+w_{\mathrm{rp}}=1,
+\qquad
+w_{xy}=w_z=w_{yaw}=0.
+$$
+
+因此：
+
+$$
+r_{\mathrm{restore}}
+=
+r_{\mathrm{restore}}^{\mathrm{rp}}.
+$$
+
+### 4. Executability Scores
+
+定义执行分数：
+
+$$
+R_{\mathrm{clean}}
+=
+E(\tau^{\mathrm{clean}}),
+$$
+
+$$
+R_{\mathrm{noisy}}
+=
+E(\tau^{\mathrm{noisy}}),
+$$
+
+$$
+R_{\mathrm{fr}}
+=
+E(\tau^{\mathrm{fr}}).
+$$
+
+Oracle 分支为：
+
+$$
+\tau^{\mathrm{oracle}}
+=
+\mathrm{GMT}
+\left(
+x^{\mathrm{noisy}}
++
+\Pi_{\mathcal{A}}(\Delta^\star)
+\right),
+$$
+
+$$
+R_{\mathrm{oracle}}
+=
+E(\tau^{\mathrm{oracle}}).
+$$
+
+\(\Pi_{\mathcal{A}}\) 表示将 Clean 修复目标投影到当前 active action cone。
+
+本版本不再使用：
+
+$$
+R_{\mathrm{oracle}}
+\quad
+\text{as the repair upper bound}.
+$$
+
+Oracle 只用于判断样本可信度。
+
+### 5. Clean Gap 与 Oracle Trust
+
+Clean damage：
+
+$$
+d_{\mathrm{clean}}
+=
+\max(R_{\mathrm{clean}} - R_{\mathrm{noisy}},0).
+$$
+
+FEMR repair gain：
+
+$$
+g_{\mathrm{fr}}
+=
+R_{\mathrm{fr}} - R_{\mathrm{noisy}}.
+$$
+
+Repair ratio：
+
+$$
+\rho_{\mathrm{exec}}
+=
+\frac{
+g_{\mathrm{fr}}
+}{
+\max(d_{\mathrm{clean}}, d_{\min})
+}.
+$$
+
+Oracle-Clean gap：
+
+$$
+g_{\mathrm{oc}}
+=
+\max(R_{\mathrm{clean}} - R_{\mathrm{oracle}},0).
+$$
+
+Oracle trust：
+
+$$
+c_{\mathrm{oracle}}
+=
+\exp
+\left(
+-
+\frac{g_{\mathrm{oc}}}{\tau_{\mathrm{oc}}}
+\right).
+$$
 
 如果：
 
-`repair_gain < 0`
+$$
+g_{\mathrm{oc}} \gg 0,
+$$
 
-说明 FrontRES 输出了 harmful correction。
+说明 oracle 明显低于 Clean。此时 oracle 不能限制 FEMR 的修复目标，只能降低该样本作为 PPO repair 样本的可信度。
 
-当前代码用连续幅度惩罚，而不是用不可导/不稳定的二值 rate：
+### 6. Repairability Window
 
-`raw_harm = relu(-repair_gain - eps_harm)`
+用 clean damage 构造 repairability window：
+
+$$
+\mu_{\mathrm{enter}}
+=
+\sigma
+\left(
+\frac{
+d_{\mathrm{clean}} - d_{\mathrm{safe}}
+}{T}
+\right),
+$$
+
+$$
+\mu_{\mathrm{exit}}
+=
+\sigma
+\left(
+\frac{
+d_{\mathrm{broken}} - d_{\mathrm{clean}}
+}{T}
+\right).
+$$
+
+未归一化窗口：
+
+$$
+\mu_{\mathrm{raw}}
+=
+\mu_{\mathrm{enter}}
+\mu_{\mathrm{exit}}.
+$$
+
+归一化 repair gate：
+
+$$
+\mu_{\mathrm{repair}}
+=
+\mathrm{clip}
+\left(
+\frac{
+\mu_{\mathrm{raw}}
+}{
+\mu_{\mathrm{peak}}
+},
+0,1
+\right).
+$$
+
+Safe gate：
+
+$$
+\mu_{\mathrm{safe}}
+=
+1-\mu_{\mathrm{enter}}.
+$$
+
+Broken gate：
+
+$$
+\mu_{\mathrm{broken}}
+=
+1-\mu_{\mathrm{exit}}.
+$$
+
+### 7. PPO Actor Sample Weight
+
+PPO actor sample weight 为：
+
+$$
+w_{\mathrm{actor}}
+=
+c_{\mathrm{oracle}}\mu_{\mathrm{repair}}
++
+\alpha_{\mathrm{side}}
+\left(
+\mu_{\mathrm{safe}}
++
+\mu_{\mathrm{broken}}
+\right).
+$$
+
+含义是：
+
+$$
+\text{repairable and oracle-trusted samples dominate PPO actor updates}.
+$$
+
+Safe 和 broken 样本只保留小权重，用于防止完全忽略边界行为。
+
+### 8. Clean-Bounded Action Cost
+
+旧 action cost：
+
+$$
+P_{\mathrm{mag}}
+=
+\sum_i
+w_i
+\left(
+\frac{\Delta_{\theta,i}}{\Delta_i^{\max}}
+\right)^2
+$$
+
+会压制必要修正。本版本默认：
+
+$$
+w_i=0.
+$$
+
+新 cost 使用 Clean target。
+
+先归一化有效修正和目标：
+
+$$
+\tilde{\Delta}_\theta
+=
+\frac{\bar{\Delta}_\theta}{\Delta^{\max}},
+\qquad
+\tilde{\Delta}^{\star}
+=
+\frac{\bar{\Delta}^{\star}}{\Delta^{\max}}.
+$$
+
+Clean 方向：
+
+$$
+u
+=
+\frac{
+\tilde{\Delta}^{\star}
+}{
+\|\tilde{\Delta}^{\star}\|_2+\epsilon
+}.
+$$
+
+FEMR 修正沿 Clean 方向的分量：
+
+$$
+\tilde{\Delta}_{\parallel}
+=
+\left(
+\tilde{\Delta}_\theta^\top u
+\right)u.
+$$
+
+FEMR 修正偏离 Clean 方向的分量：
+
+$$
+\tilde{\Delta}_{\perp}
+=
+\tilde{\Delta}_\theta
+-
+\tilde{\Delta}_{\parallel}.
+$$
+
+Side cost：
+
+$$
+P_{\mathrm{side}}
+=
+\lambda_{\mathrm{side}}
+\left\|
+\tilde{\Delta}_{\perp}
+\right\|_2^2.
+$$
+
+Over-correction cost：
+
+$$
+P_{\mathrm{over}}
+=
+\lambda_{\mathrm{over}}
+\left[
+\max
+\left(
+\tilde{\Delta}_\theta^\top u
+-
+\|\tilde{\Delta}^{\star}\|_2
+-
+m_{\mathrm{over}},
+0
+\right)
+\right]^2.
+$$
+
+Clean-bounded action cost：
+
+$$
+P_{\mathrm{clean\text{-}bound}}
+=
+P_{\mathrm{side}}
++
+P_{\mathrm{over}}.
+$$
+
+### 9. Under-Repair Penalty
+
+Restoration ratio：
+
+$$
+\rho_{\mathrm{restore}}
+=
+\frac{
+e_{\mathrm{raw}} - e_{\mathrm{fr}}
+}{
+e_{\mathrm{raw}}+\epsilon
+}.
+$$
+
+Under-repair penalty：
+
+$$
+P_{\mathrm{under}}
+=
+\lambda_{\mathrm{under}}
+\mu_{\mathrm{repair}}
+\left[
+\max
+\left(
+\rho_{\min}
+-
+\rho_{\mathrm{restore}},
+0
+\right)
+\right]^2.
+$$
+
+这个项只在 repairable 区域鼓励 FEMR 修得足够明显。
+
+### 10. Harmful Repair Penalty
+
+Executable gain：
+
+$$
+g_{\mathrm{fr}}
+=
+R_{\mathrm{fr}} - R_{\mathrm{noisy}}.
+$$
+
+Raw harmful magnitude：
+
+$$
+h_{\mathrm{raw}}
+=
+\max(-g_{\mathrm{fr}}-\epsilon_{\mathrm{harm}},0).
+$$
+
+Action activity：
+
+$$
+a
+=
+\frac{
+\|\bar{\Delta}_\theta\|_2^2
+}{
+\|\Delta^{\max}\|_2^2+\epsilon
+}.
+$$
+
+Action-conditioned harm gate：
+
+$$
+w_{\mathrm{harm\text{-}action}}
+=
+\mathrm{clip}
+\left(
+\frac{
+a-a_{\min}
+}{
+a_{\max}-a_{\min}
+},
+0,1
+\right).
+$$
+
+Harm penalty：
+
+$$
+P_{\mathrm{harm}}
+=
+\lambda_{\mathrm{harm}}
+w_{\mathrm{region}}
+w_{\mathrm{harm\text{-}action}}
+h_{\mathrm{raw}}.
+$$
 
 其中：
 
-`eps_harm` 是容忍区，默认 `0.001`，用于忽略 executable score 的微小噪声。
-
-但是，`repair_gain < 0` 本身还不能证明 FrontRES 做了“有害修正”。
-
-如果 FrontRES 几乎 no-op，`R_frontres - R_perturbed` 的轻微负值可能只是分支评估噪声。
-
-因此当前代码额外使用 action-conditioned harm gate：
-
-`action_harm_gate = clamp((action_cost - harm_action_cost_floor) / (harm_action_cost_ref - harm_action_cost_floor), 0, 1)`
-
-`harm = raw_harm * action_harm_gate`
-
-含义：
-
-只有当 FrontRES 真的输出了足够大的修正时，负 gain 才会被当成 harmful repair。
-
-harm 惩罚权重：
-
-`harm_weight = mu + side_harm_weight * (1 - mu)`
-
-含义：
-
-`mu` 区域修坏：强惩罚。
-
-`safe/broken` 区域修坏：也惩罚，但可用 `side_harm_weight` 控制强度。
-
-默认：
-
-`frontres_harm_epsilon = 0.001`
-
-`frontres_harm_penalty_weight = 0.25`
-
-`frontres_side_harm_weight = 0.0`
-
-`frontres_harm_action_cost_floor = 0.001`
-
-`frontres_harm_action_cost_ref = 0.01`
-
-</aside>
-
-<aside>
-💡
-
-**Final Reward**
-
-`r_delta =`
-
-`mu * exec_signal`
-
-`- harm_penalty`
-
-`- (1 - mu) * intervention_cost`
-
-`+ optional geometry/rescue terms`
-
-当前主训练配置中：
-
-`exec_signal = repair_gain`
-
-`harm_penalty = harm_penalty_weight * harm_weight * relu(-repair_gain - eps_harm) * action_harm_gate`
-
-`intervention_cost = normalized weighted action magnitude`
-
-`geometry/rescue terms` 默认关闭，用于保持主信号干净。
-
-注意：
-
-旧公式中的 `fragile_gate`、`bad_repair_gate`、`safe_cost / broken_cost` 已经不是主 reward 机制。
-
-</aside>
-
-<aside>
-💡
-
-**Actor Gate / PPO Sample Weight**
-
-注意：这里的 `actor_gate` 不是 reward gate。
-
-我们取消的是旧的复杂 reward gating：
-
-`safe_gate / damage_gate / broken_gate / fragile_gate / bad_repair_gate`
-
-当前保留的 `actor_gate` 只是 PPO actor loss 的样本权重。
-
-`mu` 控制 reward 中哪些样本提供修复信号。
-
-`actor_gate` 控制 PPO 更新时每个样本对 actor 参数更新的相对贡献。
-
-当前：
-
-`actor_gate = mu + side_actor_weight * (1 - mu)`
-
-默认：
-
-`frontres_side_actor_gate_weight = 0.05`
-
-含义：
-
-`repair` 样本：正常更新 actor。
-
-`safe/broken` 样本：只用很小权重更新 actor，避免无效样本主导 PPO。
-
-PPO actor loss 使用按权重总和归一化：
-
-`surrogate_loss = sum(actor_gate * surrogate_i) / sum(actor_gate)`
-
-因此 `actor_gate` 改变样本相对权重，而不是简单缩小整个 batch 的学习率。
-
-</aside>
-
-<aside>
-💡
-
-**Console Diagnostics**
-
-下面是当前控制台 `FRONTRES` 区域会输出的完整诊断项。
-
-我建议把这些指标分成四类：
-
-`Performance`
-
-运行性能、episode 长度、基线分支和当前扰动强度。它们回答：
-
-`训练跑得是否正常？当前 batch 的环境难度是多少？GMT baseline 是什么水平？`
-
----
-
-`Main Reward`
-
-主 reward 和主行为质量指标。它们回答：
-
-`FrontRES 是否真的把扰动 reference 修得更可执行？是否产生了有害修正？`
-
----
-
-`Detail Reward`
-
-reward 的细分来源。它们回答：
-
-`收益或损失来自 z、xy、roll/pitch、yaw，还是来自 action cost / rescue / geometry 项？`
-
----
-
-`Optimization / Update`
-
-优化与更新诊断项。它们不直接属于 reward，而是描述 PPO / supervised / curriculum / sample weighting 的训练过程。它们回答：
-
-`当前 actor 是怎么被更新的？PPO 和 supervised 是否冲突？哪些样本在主导更新？`
-
-</aside>
-
-<aside>
-💡
-
-**Console Diagnostics: Performance**
-
-`Learning iteration`
-
-当前训练迭代数。
-
-格式：
-
-`current_iteration / max_iterations`
-
-用于确认训练进度以及当前是否处于 warmup、actor takeover 或 PPO fine-tuning 阶段。
-
----
-
-`PHASE`
-
-当前训练阶段。
-
-常见值：
-
-`SUPERVISED WARMUP`
-
-`CRITIC WARMUP`
-
-`ACTOR TAKEOVER`
-
-`PPO + SUPERVISED ANCHOR`
-
-`PPO + WEAK SUPERVISION`
-
-`PPO FINE-TUNING`
-
-括号中的说明会提示当前是否固定 DR、是否冻结 PPO actor、是否正在 ramp PPO actor weight。
-
----
-
-`Computation`
-
-格式：
-
-`steps/s (collection time, learning time)`
-
-含义：
-
-训练吞吐量、采样耗时、学习耗时。主要用于发现仿真或学习是否异常变慢。
-
----
-
-`Mean action noise std`
-
-当前 policy action distribution 的平均噪声标准差。
-
-值越大，探索越强；值越小，动作越确定。
-
----
-
-`Mean episode length`
-
-FrontRES 当前训练分支的平均 episode 长度。
-
-这不是 GMT baseline，而是带 FrontRES 分支的 episode 长度。
-
----
-
-`ep_len_GMT (baseline)`
-
-冻结 GMT baseline 分支的平均 episode 长度。
-
-如果 `Mean episode length` 明显低于 `ep_len_GMT`，说明 FrontRES 可能让执行更差。
-
-如果明显高于 `ep_len_GMT`，说明 FrontRES 可能提高了可执行性。
-
----
-
-`perturb curriculum`
-
-当前扰动课程。
-
-示例：
-
-`single [global_z,local_rp,planar,yaw]`
-
-前半部分是扰动复杂度，后半部分是当前启用的扰动家族。
-
----
-
-`DR scale`
-
-当前扰动强度缩放。
-
-它是判断 batch 难度的关键指标。`broken_frac` 很高时，先看 `DR scale` 是否过大。
-
----
-
-`survival rate`
-
-当前 batch 中 episode 没有提前失败的比例。
-
-越接近 1，说明整体还可执行；明显下降时，可能扰动太强或 FrontRES 输出有害修正。
-
-</aside>
-
-<aside>
-💡
-
-**Console Diagnostics: Main Reward**
-
-`r_delta (FrontRES)`
-
-FrontRES 当前训练分支的平均 episode reward。
-
-这是训练侧最直接的总体 reward 观测，但它包含环境 episode 的整体结果，不如 `gap/gain/fit/harm` 精确。
-
----
-
-`reward_GMT (baseline)`
-
-GMT baseline 的平均 episode reward。
-
-和 `r_delta` 配合看：
-
-`r_delta > reward_GMT`：FrontRES 分支整体更好。
-
-`r_delta < reward_GMT`：FrontRES 分支整体更差。
-
----
-
-`supervised_cos_sim`
-
-FrontRES 输出方向和 supervised anti-perturbation target 的余弦相似度。
-
-它看的是“方向是否像人工标签”，不是“执行后是否真的更好”。
-
----
-
-`|Δpos|`
-
-FrontRES 输出的位置修正平均幅度，单位 `m`。
-
-过大通常意味着修正激进；过小可能说明没有学会有效修复，或当前 batch 大多是 safe。
-
----
-
-`|Δrpy|`
-
-FrontRES 输出的姿态修正平均幅度，单位 `rad`。
-
-用于判断 roll/pitch/yaw 修正是否异常放大。
-
----
-
-`gap/gain/ratio`
-
-对应：
-
-`damage_gap / repair_gain / repair_ratio`
-
-`damage_gap`：扰动造成了多少 executable damage。
-
-`repair_gain`：FrontRES 相对 perturbed baseline 提高了多少 executable score。
-
-`repair_ratio`：`repair_gain / damage_gap` 的归一化诊断值，不再参与 gate。
-
-阅读方式：
-
-`gap > 0 且 gain > 0`：有损伤，FrontRES 正在修。
-
-`gap > 0 但 gain < 0`：有损伤，但 FrontRES 修坏了。
-
-`gap 很小`：样本本来就 safe，不能期待大 gain。
-
----
-
-`signal/w_signal/train_r`
-
-对应：
-
-`exec_signal / weighted_exec_signal / train_reward`
-
-`exec_signal`：未乘窗口权重前的执行收益信号，当前主要等于 `repair_gain`。
-
-`weighted_exec_signal`：乘以 `mu` 后的执行收益信号。
-
-`train_reward`：最终写入 FrontRES 训练的单步 reward，已经包含 harm penalty 和 action cost。
-
----
-
-`fit total/rate/gain`
-
-对应：
-
-`behavior_fit / repair_fit_rate / repair_fit_gain`
-
-`behavior_fit`：总拟合度，衡量当前 batch 中 FrontRES 的实际行为是否符合期望。
-
-公式概念：
-
-`修复收益 - 有害修正 - 窗口外乱动成本`
-
-再除以当前 batch 中可解释的损伤与成本规模。
-
-`repair_fit_rate`：可修窗口内，FrontRES 修掉了多少比例的 executable damage。
-
-这是最像“训练集拟合度 / accuracy”的指标。
-
-`repair_fit_gain`：可修窗口内平均 executable gain。
-
-它不会被 repair 样本比例稀释，比 `weighted_exec_signal` 更适合看修复能力本身。
-
----
-
-`harm rate/mag`
-
-对应：
-
-`harm_rate / harm_mag`
-
-`harm_rate`：可修窗口内，有多少样本被 FrontRES 修坏。
-
-`harm_mag`：可修窗口内，经过 action gate 后的平均有害修正幅度。
-
-理想状态：
-
-`harm_rate` 接近 0，`harm_mag` 接近 0。
-
----
-
-`safe/broken harm`
-
-对应：
-
-`safe_harm_rate / broken_harm_rate`
-
-`safe_harm_rate`：本来几乎没坏的 safe 样本，有多少被 FrontRES 修坏。
-
-`broken_harm_rate`：深度损坏的 broken 样本，有多少被 FrontRES 硬修得更差。
-
-这两个指标用于检查 FrontRES 是否在不该修的区域乱动。
-
----
-
-`safe/broken abstain`
-
-对应：
-
-`safe_abstain_cost / broken_abstain_cost`
-
-衡量 FrontRES 在 safe / broken 样本上是否保持克制。
-
-值越低，说明窗口外越接近 no-op。
-
----
-
-`positive_gain_frac`
-
-`repair_gain > 0` 的样本比例。
-
-它只看正负，不看样本是否处于可修窗口，也不看有害幅度。
-
-现在它是辅助指标，优先级低于 `fit total/rate/gain` 和 `harm rate/mag`。
-
----
-
-`safe/repair/broken frac`
-
-当前 batch 的硬分区比例。
-
-`safe`：损伤太小，不需要明显修复。
-
-`repair`：损伤处于可修窗口，是最重要的学习样本。
-
-`broken`：损伤太深，不应强行修复。
-
-阅读方式：
-
-`repair_frac` 太低：真正可学习样本不足。
-
-`broken_frac` 太高：扰动太难，优先降低 DR 或简化 curriculum。
-
-`safe_frac` 太高：样本太容易，FrontRES 主要学 no-op。
-
-</aside>
-
-<aside>
-💡
-
-**Console Diagnostics: Detail Reward**
-
-`r_z/r_xy/r_rp/r_yaw`
-
-对应四个 active cone 方向的 executable reward 分量：
-
-`r_z`：竖直方向修复质量。
-
-`r_xy`：平面位置修复质量。
-
-`r_rp`：roll / pitch 姿态修复质量。
-
-`r_yaw`：yaw 方向修复质量。
-
-用途：
-
-判断当前 reward 是否和扰动家族、动作空间对齐。
-
----
-
-`repair/geom/rescue/action_cost`
-
-对应：
-
-`r_exec / r_geom / r_rescue / intervention_cost`
-
-`repair`：核心执行修复 reward。
-
-`geom`：几何一致性辅助项。
-
-`rescue`：从坏状态拉回可执行区域的辅助项。
-
-`action_cost`：FrontRES 修正幅度成本。
-
-当前主配置里，`repair` 是主信号，`geom/rescue` 通常是弱项或关闭。
-
----
-
-`exec reward FR/pert`
-
-对应：
-
-`R_frontres / R_perturbed`
-
-`R_frontres`：FrontRES 修正后的 executable score。
-
-`R_perturbed`：不经过 FrontRES 的 perturbed baseline executable score。
-
-它们的差就是：
-
-`repair_gain = R_frontres - R_perturbed`
-
----
-
-`exec planar/vertical/task`
-
-执行性 reward 的三类聚合：
-
-`planar`：平面运动可执行性。
-
-`vertical`：高度、接触、roll/pitch 相关可执行性。
-
-`task`：弱任务一致性项，用于避免 trivial no-motion。
-
-用途：
-
-判断 reward 改善来自真正的运动可执行性，还是来自任务项偏置。
-
----
-
-`exec/cost gate`
-
-对应：
-
-`exec_gate / cost_gate`
-
-当前基本等于：
-
-`exec_gate = mu`
-
-`cost_gate = 1 - mu`
-
-它是调试项，用于确认 reward window 是否按预期工作。
-
-</aside>
-
-<aside>
-💡
-
-**Console Diagnostics: Optimization / Update**
-
-这些指标不是 reward 项，建议统一叫：
-
-`Optimization / Update Diagnostics`
-
-中文可以叫：
-
-`优化与更新诊断项`
-
-它们描述的是“训练如何更新参数”，而不是“当前样本得到多少 reward”。
-
----
-
-`mu (reward window)`
-
-对应：
-
-`window_mu`
-
-`mu`：平均 repairability window 权重，也是主 reward window。
-
----
-
-`actor sample weight`
-
-对应：
-
-`actor_gate`
-
-`actor_gate`：PPO actor loss 的样本权重，不是 reward gate。
-
-当前：
-
-`actor_gate = mu + side_actor_weight * (1 - mu)`
-
-PPO actor loss 使用权重总和归一化：
-
-`surrogate_loss = sum(actor_gate * surrogate_i) / sum(actor_gate)`
-
-因此它改变样本相对贡献，不是简单缩小整个 batch 的步长。
-
----
-
-`grad cos PPO/Sup`
-
-对应：
-
-`grad_cos_ppo_supervised`
-
-括号中的：
-
-`norm ratio`
-
-对应：
-
-`grad_norm_ratio_ppo_to_supervised`
-
-含义：
-
-PPO actor 梯度和 supervised 梯度的方向关系。
-
-`grad cos > 0`：两者大致同向。
-
-`grad cos < 0`：两者冲突。
-
-`norm ratio` 很大：PPO 梯度幅度远大于 supervised，可能冲掉 warmup 学到的修正方向。
-
----
-
-`r_delta EMA`
-
-`r_delta` 的指数滑动平均。
-
-比单个 iteration 的 `r_delta` 更平滑，用于观察整体趋势。
-
----
-
-`λ_supervised`
-
-supervised loss 的当前权重。
-
-越大，actor 越受 supervised anti-perturbation target 约束。
-
-越小，actor 越主要由 PPO reward 驱动。
-
----
-
-`PPO actor weight`
-
-PPO actor surrogate loss 的当前权重。
-
-在 actor takeover 阶段会逐渐 ramp up。
-
-如果该值升得太快，而 `norm ratio` 又很大，容易出现 PPO 把 supervised 方向冲掉的问题。
-
-</aside>
-
-<aside>
-💡
-
-**Console Diagnostics: Compact Cheat Sheet**
-
-这一节是快速查阅版，只保留“控制台行名 -> 含义 -> 理想阅读方式”。
-
----
-
-## Performance
-
-`Learning iteration`
-
-训练进度：`当前迭代 / 总迭代`。
-
----
-
-`PHASE`
-
-当前训练阶段。重点看是否处于 `SUPERVISED WARMUP`、`CRITIC WARMUP`、`ACTOR TAKEOVER` 或 PPO fine-tuning。
-
----
-
-`Computation`
-
-仿真和学习速度。异常变慢时先查环境、采样或 learner。
-
----
-
-`Mean action noise std`
-
-policy 探索强度。太大可能动作抖，太小可能探索不足。
-
----
-
-`Mean episode length`
-
-FrontRES 分支平均 episode 长度。
-
----
-
-`ep_len_GMT (baseline)`
-
-GMT baseline 平均 episode 长度。和 `Mean episode length` 对比判断 FrontRES 是否让执行更稳定。
-
----
-
-`reward_GMT (baseline)`
-
-GMT baseline 平均环境 reward。和 `r_delta (FrontRES)` 对比判断 FrontRES 是否带来整体收益。
-
----
-
-`perturb curriculum`
-
-当前扰动复杂度和扰动家族。用于判断训练信号是否和 active action cone 对齐。
-
----
-
-`DR scale`
-
-当前扰动强度。`broken_frac` 高时优先检查它是否过大。
-
----
-
-`survival rate`
-
-存活率。下降说明扰动、修正或训练更新可能正在破坏可执行性。
-
----
-
-## Main Reward
-
-`r_delta (FrontRES)`
-
-FrontRES 分支平均 episode reward。总体结果指标，但不够细。
-
----
-
-`supervised_cos_sim`
-
-FrontRES 输出方向和 supervised target 的相似度。看“像不像标签”，不等于“执行是否更好”。
-
----
-
-`|Δpos|`
-
-位置修正幅度。过大说明修正激进，过小可能没有有效修复。
-
----
-
-`|Δrpy|`
-
-姿态修正幅度。用于观察 roll / pitch / yaw 输出是否异常。
-
----
-
-`gap/gain/ratio`
-
-`damage_gap / repair_gain / repair_ratio`。
-
-核心判断：
-
-`gap > 0, gain > 0`：FrontRES 正在修。
-
-`gap > 0, gain < 0`：FrontRES 修坏了。
-
----
-
-`signal/w_signal/train_r`
-
-`exec_signal / weighted_exec_signal / train_reward`。
-
-看 reward 从原始执行收益到窗口加权，再到最终训练 reward 的变化。
-
----
-
-`fit total/rate/gain`
-
-`behavior_fit / repair_fit_rate / repair_fit_gain`。
-
-最重要的拟合度指标：
-
-`behavior_fit` 看总体行为是否正确。
-
-`repair_fit_rate` 看可修窗口内修掉了多少 damage。
-
-`repair_fit_gain` 看可修窗口内平均 gain。
-
----
-
-`harm rate/mag`
-
-可修窗口内的有害修正比例和有害幅度。越低越好。
-
----
-
-`safe/broken harm`
-
-safe / broken 区域的有害修正比例。用于发现不该动时乱动、坏样本上硬修。
-
-注意：
-
-当前它只统计 action-conditioned harm。
-
-如果 `safe/broken abstain` 很低，那么 no-op 附近的 score 噪声不会再被算成 harmful repair。
-
----
-
-`safe/broken abstain`
-
-safe / broken 区域的动作成本。越低越说明窗口外接近 no-op。
-
----
-
-`positive_gain_frac`
-
-`repair_gain > 0` 的比例。辅助指标，不如 `fit` 和 `harm` 可靠。
-
----
-
-`safe/repair/broken frac`
-
-batch 难度分布。
-
-`repair_frac` 太低：有效学习样本不足。
-
-`broken_frac` 太高：扰动太难。
-
-`safe_frac` 太高：样本太容易。
-
----
-
-## Detail Reward
-
-`r_z/r_xy/r_rp/r_yaw`
-
-四个方向的 executable reward 分量。用于定位哪个修正方向出了问题。
-
----
-
-`repair/geom/rescue/action_cost`
-
-核心修复收益、几何辅助、救援辅助、动作成本。
-
-主配置优先看 `repair` 和 `action_cost`。
-
----
-
-`exec reward FR/pert`
-
-`R_frontres / R_perturbed`。
-
-两者差值就是 `repair_gain`。
-
----
-
-`exec planar/vertical/task`
-
-平面、竖直/接触、任务一致性三类 executable score。
-
-用于判断 reward 是否被某一类项主导。
-
----
-
-`exec/cost gate`
-
-`exec_gate / cost_gate`，当前基本是 `mu / (1 - mu)`。
-
-这是调试窗口权重用的指标。
-
----
-
-## Optimization / Update
-
-`mu (reward window)`
-
-`mu` 是 reward window。
-
----
-
-`actor sample weight`
-
-`actor_gate` 是 PPO actor loss 的样本更新权重，不是 reward gate。
-
----
-
-`actor/exec/cost`
-
-`actor_gate / exec_gate / cost_gate`。
-
-这是紧凑调试行，用于同时查看 PPO 样本权重、执行 reward 窗口、动作成本窗口。
-
----
-
-`grad cos PPO/Sup`
-
-PPO 梯度和 supervised 梯度的方向相似度。
-
-括号里的 `norm ratio` 表示 PPO 梯度幅度相对 supervised 的倍数。
-
-`cos < 0` 或 `norm ratio` 极大时，PPO 可能冲掉 supervised 方向。
-
----
-
-`r_delta EMA`
-
-`r_delta` 的滑动平均。比单次 iteration 更适合看趋势。
-
----
-
-`λ_supervised`
-
-supervised loss 权重。越大，越约束 FrontRES 保持 supervised 修正方向。
-
----
-
-`PPO actor weight`
-
-PPO actor loss 权重。actor takeover 阶段会 ramp up。
-
-如果它升太快，同时 `norm ratio` 很大，训练容易不稳。
-
-</aside>
-
-<aside>
-💡
-
-**Console Diagnostics: Reading Priority**
-
-如果只想快速判断训练状态，优先看：
-
-`gap/gain/ratio`
-
-`fit total/rate/gain`
-
-`harm rate/mag`
-
-`safe/repair/broken frac`
-
-`mu (reward window)`
-
-`actor sample weight`
-
-`grad cos PPO/Sup`
-
-`reward_GMT` vs `r_delta`
-
-如果要定位 reward 为什么异常，再看：
-
-`r_z/r_xy/r_rp/r_yaw`
-
-`repair/geom/rescue/action_cost`
-
-`exec planar/vertical/task`
-
-`exec reward FR/pert`
-
-如果要定位训练是否被 PPO 冲坏，再看：
-
-`λ_supervised`
-
-`PPO actor weight`
-
-`grad cos PPO/Sup`
-
-`norm ratio`
-
-</aside>
-
-<aside>
-💡
-
-**哪些指标保留，哪些可以降级**
-
-## 必须保留
-
-`fit total/rate/gain`
-
-`harm rate/mag`
-
-`safe/broken harm`
-
-`safe/broken abstain`
-
-`gap/gain/ratio`
-
-`safe/repair/broken frac`
-
-`mu (reward window)`
-
-`actor sample weight`
-
-`grad cos PPO/Sup`
-
-`supervised_cos_sim`
-
-`|Δpos| / |Δrpy|`
-
-## 调试期保留，稳定后可删除
-
-`exec/cost gate`
-
-因为它们现在基本等于 `mu / (1 - mu)`。
-
-`signal/w_signal/train_r`
-
-它能看 reward 组成，但不如 `fit total/rate/gain` 适合评估拟合度。
-
-`positive_gain_frac`
-
-它只看正负比例，不看窗口权重，也不看有害幅度。现在可由 `harm_rate` 和 `repair_fit_rate` 部分替代。
-
-## 不再使用
-
-`safe_gate`
-
-`fragile_gate`
-
-`damage_gate`
-
-`broken_gate`
-
-`bad_repair_gate`
-
-`safe_cost / fragile_cost / broken_cost`
-
-这些属于旧 gating 设计，不应再用来解释当前训练日志。
-
-</aside>
-
-
-<aside>
-💡
-
-**Final Loss**
-
-`loss =`
-
-`ppo_actor_weight * surrogate_loss`
-
-`+ value_loss_coef * value_loss`
-
-`+ entropy_coef * entropy` 
-
-`+ lambda_supervised * supervised_loss`
-
-</aside>
+$$
+w_{\mathrm{region}}
+=
+\mu_{\mathrm{repair}}
++
+\beta_{\mathrm{broken}}\mu_{\mathrm{broken}}
++
+\beta_{\mathrm{safe}}\mu_{\mathrm{safe}}.
+$$
+
+### 11. Progress Scaling
+
+Reward progress：
+
+$$
+p_{\mathrm{DR}}
+=
+\mathrm{clip}
+\left(
+\frac{
+\mathrm{DR\ scale}
+}{
+\mathrm{DR}_{\mathrm{ref}}
+},
+0,1
+\right),
+$$
+
+$$
+p_{\mathrm{actor}}
+=
+\mathrm{clip}
+\left(
+\mathrm{PPO\ actor\ weight},
+0,1
+\right),
+$$
+
+$$
+p
+=
+p_{\mathrm{DR}}p_{\mathrm{actor}}.
+$$
+
+Constraint progress：
+
+$$
+p_c
+=
+p^{\gamma}.
+$$
+
+### 12. Final Intrinsic Reward
+
+完整形式：
+
+$$
+r_\Delta
+=
+p
+\left(
+w_{\mathrm{restore}}r_{\mathrm{restore}}
++
+w_{\mathrm{exec}}r_{\mathrm{exec}}
++
+w_{\mathrm{rescue}}r_{\mathrm{rescue}}
+\right)
+-
+p_c
+\left(
+P_{\mathrm{harm}}
++
+P_{\mathrm{clean\text{-}bound}}
++
+P_{\mathrm{under}}
++
+P_{\mathrm{mag}}
+\right).
+$$
+
+当前 rp-only demo-oriented 配置近似为：
+
+$$
+w_{\mathrm{restore}}=1,
+\qquad
+w_{\mathrm{exec}}=0,
+\qquad
+w_{\mathrm{rescue}}=0,
+\qquad
+P_{\mathrm{mag}}=0.
+$$
+
+因此：
+
+$$
+r_\Delta^{\mathrm{rp}}
+=
+p
+\left(
+e_{\mathrm{raw}}^{\mathrm{rp}}
+-
+e_{\mathrm{fr}}^{\mathrm{rp}}
+\right)
+-
+p_c
+\left(
+P_{\mathrm{harm}}
++
+P_{\mathrm{side}}
++
+P_{\mathrm{over}}
++
+P_{\mathrm{under}}
+\right).
+$$
+
+### 13. PPO Loss
+
+PPO ratio：
+
+$$
+r_t(\theta)
+=
+\frac{
+\pi_\theta(a_t|s_t)
+}{
+\pi_{\theta_{\mathrm{old}}}(a_t|s_t)
+}.
+$$
+
+Clipped PPO actor loss：
+
+$$
+L_{\mathrm{PPO}}
+=
+\mathbb{E}
+\left[
+w_{\mathrm{actor}}
+\max
+\left(
+-r_t(\theta)A_t,
+-
+\mathrm{clip}
+\left(
+r_t(\theta),
+1-\epsilon,
+1+\epsilon
+\right)A_t
+\right)
+\right].
+$$
+
+Value loss：
+
+$$
+L_V
+=
+\mathbb{E}
+\left[
+\left(
+V_\theta(s_t)-\hat{R}_t
+\right)^2
+\right].
+$$
+
+### 14. Supervised Anchor
+
+Supervised target：
+
+$$
+\bar{\Delta}^{\star}
+=
+M\odot\Delta^\star.
+$$
+
+Supervised regression loss：
+
+$$
+L_{\mathrm{sup}}
+=
+\mathrm{Huber}
+\left(
+\bar{\Delta}_\theta,
+\bar{\Delta}^{\star}
+\right).
+$$
+
+Direction loss：
+
+$$
+L_{\mathrm{dir}}
+=
+1
+-
+\cos
+\left(
+\bar{\Delta}_\theta,
+\bar{\Delta}^{\star}
+\right).
+$$
+
+Total supervised loss：
+
+$$
+L_{\mathrm{sup,total}}
+=
+L_{\mathrm{sup}}
++
+\lambda_{\mathrm{dir}}L_{\mathrm{dir}}.
+$$
+
+### 15. Total Optimization Objective
+
+总 loss：
+
+$$
+L_{\mathrm{total}}
+=
+w_{\mathrm{ppo}}L_{\mathrm{PPO}}
++
+\lambda_VL_V
+-
+\lambda_HH(\pi_\theta)
++
+\lambda_{\mathrm{sup}}L_{\mathrm{sup,total}}.
+$$
+
+其中：
+
+$$
+w_{\mathrm{ppo}}
+=
+\mathrm{PPO\ actor\ weight}.
+$$
+
+### 16. Training Flow
+
+监督 warmup：
+
+$$
+\theta
+\leftarrow
+\arg\min_\theta
+L_{\mathrm{sup,total}}.
+$$
+
+Actor takeover：
+
+$$
+w_{\mathrm{ppo}}:0\rightarrow1,
+$$
+
+$$
+p_{\mathrm{actor}}:0\rightarrow1.
+$$
+
+PPO fine-tuning：
+
+$$
+\theta
+\leftarrow
+\arg\min_\theta
+L_{\mathrm{total}}.
+$$
+
+最终约束为：
+
+$$
+\boxed{
+\text{Clean is the target; oracle is trust; action cost is Clean-bounded.}
+}
+$$

@@ -278,6 +278,8 @@ class RslRlFrontRESUnifiedAlgorithmCfg(RslRlPpoAlgorithmCfg):
     """Number of PPO iterations used to linearly ramp actor surrogate from 0 to 1."""
     ppo_advantage_focal_power: float = 0.0
     """Optional |advantage| focal exponent for actor surrogate. 0.0 gives standard PPO."""
+    frontres_training_objective: str = "ppo_hrl"
+    """FrontRES update objective: 'ppo_hrl' keeps PPO+supervised, 'supervised_restore' uses only supervised restoration."""
     frontres_exec_reward_signal: str = "gain"
     """Executable reward signal: gain, ratio, or family_preference."""
     frontres_selective_reward_enabled: bool = True

@@ -58,6 +58,7 @@ class FrontRESUnified:
         ppo_actor_ramp_iterations: int = 0,
         ppo_advantage_focal_power: float = 0.0,
         frontres_active_task_dims: list[int] | None = None,
+        frontres_training_objective: str = "ppo_hrl",
         diagnose_gradient_conflict: bool = True,
         hybrid: bool = True,
         use_ppo: bool = True,
@@ -136,6 +137,7 @@ class FrontRESUnified:
         self.ppo_actor_ramp_iterations = int(ppo_actor_ramp_iterations)
         self.ppo_advantage_focal_power = float(ppo_advantage_focal_power)
         self.frontres_active_task_dims = frontres_active_task_dims
+        self.frontres_training_objective = str(frontres_training_objective).lower()
         self.diagnose_gradient_conflict = bool(diagnose_gradient_conflict)
         self.ppo_actor_weight = 1.0
         self._supervised_decay_triggered = False
@@ -211,7 +213,11 @@ class FrontRESUnified:
     def _print_init_summary(self):
         print("=" * 80)
         print("  FrontRESUnified ▸ PPO + Supervised ΔSE3")
-        print(f"  L = L_PPO + λ_sup({self.lambda_supervised:.2f})·L_supervised")
+        print(f"  Objective={self.frontres_training_objective}")
+        if self.frontres_training_objective == "supervised_restore":
+            print("  L = L_supervised_restore  (PPO/HRL branch kept but disabled for updates)")
+        else:
+            print(f"  L = L_PPO + λ_sup({self.lambda_supervised:.2f})·L_supervised")
         print("=" * 80)
         print(f"  LR={self.learning_rate}  clip={self.clip_param}  ent_coef={self.entropy_coef}")
         print(f"  epochs={self.num_learning_epochs}  mini_batches={self.num_mini_batches}")
@@ -300,7 +306,10 @@ class FrontRESUnified:
 
     def update(self):
         loss_dict = self._update_ppo_supervised()
-        if not bool(getattr(self, "state_supervised_controller_enabled", False)):
+        if (
+            self.frontres_training_objective != "supervised_restore"
+            and not bool(getattr(self, "state_supervised_controller_enabled", False))
+        ):
             self._step_supervised_lambda(loss_dict.get("supervised_cos_sim", 0.0))
         return loss_dict
 
@@ -330,6 +339,7 @@ class FrontRESUnified:
         mean_entropy = 0.0
         mean_supervised_loss = 0.0
         mean_supervised_cos_sim = 0.0
+        mean_supervised_metrics: dict[str, float] = {}
         grad_conflict_cos = 0.0
         grad_conflict_norm_ratio = 0.0
         grad_conflict_count = 0
@@ -382,37 +392,47 @@ class FrontRESUnified:
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
 
-            if self.desired_kl is not None and self.schedule == "adaptive":
+            if (
+                self.frontres_training_objective != "supervised_restore"
+                and self.desired_kl is not None
+                and self.schedule == "adaptive"
+            ):
                 self._adapt_learning_rate(old_mu_batch, old_sigma_batch, mu_batch, sigma_batch)
 
-            surrogate_loss, value_loss = self._compute_ppo_losses(
-                actions_log_prob_batch,
-                old_actions_log_prob_batch,
-                advantages_batch,
-                target_values_batch,
-                returns_batch,
-                value_batch,
-                frontres_mask_batch,
-                frontres_actor_gate_batch,
-            )
-            supervised_loss, sup_cos_sim = self._compute_supervised_loss(
+            supervised_loss, sup_cos_sim, sup_metrics = self._compute_supervised_loss(
                 mu_batch, supervised_target_batch, original_batch_size)
 
-            oracle_mix = float(getattr(self, "oracle_mix", 0.0))
-            ppo_weight = float(getattr(self, "ppo_actor_weight", 1.0)) * (1.0 - oracle_mix)
-            if self.diagnose_gradient_conflict and ppo_weight > 0.0 and self.lambda_supervised > 0.0:
-                _gc, _ratio = self._compute_actor_grad_conflict(
-                    surrogate_loss, supervised_loss)
-                if _gc is not None:
-                    grad_conflict_cos += _gc
-                    grad_conflict_norm_ratio += _ratio
-                    grad_conflict_count += 1
-            loss = (
-                ppo_weight * surrogate_loss
-                + self.value_loss_coef * value_loss
-                - self.entropy_coef * entropy_batch.mean()
-                + self.lambda_supervised * supervised_loss
-            )
+            if self.frontres_training_objective == "supervised_restore":
+                loss = supervised_loss
+                value_loss = torch.zeros((), device=self.device)
+                surrogate_loss = torch.zeros((), device=self.device)
+            else:
+                surrogate_loss, value_loss = self._compute_ppo_losses(
+                    actions_log_prob_batch,
+                    old_actions_log_prob_batch,
+                    advantages_batch,
+                    target_values_batch,
+                    returns_batch,
+                    value_batch,
+                    frontres_mask_batch,
+                    frontres_actor_gate_batch,
+                )
+
+                oracle_mix = float(getattr(self, "oracle_mix", 0.0))
+                ppo_weight = float(getattr(self, "ppo_actor_weight", 1.0)) * (1.0 - oracle_mix)
+                if self.diagnose_gradient_conflict and ppo_weight > 0.0 and self.lambda_supervised > 0.0:
+                    _gc, _ratio = self._compute_actor_grad_conflict(
+                        surrogate_loss, supervised_loss)
+                    if _gc is not None:
+                        grad_conflict_cos += _gc
+                        grad_conflict_norm_ratio += _ratio
+                        grad_conflict_count += 1
+                loss = (
+                    ppo_weight * surrogate_loss
+                    + self.value_loss_coef * value_loss
+                    - self.entropy_coef * entropy_batch.mean()
+                    + self.lambda_supervised * supervised_loss
+                )
 
             self.optimizer.zero_grad()
             if not torch.isfinite(loss):
@@ -437,6 +457,8 @@ class FrontRESUnified:
             mean_entropy += entropy_batch.mean().item()
             mean_supervised_loss += supervised_loss.item()
             mean_supervised_cos_sim += sup_cos_sim
+            for key, value in sup_metrics.items():
+                mean_supervised_metrics[key] = mean_supervised_metrics.get(key, 0.0) + float(value)
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -444,6 +466,9 @@ class FrontRESUnified:
         mean_entropy /= num_updates
         mean_supervised_loss /= num_updates
         mean_supervised_cos_sim /= num_updates
+        mean_supervised_metrics = {
+            key: value / num_updates for key, value in mean_supervised_metrics.items()
+        }
         if grad_conflict_count > 0:
             grad_conflict_cos /= grad_conflict_count
             grad_conflict_norm_ratio /= grad_conflict_count
@@ -452,7 +477,7 @@ class FrontRESUnified:
             grad_conflict_norm_ratio = 0.0
 
         self.storage.clear()
-        return {
+        loss_dict = {
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
@@ -467,6 +492,10 @@ class FrontRESUnified:
             "grad_cos_ppo_supervised": grad_conflict_cos,
             "grad_norm_ratio_ppo_to_supervised": grad_conflict_norm_ratio,
         }
+        loss_dict.update(mean_supervised_metrics)
+        if self.frontres_training_objective == "supervised_restore":
+            loss_dict["ppo_actor_weight"] = 0.0
+        return loss_dict
 
     def _compute_actor_grad_conflict(self, surrogate_loss, supervised_loss):
         params = [
@@ -584,13 +613,21 @@ class FrontRESUnified:
     def _compute_supervised_loss(self, mu_batch, supervised_target_batch, original_batch_size):
         supervised_loss = torch.tensor(0.0, device=self.device)
         sup_cos_sim = 0.0
+        sup_metrics = {
+            "supervised_mae": 0.0,
+            "supervised_rmse": 0.0,
+            "supervised_rpy_mae": 0.0,
+            "supervised_rpy_rmse": 0.0,
+            "supervised_restore_ratio": 0.0,
+            "supervised_valid_frac": 0.0,
+        }
         if supervised_target_batch is None or self.lambda_supervised <= 0:
-            return supervised_loss, sup_cos_sim
+            return supervised_loss, sup_cos_sim, sup_metrics
 
         mu_dim = mu_batch.shape[-1]
         sup_dim = supervised_target_batch.shape[-1]
         if mu_dim < sup_dim:
-            return supervised_loss, sup_cos_sim
+            return supervised_loss, sup_cos_sim, sup_metrics
 
         raw_pred = mu_batch[:original_batch_size]
         target = supervised_target_batch[:original_batch_size]
@@ -673,10 +710,22 @@ class FrontRESUnified:
             supervised_loss = supervised_loss + self.supervised_conf_loss_weight * conf_sup
 
         with torch.no_grad():
+            err = pred - target_detached
+            sup_metrics["supervised_mae"] = err.abs().mean().item()
+            sup_metrics["supervised_rmse"] = err.square().mean().sqrt().item()
+            if err.shape[-1] >= 6:
+                rpy_err_vec = err[:, 3:6]
+                sup_metrics["supervised_rpy_mae"] = rpy_err_vec.abs().mean().item()
+                sup_metrics["supervised_rpy_rmse"] = rpy_err_vec.square().mean().sqrt().item()
+            sup_metrics["supervised_valid_frac"] = valid.float().mean().item()
             if valid.any():
                 sup_cos_sim = nn.functional.cosine_similarity(
                     pred[valid], target[valid], dim=-1).mean().item()
-        return supervised_loss, sup_cos_sim
+                residual_norm = err[valid].norm(dim=-1)
+                target_norm_valid = target_detached[valid].norm(dim=-1).clamp(min=1e-6)
+                restore_ratio = 1.0 - residual_norm / target_norm_valid
+                sup_metrics["supervised_restore_ratio"] = restore_ratio.mean().item()
+        return supervised_loss, sup_cos_sim, sup_metrics
 
     def _warn_skip(self, reason: str, loss: torch.Tensor | None = None):
         skip_count = getattr(self, "_nan_skip_count", 0) + 1

@@ -1130,6 +1130,12 @@ class OnPolicyRunner:
         print(f"[Runner] Iteration counters ready: start={start_iter}, total={tot_iter}", flush=True)
 
         _is_frontres = isinstance(self.alg.policy, FrontRESActorCritic)
+        _frontres_training_objective = str(getattr(
+            self.alg,
+            "frontres_training_objective",
+            self.cfg.get("frontres_training_objective", "ppo_hrl"),
+        )).lower()
+        _frontres_supervised_restore = _is_frontres and _frontres_training_objective == "supervised_restore"
 
         # Critic warmup: freeze Actor for the first N iterations so the Critic
         # can converge before Actor weights (pretrained from Stage 1) are updated.
@@ -1207,6 +1213,8 @@ class OnPolicyRunner:
             """Linear supervised-to-PPO takeover schedule for the current iteration."""
             if not (_is_frontres and hasattr(self.alg, "ppo_actor_weight")):
                 return 1.0
+            if _frontres_supervised_restore:
+                return 0.0
             _actor_warmup = int(self.alg_cfg.get(
                 "ppo_actor_warmup_iterations",
                 self.cfg.get("ppo_actor_warmup_iterations", 0)))
@@ -3646,11 +3654,12 @@ class OnPolicyRunner:
                 }
 
             if _is_frontres:
-                self._frontres_update_supervised_controller(
-                    loss_dict=loss_dict,
-                    positive_gain_frac=frontres_positive_gain_frac_mean,
-                    harm_rate=frontres_harm_rate_mean,
-                )
+                if not _frontres_supervised_restore:
+                    self._frontres_update_supervised_controller(
+                        loss_dict=loss_dict,
+                        positive_gain_frac=frontres_positive_gain_frac_mean,
+                        harm_rate=frontres_harm_rate_mean,
+                    )
                 if hasattr(self.alg, "lambda_supervised"):
                     loss_dict["lambda_supervised"] = float(self.alg.lambda_supervised)
 
@@ -3759,7 +3768,15 @@ class OnPolicyRunner:
         # Keys suppressed when their controlling lambda is 0 (avoids clutter for unused modes).
         _suppress_if_zero = {"bc_off_policy", "bc_teacher", "lambda_off_policy", "lambda_teacher"}
         # Keys reclassified out of Loss/ for clarity.
-        _to_frontres  = {"supervised_cos_sim"}      # diagnostic, not a loss
+        _to_frontres  = {
+            "supervised_cos_sim",
+            "supervised_mae",
+            "supervised_rmse",
+            "supervised_rpy_mae",
+            "supervised_rpy_rmse",
+            "supervised_restore_ratio",
+            "supervised_valid_frac",
+        }      # diagnostics, not losses
         _to_curriculum = {"lambda_supervised", "ppo_actor_weight"}  # scheduler state, not a loss
         _frontres_diag_keys = {
             "delta_q_norm_mean",
@@ -3907,7 +3924,10 @@ class OnPolicyRunner:
                 _is_critic = locs.get("_critic_warmup_active", False)
                 _is_actor_takeover = locs.get("_actor_takeover_active", False)
                 _lam = getattr(self.alg, 'lambda_supervised', 0.0)
-                if _is_warmup:
+                if str(getattr(self.alg, "frontres_training_objective", "")).lower() == "supervised_restore":
+                    _phase = "SUPERVISED RESTORE"
+                    _notes = "(PPO/HRL update disabled; fitting clean restoration target)"
+                elif _is_warmup:
                     _phase = "SUPERVISED WARMUP"
                     _notes = "(GMT-only, FrontRES corrections disabled)"
                 elif _is_critic:
@@ -3981,6 +4001,14 @@ class OnPolicyRunner:
                 _cs = locs.get("loss_dict", {}).get("supervised_cos_sim", None)
                 if _cs is not None:
                     log_string += f"""{'supervised_cos_sim:':>{pad}} {_cs:.4f}\n"""
+                _sup_restore = locs.get("loss_dict", {}).get("supervised_restore_ratio", None)
+                if _sup_restore is not None:
+                    log_string += f"""{'sup restore/mae/rmse:':>{pad}} """
+                    log_string += (
+                        f"{_sup_restore:+.3f} / "
+                        f"{locs['loss_dict'].get('supervised_rpy_mae', 0.0):.5f} / "
+                        f"{locs['loss_dict'].get('supervised_rpy_rmse', 0.0):.5f}\n"
+                    )
                 if locs.get("frontres_delta_pos_abs_mean") is not None:
                     log_string += f"""{'|Δpos|:':>{pad}} {locs['frontres_delta_pos_abs_mean']:.4f} m\n"""
                 if locs.get("frontres_delta_rpy_abs_mean") is not None:
