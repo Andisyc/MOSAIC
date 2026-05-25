@@ -566,6 +566,9 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_harm_epsilon          = 0.001
     frontres_harm_penalty_weight   = 1.0
     frontres_executable_harm_weight = 1.0
+    frontres_reward_scale_dr_reference = 1.25
+    frontres_reward_progress_min = 0.0
+    frontres_constraint_progress_exponent = 2.0
     frontres_side_harm_weight      = 0.0
     frontres_harm_action_cost_floor = 0.001
     frontres_harm_action_cost_ref   = 0.01
@@ -607,12 +610,17 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_restore_yaw_weight = 0.0
     frontres_geometry_reward_weight = 1.0
     frontres_rescue_reward_weight  = 0.0
-    # Calibration run: make the minimum-intervention prior visible but not
-    # dominant.  Current repair_gain is O(1e-3), so the previous weights
-    # produced O(1e-1) costs and overwhelmed the gain diagnostics.
-    frontres_intervention_cost_weights = [0.0, 0.0, 0.0, 0.001, 0.001, 0.0]
-    frontres_overcorrection_margin = 0.02
+    # Clean-bounded action regularization.  The legacy magnitude cost is kept
+    # off by default because it suppresses necessary repairs.  The active cost
+    # penalizes only corrections past the Clean target or away from its direction.
+    frontres_intervention_cost_weights = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    frontres_overcorrection_margin = 0.10
     frontres_overcorrection_weight = 0.5
+    frontres_clean_bound_side_weight = 0.1
+    frontres_min_restore_ratio = 0.6
+    frontres_under_repair_weight = 0.2
+    frontres_oracle_clean_gap_tau = 0.05
+    frontres_oracle_clean_gap_threshold = 1.0e9
     frontres_restore_eval_min_error = 0.01
 
     # ── Fast debug mode: shortens the feedback loop for reward/DR tuning ─────

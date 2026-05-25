@@ -2396,11 +2396,19 @@ class OnPolicyRunner:
             _frontres_r_exec_sum:         float = 0.0
             _frontres_r_geom_sum:         float = 0.0
             _frontres_intervention_cost_sum: float = 0.0
+            _frontres_clean_bound_cost_sum: float = 0.0
+            _frontres_clean_bound_side_cost_sum: float = 0.0
+            _frontres_over_cost_sum: float = 0.0
+            _frontres_under_repair_cost_sum: float = 0.0
             _frontres_reward_frontres_sum: float = 0.0
+            _frontres_reward_clean_sum:   float = 0.0
+            _frontres_reward_oracle_sum:  float = 0.0
             _frontres_exec_planar_sum:    float = 0.0
             _frontres_exec_vertical_sum:  float = 0.0
             _frontres_exec_task_sum:      float = 0.0
             _frontres_damage_gap_sum:     float = 0.0
+            _frontres_oracle_clean_gap_sum: float = 0.0
+            _frontres_oracle_trust_sum:   float = 0.0
             _frontres_repair_gain_sum:    float = 0.0
             _frontres_positive_gain_frac_sum: float = 0.0
             _frontres_repair_ratio_sum:   float = 0.0
@@ -2447,6 +2455,8 @@ class OnPolicyRunner:
             _frontres_jump_degree_sum:    float = 0.0   # mean jump_degree (gate activation monitor)
             _frontres_shaping_steps:      int   = 0
             _frontres_reward_diag_steps:  int   = 0
+            _frontres_reward_progress_sum: float = 0.0
+            _frontres_constraint_progress_sum: float = 0.0
             # Termination tracking for training envs (used to compute survival_rate this rollout)
             _frontres_term_count: int = 0
             _frontres_step_count: int = 0
@@ -2778,6 +2788,9 @@ class OnPolicyRunner:
                             _exec_perturbed = self._frontres_exec_score_for_modes(
                                 _exec_components, _base_start, _n_exec, _mode_groups
                             )
+                            _exec_clean = self._frontres_exec_score_for_modes(
+                                _exec_components, _clean_start, _n_exec, _mode_groups
+                            )
                             _, _feasible_components = self._frontres_feasible_oracle_exec_score(
                                 _mcmd_rdelta, _base_start, _n_exec, return_components=True
                             )
@@ -2788,8 +2801,18 @@ class OnPolicyRunner:
                             _exec_vertical_log = _exec_components["vertical"][:_n_exec].mean()
                             _exec_task_log = _exec_components["task"][:_n_exec].mean()
 
-                            # ── Minimum-intervention cost ──────────────────────────
+                            # ── Clean-bounded intervention costs ───────────────────
+                            # A plain ||delta|| penalty suppresses necessary repairs.
+                            # The default regularizer is therefore target-relative:
+                            #   - side cost: correction away from the Clean direction;
+                            #   - over cost: correction past the Clean target.
+                            # The legacy magnitude cost remains configurable, but its
+                            # default weights are zero for demo-oriented training.
                             _intervention_cost = torch.zeros(N_train, device=self.device)
+                            _clean_bound_cost = torch.zeros(N_train, device=self.device)
+                            _side_cost = torch.zeros(N_train, device=self.device)
+                            _over_cost = torch.zeros(N_train, device=self.device)
+                            _under_repair_penalty = torch.zeros(N_train, device=self.device)
                             _action_activity = torch.zeros(N_train, device=self.device)
                             if _is_task_space_mode and actions.shape[-1] >= 6:
                                 _delta = actions[:N_train, :6]
@@ -2825,30 +2848,70 @@ class OnPolicyRunner:
                                 if _active_delta_dims:
                                     _active_idx = torch.tensor(_active_delta_dims, device=self.device, dtype=torch.long)
                                     _action_activity = (_delta[:, _active_idx] / _max_delta[_active_idx]).pow(2).mean(dim=-1)
-                            _overcorrection_cost = torch.zeros(N_train, device=self.device)
-                            if _is_task_space_mode:
-                                _over_margin = float(self.cfg.get("frontres_overcorrection_margin", 0.0))
-                                _over_weight = float(self.cfg.get("frontres_overcorrection_weight", 0.0))
-                                if _over_weight > 0.0:
-                                    _rp_target_norm = _rp_raw.norm(dim=-1)
-                                    _rp_corr_norm = _rot_raw_to_fr[:, :2].norm(dim=-1)
-                                    _rp_over = torch.relu(_rp_corr_norm - _rp_target_norm - max(_over_margin, 0.0))
-                                    _overcorrection_cost = _over_weight * _rp_over.pow(2)
+                                    _target_delta = torch.cat(
+                                        [
+                                            (_a_w[:N_train] - _a_raw[:N_train]),
+                                            _rot_raw_to_clean,
+                                        ],
+                                        dim=-1,
+                                    )
+                                    _corr_delta = torch.cat(
+                                        [
+                                            (_a_fr[:N_train] - _a_raw[:N_train]),
+                                            _rot_raw_to_fr,
+                                        ],
+                                        dim=-1,
+                                    )
+                                    _target_active = _target_delta[:, _active_idx] / _max_delta[_active_idx]
+                                    _corr_active = _corr_delta[:, _active_idx] / _max_delta[_active_idx]
+                                    _target_norm = _target_active.norm(dim=-1, keepdim=True)
+                                    _target_dir = _target_active / _target_norm.clamp(min=1e-6)
+                                    _parallel_scalar = (_corr_active * _target_dir).sum(dim=-1, keepdim=True)
+                                    _parallel = _parallel_scalar * _target_dir
+                                    _side = _corr_active - _parallel
+
+                                    _side_weight = float(self.cfg.get("frontres_clean_bound_side_weight", 0.0))
+                                    _side_cost = max(_side_weight, 0.0) * _side.pow(2).sum(dim=-1)
+
+                                    _over_margin = float(self.cfg.get("frontres_overcorrection_margin", 0.0))
+                                    _over_weight = float(self.cfg.get("frontres_overcorrection_weight", 0.0))
+                                    _over = torch.relu(
+                                        _parallel_scalar.squeeze(-1)
+                                        - _target_norm.squeeze(-1)
+                                        - max(_over_margin, 0.0)
+                                    )
+                                    _over_cost = max(_over_weight, 0.0) * _over.pow(2)
+                                    _clean_bound_cost = _side_cost + _over_cost
+                            _overcorrection_cost = _clean_bound_cost
 
                             _w_exec = float(self.cfg.get("frontres_exec_reward_weight", 1.0))
                             _repair_scale = float(self.cfg.get("frontres_repair_reward_scale", 1.0))
                             _w_geom = float(self.cfg.get("frontres_geometry_reward_weight", 0.05))
                             _w_rescue = float(self.cfg.get("frontres_rescue_reward_weight", 1.0))
                             _w_exec_harm = float(self.cfg.get("frontres_executable_harm_weight", 1.0))
-                            # Executable-gap reward:
-                            #   damage_gap  = R_feasible_oracle_exec - R_perturbed_exec
+                            _reward_dr_ref = float(self.cfg.get(
+                                "frontres_reward_scale_dr_reference",
+                                self.cfg.get("supervised_warmup_dr_scale", self.cfg.get("dr_scale_init", 1.0)),
+                            ))
+                            _reward_dr_ref = max(_reward_dr_ref, 1e-6)
+                            _reward_dr_progress = max(0.0, min(1.0, float(_dr_scale) / _reward_dr_ref))
+                            _reward_actor_progress = max(0.0, min(1.0, float(_ppo_actor_weight_current)))
+                            _reward_progress = _reward_dr_progress * _reward_actor_progress
+                            _reward_progress = max(
+                                float(self.cfg.get("frontres_reward_progress_min", 0.0)),
+                                min(1.0, _reward_progress),
+                            )
+                            _constraint_exp = float(self.cfg.get("frontres_constraint_progress_exponent", 2.0))
+                            _constraint_exp = max(1.0, _constraint_exp)
+                            _constraint_progress = _reward_progress ** _constraint_exp
+                            # Executable diagnostics and sample gates:
+                            #   damage_gap  = R_clean_exec - R_perturbed_exec
                             #   repair_gain = R_frontres_exec - R_perturbed_exec
                             #   repair_ratio = repair_gain / damage_gap
                             #
-                            # The feasible oracle is the clean-reference repair
-                            # projected into the active action cone.  This prevents
-                            # root sink artifacts from becoming false "repairable"
-                            # targets when upward Δz is blocked for dynamics safety.
+                            # Clean is the behavior target.  The feasible oracle is
+                            # only a trust diagnostic: if its executable score falls
+                            # below Clean, it must not become a false repair ceiling.
                             #
                             # Safe/no-op and deeply broken samples should not
                             # drive the repair reward.  A double-sigmoid window
@@ -2860,8 +2923,17 @@ class OnPolicyRunner:
                             #   safe:       abstain (action cost)
                             #   repairable: repair decisively (gain + margin bonus)
                             #   broken:     abstain/conservative repair (cost + harm)
-                            _gap_raw = _exec_feasible - _exec_perturbed
+                            _gap_raw = _exec_clean - _exec_perturbed
                             _damage_gap = _gap_raw.clamp(min=0.0)
+                            _oracle_clean_gap = (_exec_clean - _exec_feasible).clamp(min=0.0)
+                            _oracle_trust_tau = float(self.cfg.get("frontres_oracle_clean_gap_tau", 0.0))
+                            if _oracle_trust_tau > 0.0:
+                                _oracle_trust = torch.exp(-_oracle_clean_gap / max(_oracle_trust_tau, 1e-6))
+                            else:
+                                _oracle_trust_threshold = float(
+                                    self.cfg.get("frontres_oracle_clean_gap_threshold", 1e9)
+                                )
+                                _oracle_trust = (_oracle_clean_gap <= _oracle_trust_threshold).to(_damage_gap.dtype)
                             _repair_gain = _exec_frontres - _exec_perturbed
                             _gap_floor = float(self.cfg.get("frontres_gap_floor_per_step", 0.005))
                             _repair_ratio = (_repair_gain / _damage_gap.clamp(min=_gap_floor)).clamp(-1.0, 1.0)
@@ -2903,6 +2975,17 @@ class OnPolicyRunner:
                             _safe_frac = (_damage_gap < _safe_gap).float().mean()
                             _repair_frac = ((_damage_gap >= _safe_gap) & (_damage_gap <= _broken_gap)).float().mean()
                             _broken_frac = (_damage_gap > _broken_gap).float().mean()
+
+                            _restore_min_ratio = float(self.cfg.get("frontres_min_restore_ratio", 0.0))
+                            _restore_under_weight = float(self.cfg.get("frontres_under_repair_weight", 0.0))
+                            if _restore_min_ratio > 0.0 and _restore_under_weight > 0.0:
+                                _restore_ratio = ((_e_raw - _e_fr) / _e_raw.clamp(min=1e-6)).clamp(-1.0, 1.0)
+                                _under = torch.relu(_restore_min_ratio - _restore_ratio)
+                                _under_repair_penalty[:_n_exec] = (
+                                    _restore_under_weight
+                                    * _repair_gate
+                                    * _under[:_n_exec].pow(2)
+                                )
 
                             _selective_reward = bool(self.cfg.get("frontres_selective_reward_enabled", True))
                             if _selective_reward:
@@ -2954,12 +3037,12 @@ class OnPolicyRunner:
                             _side_actor_weight = max(0.0, min(1.0, _side_actor_weight))
                             if _selective_reward:
                                 _actor_gate = (
-                                    _repair_gate
+                                    _oracle_trust * _repair_gate
                                     + _side_actor_weight * (_safe_gate + _broken_gate)
                                 ).clamp(0.0, 1.0)
                             else:
                                 _actor_gate = (
-                                    _window_mu + _side_actor_weight * (1.0 - _window_mu)
+                                    _oracle_trust * _window_mu + _side_actor_weight * (1.0 - _window_mu)
                                 ).clamp(0.0, 1.0)
                             _exec_weight = torch.zeros(N_train, device=self.device)
                             _cost_weight = torch.ones(N_train, device=self.device)
@@ -2981,15 +3064,22 @@ class OnPolicyRunner:
                                 )
                             _effective_gain_bonus = torch.zeros(N_train, device=self.device)
                             _effective_gain_bonus[:_n_exec] = _effective_gain_bonus_exec
-                            r_delta = (
+                            _positive_reward = (
                                 _w_exec * _repair_scale * _exec_weight * _r_exec
                                 + _w_exec * _repair_scale * _effective_gain_bonus
-                                - _w_exec_harm * _harm_penalty
                                 + _w_geom * _r_step
                                 + _w_rescue * _r_rescue
-                                - _cost_weight * (_intervention_cost + _overcorrection_cost)
                             )
+                            _constraint_penalty = (
+                                _w_exec_harm * _harm_penalty
+                                + _cost_weight * _intervention_cost
+                                + _overcorrection_cost
+                                + _under_repair_penalty
+                            )
+                            r_delta = _reward_progress * _positive_reward - _constraint_progress * _constraint_penalty
                             _r_frontres_log = _exec_frontres.mean()
+                            _r_clean_log = _exec_clean.mean()
+                            _r_oracle_log = _exec_feasible.mean()
                             _r_base_log   = _exec_perturbed.mean()
                             _r_rescue_log = _r_rescue.mean()
                         else:
@@ -3005,6 +3095,7 @@ class OnPolicyRunner:
                             _r_z = _r_xy = _r_rp = _r_ya = None
                             _actor_gate = None
                             _exec_planar_log = _exec_vertical_log = _exec_task_log = None
+                            _r_clean_log = _r_oracle_log = None
                             _frontres_actor_gate = torch.zeros(self.env.num_envs, 1, device=self.device)
                             _frontres_actor_gate[:N_train, 0] = 1.0
                             self.alg.transition.frontres_actor_gate = _frontres_actor_gate
@@ -3057,11 +3148,19 @@ class OnPolicyRunner:
                             _frontres_r_exec_sum       += _r_exec.mean().item()
                             _frontres_r_geom_sum       += _r_step.mean().item()
                             _frontres_intervention_cost_sum += _intervention_cost.mean().item()
+                            _frontres_clean_bound_cost_sum += _clean_bound_cost.mean().item()
+                            _frontres_clean_bound_side_cost_sum += _side_cost.mean().item()
+                            _frontres_over_cost_sum += _over_cost.mean().item()
+                            _frontres_under_repair_cost_sum += _under_repair_penalty.mean().item()
                             _frontres_reward_frontres_sum += _r_frontres_log.item()
+                            _frontres_reward_clean_sum += _r_clean_log.item()
+                            _frontres_reward_oracle_sum += _r_oracle_log.item()
                             _frontres_exec_planar_sum += _exec_planar_log.item()
                             _frontres_exec_vertical_sum += _exec_vertical_log.item()
                             _frontres_exec_task_sum += _exec_task_log.item()
                             _frontres_damage_gap_sum   += _damage_gap.mean().item()
+                            _frontres_oracle_clean_gap_sum += _oracle_clean_gap.mean().item()
+                            _frontres_oracle_trust_sum += _oracle_trust.mean().item()
                             _frontres_repair_gain_sum  += _repair_gain.mean().item()
                             _frontres_positive_gain_frac_sum += (_repair_gain > 0.0).float().mean().item()
                             _frontres_repair_ratio_sum += _repair_ratio.mean().item()
@@ -3070,6 +3169,8 @@ class OnPolicyRunner:
                                 _exec_weight[:_n_exec] * _r_exec[:_n_exec]
                             ).mean().item()
                             _frontres_train_reward_sum += r_delta[:_n_exec].mean().item()
+                            _frontres_reward_progress_sum += float(_reward_progress)
+                            _frontres_constraint_progress_sum += float(_constraint_progress)
                             _frontres_effective_gain_bonus_sum += _effective_gain_bonus[:_n_exec].mean().item()
                             _frontres_safe_cost_sum += (
                                 _safe_gate * _cost_exec
@@ -3317,8 +3418,32 @@ class OnPolicyRunner:
                 _frontres_intervention_cost_sum / _frontres_reward_diag_steps
                 if _is_frontres and _frontres_reward_diag_steps > 0 else None
             )
+            frontres_clean_bound_cost_mean = (
+                _frontres_clean_bound_cost_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_clean_bound_side_cost_mean = (
+                _frontres_clean_bound_side_cost_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_over_cost_mean = (
+                _frontres_over_cost_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_under_repair_cost_mean = (
+                _frontres_under_repair_cost_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
             frontres_reward_frontres_mean = (
                 _frontres_reward_frontres_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_reward_clean_mean = (
+                _frontres_reward_clean_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_reward_oracle_mean = (
+                _frontres_reward_oracle_sum / _frontres_reward_diag_steps
                 if _is_frontres and _frontres_reward_diag_steps > 0 else None
             )
             frontres_exec_planar_mean = (
@@ -3335,6 +3460,14 @@ class OnPolicyRunner:
             )
             frontres_damage_gap_mean = (
                 _frontres_damage_gap_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_oracle_clean_gap_mean = (
+                _frontres_oracle_clean_gap_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_oracle_trust_mean = (
+                _frontres_oracle_trust_sum / _frontres_reward_diag_steps
                 if _is_frontres and _frontres_reward_diag_steps > 0 else None
             )
             frontres_repair_gain_mean = (
@@ -3375,6 +3508,14 @@ class OnPolicyRunner:
             )
             frontres_broken_cost_mean = (
                 _frontres_broken_cost_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_reward_progress_mean = (
+                _frontres_reward_progress_sum / _frontres_reward_diag_steps
+                if _is_frontres and _frontres_reward_diag_steps > 0 else None
+            )
+            frontres_constraint_progress_mean = (
+                _frontres_constraint_progress_sum / _frontres_reward_diag_steps
                 if _is_frontres and _frontres_reward_diag_steps > 0 else None
             )
             frontres_behavior_fit_mean = (
@@ -3661,10 +3802,14 @@ class OnPolicyRunner:
                                        locs["frontres_baseline_mean"], locs["it"])
             for _name in (
                 "r_exec", "r_geom", "r_rescue", "intervention_cost",
-                "reward_frontres", "exec_planar", "exec_vertical", "exec_task",
-                "damage_gap", "repair_gain", "positive_gain_frac", "repair_ratio",
+                "clean_bound_cost", "clean_bound_side_cost", "over_cost", "under_repair_cost",
+                "reward_frontres", "reward_clean", "reward_oracle",
+                "exec_planar", "exec_vertical", "exec_task",
+                "damage_gap", "oracle_clean_gap", "oracle_trust",
+                "repair_gain", "positive_gain_frac", "repair_ratio",
                 "exec_signal", "weighted_exec_signal", "train_reward",
                 "effective_gain_bonus", "safe_cost", "repair_cost", "broken_cost",
+                "reward_progress", "constraint_progress",
                 "behavior_fit", "repair_fit_rate", "repair_fit_gain",
                 "restore_ratio_rp", "residual_rp_abs", "corr_roll_bias", "corr_pitch_bias",
                 "harm_rate", "harm_mag", "safe_harm_rate", "broken_harm_rate",
@@ -3855,15 +4000,37 @@ class OnPolicyRunner:
                                 f"{locs['frontres_weighted_exec_signal_mean']:+.4f} / "
                                 f"{locs['frontres_train_reward_mean']:+.4f}\n"
                             )
-                            log_string += f"""{'bonus/cost S/R/B:':>{pad}} """
+                            log_string += f"""{'Clean/Oracle/Trust:':>{pad}} """
+                            log_string += (
+                                f"{locs['frontres_reward_clean_mean']:+.4f} / "
+                                f"{locs['frontres_reward_oracle_mean']:+.4f} / "
+                                f"{locs['frontres_oracle_trust_mean']:.3f}\n"
+                            )
+                            log_string += f"""{'oracle gap/cost:':>{pad}} """
+                            log_string += (
+                                f"{locs['frontres_oracle_clean_gap_mean']:+.4f} / "
+                                f"{locs['frontres_clean_bound_cost_mean']:.4f}\n"
+                            )
+                            log_string += f"""{'side/over/under:':>{pad}} """
+                            log_string += (
+                                f"{locs['frontres_clean_bound_side_cost_mean']:.4f} / "
+                                f"{locs['frontres_over_cost_mean']:.4f} / "
+                                f"{locs['frontres_under_repair_cost_mean']:.4f}\n"
+                            )
+                            log_string += f"""{'bonus/legacy S/R/B:':>{pad}} """
                             log_string += (
                                 f"{locs['frontres_effective_gain_bonus_mean']:+.4f} / "
                                 f"{locs['frontres_safe_cost_mean']:.4f} / "
                                 f"{locs['frontres_repair_cost_mean']:.4f} / "
                                 f"{locs['frontres_broken_cost_mean']:.4f}\n"
                             )
+                            log_string += f"""{'reward/constraint prog:':>{pad}} """
+                            log_string += (
+                                f"{locs['frontres_reward_progress_mean']:.4f} / "
+                                f"{locs['frontres_constraint_progress_mean']:.4f}\n"
+                            )
                         if locs.get("frontres_behavior_fit_mean") is not None:
-                            log_string += f"""{'fit total/rate/gain:':>{pad}} """
+                            log_string += f"""{'exec legacy fit:':>{pad}} """
                             log_string += (
                                 f"{locs['frontres_behavior_fit_mean']:+.3f} / "
                                 f"{locs['frontres_repair_fit_rate_mean']:+.3f} / "
