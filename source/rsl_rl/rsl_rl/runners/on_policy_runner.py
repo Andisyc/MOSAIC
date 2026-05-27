@@ -4811,6 +4811,9 @@ class OnPolicyRunner:
             rpy_corr = task_corr[:n_train, 3:6].clone()
             c_pos = task_corr[:n_train, 6:7].clone()
             c_rpy = task_corr[:n_train, 7:8].clone()
+            if str(getattr(self.alg, "frontres_training_objective", "")).lower() == "supervised_restore":
+                c_pos = torch.ones_like(c_pos)
+                c_rpy = torch.ones_like(c_rpy)
 
             z_upper = torch.zeros_like(pos_corr[:, 2])
             if hasattr(cmd_term, "jump_degree"):
@@ -4882,8 +4885,12 @@ class OnPolicyRunner:
         written_q = cmd_term._frontres_quat_correction[:n].to(self.device)
         target = supervised_target[:n, 3:6].detach()
         pred = actions[:n, 3:6].detach()
-        conf = actions[:n, 7:8].detach() if actions.shape[-1] >= 8 else torch.ones(n, 1, device=self.device)
-        applied = pred * conf
+        conf_raw = actions[:n, 7:8].detach() if actions.shape[-1] >= 8 else torch.ones(n, 1, device=self.device)
+        if str(getattr(self.alg, "frontres_training_objective", "")).lower() == "supervised_restore":
+            conf_eff = torch.ones_like(conf_raw)
+        else:
+            conf_eff = conf_raw
+        applied = pred * conf_eff
         written = _quat_to_rotvec_wxyz(written_q)[:, :3]
 
         clean_from_raw = _quat_to_rotvec_wxyz(quat_mul(quat_inv(raw_q), clean_q))[:, :3]
@@ -4930,7 +4937,8 @@ class OnPolicyRunner:
             f"n={n} sample={sample_idx} "
             f"cos(pred,target)={float(cos_pred_target):+.4f} "
             f"cos(written,target)={float(cos_written_target):+.4f} "
-            f"sign_xy={float(sign_match):.3f} conf={float(conf.mean()):.3f} "
+            f"sign_xy={float(sign_match):.3f} conf_eff={float(conf_eff.mean()):.3f} "
+            f"conf_raw={float(conf_raw.mean()):.3f} "
             f"sat={float(sat_frac):.3f} jump={float(step_jump):.5f}",
             flush=True,
         )
