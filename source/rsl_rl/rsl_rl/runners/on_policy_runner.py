@@ -78,7 +78,8 @@ class OnPolicyRunner:
             return
         mode = str(self.cfg.get("frontres_specialist_mode", "") or "").lower()
         if mode in ("rp", "local_rp", "rp_only", "strong_rp"):
-            active_dims = [3, 4, 7]  # droll, dpitch, conf_rpy
+            task_conf_dim = int(self.policy_cfg.get("task_conf_dim", 2))
+            active_dims = [3, 4, 9, 10] if task_conf_dim == 6 else [3, 4, 7]
             self.cfg["frontres_specialist_mode"] = "rp"
             self.cfg["frontres_active_task_dims"] = active_dims
             self.cfg["frontres_perturbation_channels"] = "rp"
@@ -87,14 +88,15 @@ class OnPolicyRunner:
             self.alg_cfg["frontres_active_task_dims"] = active_dims
             print(
                 "[Runner] FrontRES specialist mode enabled: rp "
-                "(local_rp only; active dims roll/pitch/conf)",
+                f"(local_rp only; active dims={active_dims})",
                 flush=True,
             )
             return
         if mode not in ("rp_z", "z_rp", "vertical_contact"):
             return
 
-        active_dims = [2, 3, 4, 6, 7]  # dz, droll, dpitch, conf_pos, conf_rpy
+        task_conf_dim = int(self.policy_cfg.get("task_conf_dim", 2))
+        active_dims = [2, 3, 4, 8, 9, 10] if task_conf_dim == 6 else [2, 3, 4, 6, 7]
         self.cfg["frontres_specialist_mode"] = "rp_z"
         self.cfg["frontres_active_task_dims"] = active_dims
         self.cfg["frontres_perturbation_channels"] = "rp_z"
@@ -103,7 +105,7 @@ class OnPolicyRunner:
         self.alg_cfg["frontres_active_task_dims"] = active_dims
         print(
             "[Runner] FrontRES specialist mode enabled: rp_z "
-            "(global_z + local_rp; active dims dz/rp/conf)",
+            f"(global_z + local_rp; active dims={active_dims})",
             flush=True,
         )
 
@@ -1135,7 +1137,10 @@ class OnPolicyRunner:
             "frontres_training_objective",
             self.cfg.get("frontres_training_objective", "ppo_hrl"),
         )).lower()
-        _frontres_supervised_restore = _is_frontres and _frontres_training_objective == "supervised_restore"
+        _frontres_supervised_restore = (
+            _is_frontres
+            and _frontres_training_objective in ("supervised_restore", "basis_restore")
+        )
 
         # Critic warmup: freeze Actor for the first N iterations so the Critic
         # can converge before Actor weights (pretrained from Stage 1) are updated.
@@ -1278,18 +1283,19 @@ class OnPolicyRunner:
         if _is_task_space_mode:
             _active_dims = self.cfg.get("frontres_active_task_dims", None)
             if _active_dims is not None:
-                _frontres_task_action_mask = torch.zeros(8, device=self.device)
+                _task_action_dim = int(getattr(self.alg.policy, "total_output_dim", 8))
+                _frontres_task_action_mask = torch.zeros(_task_action_dim, device=self.device)
                 for _idx in _active_dims:
                     _idx = int(_idx)
-                    if not 0 <= _idx < 8:
+                    if not 0 <= _idx < _task_action_dim:
                         raise ValueError(
-                            "frontres_active_task_dims must contain indices in [0, 7] "
-                            "for [dx,dy,dz,droll,dpitch,dyaw,c_pos,c_rpy]."
+                            "frontres_active_task_dims contains an index outside the "
+                            f"current FrontRES action dim {_task_action_dim}."
                         )
                     _frontres_task_action_mask[_idx] = 1.0
                 print(
                     "[Runner] FrontRES task-space action mask enabled: "
-                    "[dx,dy,dz,droll,dpitch,dyaw,c_pos,c_rpy] mask="
+                    f"dim={_task_action_dim} mask="
                     f"{_frontres_task_action_mask.detach().cpu().tolist()}",
                     flush=True,
                 )
@@ -1939,7 +1945,12 @@ class OnPolicyRunner:
                                 )
                             loss = loss + _warmup_dir_w * direction_loss
                         _conf_w = float(getattr(self.alg, 'supervised_conf_loss_weight', 0.0))
-                        if getattr(self.alg.policy, 'num_task_corrections', 0) > 0 and pred.shape[-1] >= 8 and _conf_w > 0:
+                        if (
+                            getattr(self.alg.policy, 'num_task_corrections', 0) > 0
+                            and pred.shape[-1] >= 8
+                            and _conf_w > 0
+                            and int(getattr(self.alg.policy, "task_conf_dim", 2)) == 2
+                        ):
                             target_conf = valid.view(-1, 1).to(pred.dtype)
                             conf_loss = torch.nn.functional.binary_cross_entropy_with_logits(
                                 pred[:, 6:8], target_conf.expand(-1, 2))
@@ -3804,6 +3815,13 @@ class OnPolicyRunner:
             "supervised_l_mag",
             "supervised_l_over",
             "supervised_l_smooth",
+            "supervised_l_sparse",
+            "supervised_l_miss",
+            "supervised_l_coeff_smooth",
+            "frontres_alpha_mean",
+            "frontres_alpha_active_frac",
+            "frontres_write_ratio",
+            "frontres_axis_leakage",
         }      # diagnostics, not losses
         _to_curriculum = {"lambda_supervised", "ppo_actor_weight"}  # scheduler state, not a loss
         _frontres_diag_keys = {
@@ -3956,6 +3974,9 @@ class OnPolicyRunner:
                 if f"{_objective}".lower() == "supervised_restore":
                     _phase = "SUPERVISED RESTORE"
                     _notes = "(PPO/HRL update disabled; fitting clean restoration target)"
+                elif f"{_objective}".lower() == "basis_restore":
+                    _phase = "BASIS RESTORE"
+                    _notes = "(PPO/HRL update disabled; factorized repair coefficients)"
                 elif _is_warmup:
                     _phase = "SUPERVISED WARMUP"
                     _notes = "(GMT-only, FrontRES corrections disabled)"
@@ -4024,7 +4045,7 @@ class OnPolicyRunner:
 
                 _frontres_supervised_log = (
                     f"{getattr(self.alg, 'frontres_training_objective', '')}".lower()
-                    == "supervised_restore"
+                    in ("supervised_restore", "basis_restore")
                 )
                 _loss_dict = locs.get("loss_dict", {})
 
@@ -4061,6 +4082,23 @@ class OnPolicyRunner:
                             f"{_loss_dict.get('supervised_l_mag', 0.0):.6f} / "
                             f"{_loss_dict.get('supervised_l_over', 0.0):.6f} / "
                             f"{_loss_dict.get('supervised_l_smooth', 0.0):.6f}\n"
+                        )
+                    if f"{getattr(self.alg, 'frontres_training_objective', '')}".lower() == "basis_restore":
+                        log_string += f"""{'alpha mean/active:':>{pad}} """
+                        log_string += (
+                            f"{_loss_dict.get('frontres_alpha_mean', 0.0):.3f} / "
+                            f"{_loss_dict.get('frontres_alpha_active_frac', 0.0):.3f}\n"
+                        )
+                        log_string += f"""{'write ratio/leakage:':>{pad}} """
+                        log_string += (
+                            f"{_loss_dict.get('frontres_write_ratio', 0.0):.3f} / "
+                            f"{_loss_dict.get('frontres_axis_leakage', 0.0):.3f}\n"
+                        )
+                        log_string += f"""{'L_sparse/miss/csmooth:':>{pad}} """
+                        log_string += (
+                            f"{_loss_dict.get('supervised_l_sparse', 0.0):.6f} / "
+                            f"{_loss_dict.get('supervised_l_miss', 0.0):.6f} / "
+                            f"{_loss_dict.get('supervised_l_coeff_smooth', 0.0):.6f}\n"
                         )
 
                     log_string += f"""\n{'-' * 10} Correction Geometry {'-' * 10}\n"""
@@ -4733,7 +4771,7 @@ class OnPolicyRunner:
         return self.obs_normalizer(obs)
 
     def _mask_frontres_task_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        """Apply the configured task-space action cone to [dx,dy,dz,r,p,y,c_pos,c_rpy]."""
+        """Apply the configured task-space action cone to task corrections and coefficients."""
         active_dims = self.cfg.get("frontres_active_task_dims", None)
         if active_dims is None:
             return actions
@@ -4809,9 +4847,14 @@ class OnPolicyRunner:
                 continue
             pos_corr = task_corr[:n_train, :3].clone()
             rpy_corr = task_corr[:n_train, 3:6].clone()
-            c_pos = task_corr[:n_train, 6:7].clone()
-            c_rpy = task_corr[:n_train, 7:8].clone()
-            if str(getattr(self.alg, "frontres_training_objective", "")).lower() == "supervised_restore":
+            objective = str(getattr(self.alg, "frontres_training_objective", "")).lower()
+            if task_corr.shape[-1] >= 12 and int(getattr(policy, "task_conf_dim", 2)) == 6:
+                c_pos = task_corr[:n_train, 6:9].clone()
+                c_rpy = task_corr[:n_train, 9:12].clone()
+            else:
+                c_pos = task_corr[:n_train, 6:7].clone()
+                c_rpy = task_corr[:n_train, 7:8].clone()
+            if objective == "supervised_restore":
                 c_pos = torch.ones_like(c_pos)
                 c_rpy = torch.ones_like(c_rpy)
 
@@ -4851,7 +4894,8 @@ class OnPolicyRunner:
             return
         if rollout_step != 0:
             return
-        if str(getattr(self.alg, "frontres_training_objective", "")).lower() != "supervised_restore":
+        objective = str(getattr(self.alg, "frontres_training_objective", "")).lower()
+        if objective not in ("supervised_restore", "basis_restore"):
             return
         interval = int(getattr(self.alg, "frontres_restore_debug_print_interval", self.cfg.get("frontres_restore_debug_print_interval", 100)))
         if interval <= 0 or int(it) % interval != 0:
@@ -4885,8 +4929,13 @@ class OnPolicyRunner:
         written_q = cmd_term._frontres_quat_correction[:n].to(self.device)
         target = supervised_target[:n, 3:6].detach()
         pred = actions[:n, 3:6].detach()
-        conf_raw = actions[:n, 7:8].detach() if actions.shape[-1] >= 8 else torch.ones(n, 1, device=self.device)
-        if str(getattr(self.alg, "frontres_training_objective", "")).lower() == "supervised_restore":
+        if actions.shape[-1] >= 12 and int(getattr(self.alg.policy, "task_conf_dim", 2)) == 6:
+            conf_raw = actions[:n, 9:12].detach()
+        elif actions.shape[-1] >= 8:
+            conf_raw = actions[:n, 7:8].detach()
+        else:
+            conf_raw = torch.ones(n, 1, device=self.device)
+        if objective == "supervised_restore":
             conf_eff = torch.ones_like(conf_raw)
         else:
             conf_eff = conf_raw

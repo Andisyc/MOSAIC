@@ -51,6 +51,10 @@ def main() -> int:
     parser.add_argument("--num_trials", type=int, default=2)
     parser.add_argument("--epsilon_values", type=float, nargs="+", default=[0.0, 0.02])
     parser.add_argument("--push_velocities", type=float, nargs="+", default=[0.0, 1.0])
+    parser.add_argument("--fixed_push_offset", type=int, default=None,
+                        help="Fixed push step within the observe phase.")
+    parser.add_argument("--push_direction_angle", type=float, default=None,
+                        help="Fixed horizontal push direction in degrees.")
     parser.add_argument("--perturbation_modes", type=str, nargs="+", default=["composite"],
                         choices=["composite", "xy", "yaw", "z", "rp"])
     parser.add_argument("--record_video", action="store_true")
@@ -82,6 +86,8 @@ def main() -> int:
         "n_trials": args.num_trials,
         "epsilon_values": args.epsilon_values,
         "push_velocities": args.push_velocities,
+        "fixed_push_offset": args.fixed_push_offset,
+        "push_direction_angle": args.push_direction_angle,
         "perturbation_modes": args.perturbation_modes,
     }
     (output_dir / "run_meta.json").write_text(json.dumps(run_meta, indent=2))
@@ -122,6 +128,10 @@ def main() -> int:
             "--perturbation_modes", *args.perturbation_modes,
             *passthrough,
         ]
+        if args.fixed_push_offset is not None:
+            cmd += ["--fixed_push_offset", str(args.fixed_push_offset)]
+        if args.push_direction_angle is not None:
+            cmd += ["--push_direction_angle", str(args.push_direction_angle)]
         if args.record_video:
             cmd.append("--record_video")
 

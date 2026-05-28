@@ -278,6 +278,12 @@ class RslRlFrontRESUnifiedAlgorithmCfg(RslRlPpoAlgorithmCfg):
     """Weight for penalizing corrections whose norm exceeds the clean target norm."""
     supervised_smooth_loss_weight: float = 0.0
     """Weight for matching temporal first differences of corrections to the target sequence."""
+    supervised_coeff_sparse_weight: float = 0.0
+    """L1 weight on per-axis repair coefficients in basis_restore."""
+    supervised_coeff_miss_weight: float = 0.0
+    """Penalty for closing coefficients on active target axes in basis_restore."""
+    supervised_coeff_smooth_weight: float = 0.0
+    """Temporal smoothness weight for per-axis repair coefficients in basis_restore."""
     frontres_supervised_lr_schedule: str = "fixed"
     """Supervised-only LR schedule: fixed or cosine_anneal."""
     frontres_supervised_lr_start: float | None = None

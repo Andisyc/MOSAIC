@@ -482,12 +482,12 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     correction_smooth_alpha        = 0.4
 
     # ── FrontRES rp demo specialist ───────────────────────────────────────────
-    # Task-space action layout:
-    #   [dx, dy, dz, droll, dpitch, dyaw, c_pos, c_rpy]
+    # Task-space action layout with task_conf_dim=6:
+    #   [dx, dy, dz, droll, dpitch, dyaw, ax, ay, az, aroll, apitch, ayaw]
     # Isolate roll/pitch first so we can measure GMT's angular robustness limit
     # without coupling the signal to root-z contact discontinuities.
     frontres_specialist_mode       = "rp"
-    frontres_active_task_dims      = [3, 4, 7]
+    frontres_active_task_dims      = [3, 4, 9, 10]
     frontres_perturbation_channels = "rp"
 
     # "More executable" reward:
@@ -780,7 +780,8 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
                                            # Tune range: 0.03-0.08 (effect is narrow).
         noise_std_type         = "scalar",
         # ── Task-space SE(3) correction mode ─────────────────────────────────
-        num_task_corrections   = 6,        # bounded correction head = [Δpos(3), Δrpy(3)]; policy appends c_pos/c_rpy
+        num_task_corrections   = 6,        # bounded correction proposal = [Δpos(3), Δrpy(3)]
+        task_conf_dim          = 6,        # per-axis repair coefficients αx/αy/αz/αr/αp/αyaw
         max_delta_pos          = 0.3,      # tanh clip (metres)
         max_delta_rpy          = 0.4,      # tanh clip (rad); needed to repair RobotBridge rp eps up to 0.35
         # ── GMT (frozen) ─────────────────────────────────────────────────────
@@ -817,9 +818,9 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         max_grad_norm        = 0.5,
 
         # ── Supervised auxiliary loss (λ_sup schedule) ────────────────────────
-        frontres_training_objective  = "supervised_restore",
+        frontres_training_objective  = "basis_restore",
         lambda_supervised             = 1.0,   # initial weight
-        lambda_supervised_min         = 1.0,   # supervised_restore keeps the target as the main objective
+        lambda_supervised_min         = 1.0,   # supervised/basis branches keep the target as the main objective
         lambda_supervised_decay       = 1.0,   # no decay in the supervised branch
         supervised_trigger_cosine_sim = 0.85,  # EMA threshold to start decay
         supervised_rpy_loss_weight    = 1.0,
@@ -829,6 +830,9 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         supervised_magnitude_loss_weight = 0.5,
         supervised_over_loss_weight      = 0.2,
         supervised_smooth_loss_weight    = 0.05,
+        supervised_coeff_sparse_weight   = 0.02,
+        supervised_coeff_miss_weight     = 0.10,
+        supervised_coeff_smooth_weight   = 0.02,
         frontres_supervised_lr_schedule  = "cosine_anneal",
         frontres_supervised_lr_start     = 3.0e-5,
         frontres_supervised_lr_peak      = 1.0e-4,
@@ -843,7 +847,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         ppo_actor_warmup_iterations   = 0,
         ppo_actor_ramp_iterations     = 400,
         ppo_advantage_focal_power     = 0.0,
-        frontres_active_task_dims      = [3, 4, 7],
+        frontres_active_task_dims      = [3, 4, 9, 10],
         diagnose_gradient_conflict    = True,
 
         # ── Misc ─────────────────────────────────────────────────────────────

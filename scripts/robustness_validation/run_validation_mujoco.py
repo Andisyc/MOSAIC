@@ -475,11 +475,17 @@ def run_trial(agent, perturber: ReferenceFramePerturber, push_velocity: float, s
     obs = env.reset()
     env.motion_loader.cur_motion_end = False
     rng = random.Random(seed)
-    angle = rng.uniform(0.0, 2.0 * math.pi)
+    if args.push_direction_angle is None:
+        angle = rng.uniform(0.0, 2.0 * math.pi)
+    else:
+        angle = math.radians(float(args.push_direction_angle))
     push_dir = np.array([math.cos(angle), math.sin(angle), 0.0], dtype=np.float32)
     max_offset_by_window = args.observe_steps - args.recovery_window_steps - args.push_safety_margin_steps
     push_offset_max = min(args.push_offset_max, max(args.push_offset_min, max_offset_by_window))
-    push_offset = rng.randint(args.push_offset_min, push_offset_max)
+    if args.fixed_push_offset is None:
+        push_offset = rng.randint(args.push_offset_min, push_offset_max)
+    else:
+        push_offset = int(np.clip(args.fixed_push_offset, 0, max_offset_by_window))
     push_step_abs = args.settle_steps + push_offset
 
     settle_margins: list[float] = []
@@ -576,6 +582,10 @@ def main() -> int:
     parser.add_argument("--observe_steps", type=int, default=OBSERVE_STEPS)
     parser.add_argument("--push_offset_min", type=int, default=PUSH_OFFSET_MIN)
     parser.add_argument("--push_offset_max", type=int, default=PUSH_OFFSET_MAX)
+    parser.add_argument("--fixed_push_offset", type=int, default=None,
+                        help="Fixed push step within the observe phase. If omitted, timing is randomized.")
+    parser.add_argument("--push_direction_angle", type=float, default=None,
+                        help="Fixed horizontal push direction in degrees. If omitted, direction is randomized per trial.")
     parser.add_argument("--recovery_window_steps", type=int, default=RECOVERY_WINDOW_STEPS,
                         help="Only this many steps after the push contribute to post-push min-margin metrics.")
     parser.add_argument("--push_safety_margin_steps", type=int, default=PUSH_SAFETY_MARGIN_STEPS,
@@ -643,6 +653,8 @@ def main() -> int:
         "frontres_debug_delta": args.frontres_debug_delta,
         "epsilon_values": args.epsilon_values,
         "push_velocities": args.push_velocities,
+        "fixed_push_offset": args.fixed_push_offset,
+        "push_direction_angle": args.push_direction_angle,
         "perturbation_modes": args.perturbation_modes,
         "n_trials": args.num_trials,
         "settle_steps": args.settle_steps,

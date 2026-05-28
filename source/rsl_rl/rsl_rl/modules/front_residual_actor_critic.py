@@ -154,10 +154,11 @@ class FrontRESActorCritic(nn.Module):
         # 0.3 m covers typical float/sink artifacts (AMASS→G1 conversion errors).
         max_delta_z: float = 0.3,
         # Task-space mode: when >0, replaces Δq+Δz with [Δpos(3), Δrpy(3)]
-        # plus two confidence heads. Δq patching is disabled.
+        # plus confidence/repair-coefficient heads. Δq patching is disabled.
         num_task_corrections: int = 0,
         max_delta_pos: float = 0.3,     # tanh clip for position correction (metres)
         max_delta_rpy: float = 0.3,     # tanh clip for orientation correction (radians)
+        task_conf_dim: int = 2,          # 2: legacy c_pos/c_rpy, 6: per-axis repair coefficients
         # FrontRES-specific observation subset: when >0, FrontRES only processes the
         # first num_frontres_obs dims of policy_obs (reference-frame data only).
         # GMT continues to receive the full policy_obs. 0 = legacy (full obs for both).
@@ -179,9 +180,12 @@ class FrontRESActorCritic(nn.Module):
         self.num_actions = num_actions          # = robot joint DOFs = GMT output dim (e.g. 29)
         self.num_z_outputs = num_z_outputs      # extra Δz outputs (0 = legacy)
         self.num_task_corrections = num_task_corrections  # task-space mode dim (0 = disabled)
-        # Task-space mode: output = [Δpos(3), Δrpy(3), c_pos(1), c_rpy(1)]
+        self.task_conf_dim = int(task_conf_dim)
+        if self.num_task_corrections > 0 and self.task_conf_dim not in (2, 6):
+            raise ValueError("task_conf_dim must be 2 (legacy) or 6 (per-axis coefficients).")
+        # Task-space mode: output = [Δpos(3), Δrpy(3), confidence/coefficients].
         if num_task_corrections > 0:
-            self.total_output_dim = num_task_corrections + 2   # +2 for confidences
+            self.total_output_dim = num_task_corrections + self.task_conf_dim
         else:
             self.total_output_dim = num_actions + num_z_outputs  # FrontRES output (e.g. 30)
         # FrontRES observation subset: when >0, residual_actor only sees first N dims
@@ -353,7 +357,7 @@ class FrontRESActorCritic(nn.Module):
         # ========== Build Front-End Residual Network ==========
 
         # Joint-space mode outputs [Δq, Δz]; task-space mode outputs
-        # [Δpos, Δrpy, c_pos, c_rpy].
+        # [Δpos, Δrpy, confidence/repair coefficients].
         _frontres_input_dim = num_frontres_obs if num_frontres_obs > 0 else num_actor_obs
         self.residual_actor = self._build_residual_actor(
             input_dim=_frontres_input_dim,
@@ -362,9 +366,13 @@ class FrontRESActorCritic(nn.Module):
             activation=activation_fn,
             last_layer_gain=residual_last_layer_gain)
         if num_task_corrections > 0:
+            coeff_desc = (
+                "c_pos(1)+c_rpy(1)" if self.task_conf_dim == 2
+                else "alpha_pos(3)+alpha_rpy(3)"
+            )
             print(f"[FrontEndResidualActorCritic] FrontRES output: "
                   f"{self.total_output_dim} task-space dims "
-                  f"[Δpos(3)+Δrpy(3)+c_pos(1)+c_rpy(1)] — no Δq patching")
+                  f"[Δpos(3)+Δrpy(3)+{coeff_desc}] — no Δq patching")
         else:
             print(f"[FrontEndResidualActorCritic] FrontRES output: "
                   f"{num_actions} Δq + {num_z_outputs} Δz = {self.total_output_dim} dims")
@@ -429,9 +437,9 @@ class FrontRESActorCritic(nn.Module):
             _val = init_noise_std * torch.ones(self.total_output_dim)
             if self.num_task_corrections > 0:
                 # FrontRES: per-dimension σ.
-                #   pos/rpy (6 dims):  init_noise_std (0.01) — precision, not exploration
-                #   c_pos/c_rpy (2 dims): 5× larger — PPO needs room to explore gating
-                _val[-2:] = init_noise_std * 5.0
+                #   pos/rpy: precision, not exploration.
+                #   confidence/coefficients: slightly larger so gates can move.
+                _val[-self.task_conf_dim:] = init_noise_std * 5.0
                 self.register_buffer('std', _val)
             else:
                 self.std = nn.Parameter(_val)
@@ -757,9 +765,8 @@ class FrontRESActorCritic(nn.Module):
         if self.num_task_corrections > 0:
             delta_pos = torch.tanh(raw[:, :3]) * self.max_delta_pos
             delta_rpy = torch.tanh(raw[:, 3:6]) * self.max_delta_rpy
-            conf_pos = torch.sigmoid(raw[:, 6:7])
-            conf_rpy = torch.sigmoid(raw[:, 7:8])
-            frontres_out = torch.cat([delta_pos, delta_rpy, conf_pos, conf_rpy], dim=-1)
+            coeff = torch.sigmoid(raw[:, 6:6 + self.task_conf_dim])
+            frontres_out = torch.cat([delta_pos, delta_rpy, coeff], dim=-1)
             self.last_task_correction = frontres_out.detach()
             self.last_delta_z = None
             with torch.no_grad():
@@ -786,8 +793,7 @@ class FrontRESActorCritic(nn.Module):
         correction = torch.cat([
             torch.tanh(raw[:, :3]) * self.max_delta_pos,
             torch.tanh(raw[:, 3:6]) * self.max_delta_rpy,
-            torch.sigmoid(raw[:, 6:7]),
-            torch.sigmoid(raw[:, 7:8]),
+            torch.sigmoid(raw[:, 6:6 + self.task_conf_dim]),
         ], dim=-1)
         self.last_task_correction = correction.detach()
         self.last_delta_z = None
@@ -861,17 +867,15 @@ class FrontRESActorCritic(nn.Module):
         raw = self.residual_actor(policy_obs)
 
         if self.num_task_corrections > 0:
-            # Output: [Δpos_raw(3), Δrpy_raw(3), c_pos_raw(1), c_rpy_raw(1)] = 8 dims
+            # Output: [Δpos_raw(3), Δrpy_raw(3), confidence/coefficient raw dims].
             raw_pos   = raw[:, :3]
             raw_rpy   = raw[:, 3:6]
-            raw_c_pos = raw[:, 6:7]
-            raw_c_rpy = raw[:, 7:8]
-            frontres_mean = torch.cat([raw_pos, raw_rpy, raw_c_pos, raw_c_rpy], dim=-1)
+            raw_coeff = raw[:, 6:6 + self.task_conf_dim]
+            frontres_mean = torch.cat([raw_pos, raw_rpy, raw_coeff], dim=-1)
             self.last_task_correction = torch.cat([
                 torch.tanh(raw_pos)    * self.max_delta_pos,
                 torch.tanh(raw_rpy)    * self.max_delta_rpy,
-                torch.sigmoid(raw_c_pos),
-                torch.sigmoid(raw_c_rpy),
+                torch.sigmoid(raw_coeff),
             ], dim=-1).detach()
             self.last_delta_z          = None
             self.last_residual_actions = self.last_task_correction
@@ -935,13 +939,11 @@ class FrontRESActorCritic(nn.Module):
         self.update_distribution(observations)
         raw_sample = self.distribution.sample()
         if self.num_task_corrections > 0:
-            # Raw → bounded: pos/rpy via tanh, confidences via sigmoid.
-            # Output: [Δpos(3), Δrpy(3), c_pos(1), c_rpy(1)] — 8 dims.
+            # Raw → bounded: pos/rpy via tanh, confidences/coefficients via sigmoid.
             return torch.cat([
                 torch.tanh(raw_sample[:, :3])  * self.max_delta_pos,
                 torch.tanh(raw_sample[:, 3:6]) * self.max_delta_rpy,
-                torch.sigmoid(raw_sample[:, 6:7]),
-                torch.sigmoid(raw_sample[:, 7:8]),
+                torch.sigmoid(raw_sample[:, 6:6 + self.task_conf_dim]),
             ], dim=-1)
         return raw_sample
 
@@ -990,10 +992,9 @@ class FrontRESActorCritic(nn.Module):
         `actions` here are full frontres_output values stored during rollout (NOT robot actions).
         """
         if self.num_task_corrections > 0:
-            # Actions: [Δpos(3), Δrpy(3), c_pos(1), c_rpy(1)] — 8 dims
+            # Actions: [Δpos(3), Δrpy(3), confidence/coefficient dims].
             _pos_rpy = actions[:, :6]
-            _c_pos   = actions[:, 6:7]
-            _c_rpy   = actions[:, 7:8]
+            _coeff   = actions[:, 6:6 + self.task_conf_dim]
             # ── pos/rpy: invert tanh ──────────────────────────────────────
             max_d = torch.cat([
                 torch.full((3,), self.max_delta_pos, device=actions.device),
@@ -1001,18 +1002,15 @@ class FrontRESActorCritic(nn.Module):
             ], dim=-1)
             normalized = (_pos_rpy / max_d).clamp(-1 + 1e-6, 1 - 1e-6)
             raw_pr = torch.atanh(normalized)
-            # ── confidences: invert sigmoid → logit ───────────────────────
-            _c_p_clamped = _c_pos.clamp(1e-6, 1.0 - 1e-6)
-            _c_r_clamped = _c_rpy.clamp(1e-6, 1.0 - 1e-6)
-            raw_c_pos = torch.log(_c_p_clamped / (1.0 - _c_p_clamped))
-            raw_c_rpy = torch.log(_c_r_clamped / (1.0 - _c_r_clamped))
+            # ── confidences/coefficients: invert sigmoid → logit ──────────
+            _coeff_clamped = _coeff.clamp(1e-6, 1.0 - 1e-6)
+            raw_coeff = torch.log(_coeff_clamped / (1.0 - _coeff_clamped))
             # ── raw sample + log_prob ─────────────────────────────────────
-            raw_sample = torch.cat([raw_pr, raw_c_pos, raw_c_rpy], dim=-1)
+            raw_sample = torch.cat([raw_pr, raw_coeff], dim=-1)
             log_prob = self.distribution.log_prob(raw_sample).sum(dim=-1)
             # Jacobian
             log_j   = (torch.log(max_d) + torch.log(1.0 - normalized.pow(2) + 1e-6)).sum(dim=-1)
-            log_j_c = ((torch.log(_c_p_clamped) + torch.log(1.0 - _c_p_clamped))
-                     + (torch.log(_c_r_clamped) + torch.log(1.0 - _c_r_clamped))).sum(dim=-1)
+            log_j_c = (torch.log(_coeff_clamped) + torch.log(1.0 - _coeff_clamped)).sum(dim=-1)
             return log_prob - log_j - log_j_c
         return self.distribution.log_prob(actions).sum(dim=-1)
 

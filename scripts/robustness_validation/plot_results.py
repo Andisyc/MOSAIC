@@ -107,6 +107,23 @@ def load_and_plot_run_root(results_dir: str, output_dir: str | None = None) -> N
     print(f"[plot] Run-root figures saved to {output_dir}")
 
 
+def load_and_plot_grouped_dirs(
+    results_dirs: list[str],
+    output_dir: str | None = None,
+    perturbation_mode: str = "composite",
+) -> None:
+    """Generate paper-style grouped figures from arbitrary per-motion result dirs."""
+    result_dirs = [_validate_results_dir(path) for path in results_dirs]
+    stores = [(Path(d).name, ResultsStore.load(d)) for d in result_dirs]
+    if output_dir is None:
+        output_dir = os.path.join(os.path.dirname(result_dirs[0]), "figures_grouped")
+    os.makedirs(output_dir, exist_ok=True)
+    _write_summary_all_csv(stores, os.path.join(output_dir, "summary_all.csv"))
+    plot_grouped_recovery_curve(stores, output_dir, perturbation_mode=perturbation_mode)
+    plot_grouped_zmp_mechanism(stores, output_dir, perturbation_mode=perturbation_mode)
+    print(f"[plot] Grouped figures saved to {output_dir}")
+
+
 def _validate_results_dir(path: str) -> str:
     """Validate a results directory and return its normalized path."""
 
@@ -214,41 +231,29 @@ def plot_recovery_curve(
                         color=color, linewidth=0.9, linestyle="--",
                         alpha=0.45, label=label)
 
-            # Std band across motions
-            std_rates = np.array([merged[ei][pi]["std_rate"] * 100 for ei in range(n_eps)])
-            ax.fill_between(eps_vals,
-                            mean_rates - std_rates,
-                            mean_rates + std_rates,
-                            color=color, alpha=0.18)
             ax.plot(eps_vals, mean_rates,
                     color=color, linewidth=2.2, linestyle="-",
                     marker="o", markersize=6,
                     label=f"Mean — Δv={pv} m/s")
         else:
-            # Single motion: Bernoulli CI
-            ax.fill_between(eps_vals,
-                            mean_rates - ci_rates,
-                            mean_rates + ci_rates,
-                            color=color, alpha=0.15)
             ax.plot(eps_vals, mean_rates,
                     color=color, linewidth=2, linestyle="-",
                     marker="o", markersize=6,
                     label=f"Δv = {pv} m/s")
 
-    ax.axhline(70.0, color="gray", linestyle="--", linewidth=1.0, label="70% threshold")
-    ax.set_xlabel("Reference frame noise RMS ε (m)")
+    ax.set_xlabel("Reference frame noise ε")
     ax.set_ylabel("End-to-end success rate (%)")
-    title = "Robustness Budget Consumption vs Reference Frame Noise"
+    title = "Push-Recovery Rate"
     if multi_mode:
         n = len(merged[0][0]["motion_names"])
-        title += f"\n(mean ± std over {n} motion sequences)"
+        title += f"\n(mean over {n} motion sequences)"
     ax.set_title(title)
     ax.set_ylim(0, 105)
     ax.set_xlim(left=0)
 
     # Legend: motions in upper part, push velocities in lower part
     handles, labels = ax.get_legend_handles_labels()
-    ax.legend(handles, labels, loc="lower left", fontsize=8, framealpha=0.75,
+    ax.legend(handles, labels, loc="upper right", fontsize=8, framealpha=0.75,
               ncol=2 if multi_mode else 1)
 
     _save(fig, output_dir, "fig1_recovery_curve")
@@ -303,26 +308,17 @@ def plot_zmp_mechanism(
             ax.plot(eps_vals, ind_zmps, color=color, linewidth=0.9,
                     linestyle="--", alpha=0.4, label=mname)
 
-        ax.fill_between(eps_vals,
-                        mean_zmps - std_zmps,
-                        mean_zmps + std_zmps,
-                        color=color, alpha=0.18, label="±1 std (motions)")
         ax.plot(eps_vals, mean_zmps, color=color, linewidth=2.2, linestyle="-",
                 marker="s", markersize=7, label="Min post-push margin")
     else:
-        ax.fill_between(eps_vals,
-                        mean_zmps - std_zmps,
-                        mean_zmps + std_zmps,
-                        color=color, alpha=0.18, label="±1 std (trials)")
         ax.plot(eps_vals, mean_zmps, color=color, linewidth=2, linestyle="-",
                 marker="s", markersize=7, label="Min post-push margin")
 
-    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0,
-               label="Stability boundary")
-    ax.set_xlabel("Reference frame noise RMS ε (m)")
+    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0)
+    ax.set_xlabel("Reference frame noise ε")
     ax.set_ylabel("Minimum post-push margin (m)")
-    ax.set_title("Mechanism: Post-Push Margin vs Reference Frame Noise")
-    ax.legend(fontsize=8)
+    ax.set_title("Stability Margin")
+    ax.legend(fontsize=8, loc="upper right")
     ax.set_xlim(left=0)
 
     _save(fig, output_dir, "fig2_zmp_mechanism")
@@ -524,23 +520,29 @@ def _pooled_rate_by_eps(
     n_eps = len(ref_meta["epsilon_values"])
     n_pvel = len(ref_meta["push_velocities"])
     means, cis, totals = [], [], []
+    real_groups = sorted({store.meta.get("motion_group", "Ungrouped") for _, store in stores})
 
     for ei in range(n_eps):
-        succ = 0.0
+        groups_to_average = real_groups if group == "Overall" else [group]
+        group_rates = []
         total = 0
-        for _, store in stores:
-            if group != "Overall" and store.meta.get("motion_group", "Ungrouped") != group:
-                continue
-            summary = _mode_summary(store, perturbation_mode)
-            for pi in range(n_pvel):
-                cell = summary[ei][pi]
-                n = int(cell["n_total"])
-                rate = cell["end_to_end_success_rate"]
-                if n <= 0 or np.isnan(rate):
+        for group_name in groups_to_average:
+            motion_rates = []
+            for _, store in stores:
+                if store.meta.get("motion_group", "Ungrouped") != group_name:
                     continue
-                succ += float(rate) * n
-                total += n
-        p = succ / total if total > 0 else float("nan")
+                summary = _mode_summary(store, perturbation_mode)
+                for pi in range(n_pvel):
+                    cell = summary[ei][pi]
+                    n = int(cell["n_total"])
+                    rate = cell["end_to_end_success_rate"]
+                    if n <= 0 or np.isnan(rate):
+                        continue
+                    motion_rates.append(float(rate))
+                    total += n
+            if motion_rates:
+                group_rates.append(float(np.mean(motion_rates)))
+        p = float(np.mean(group_rates)) if group_rates else float("nan")
         ci = float(np.sqrt(p * (1.0 - p) / total)) if total > 0 and not np.isnan(p) else 0.0
         means.append(p)
         cis.append(ci)
@@ -557,28 +559,31 @@ def _pooled_zmp_by_eps(
     n_eps = len(ref_meta["epsilon_values"])
     n_pvel = len(ref_meta["push_velocities"])
     means, stds = [], []
+    real_groups = sorted({store.meta.get("motion_group", "Ungrouped") for _, store in stores})
 
     for ei in range(n_eps):
-        vals = []
-        weights = []
-        for _, store in stores:
-            if group != "Overall" and store.meta.get("motion_group", "Ungrouped") != group:
-                continue
-            summary = _mode_summary(store, perturbation_mode)
-            for pi in range(n_pvel):
-                cell = summary[ei][pi]
-                zmp = cell["mean_min_zmp_after_push"]
-                n = int(cell["n_total"])
-                if n <= 0 or np.isnan(zmp):
+        groups_to_average = real_groups if group == "Overall" else [group]
+        group_vals = []
+        for group_name in groups_to_average:
+            vals = []
+            for _, store in stores:
+                if store.meta.get("motion_group", "Ungrouped") != group_name:
                     continue
-                vals.append(float(zmp))
-                weights.append(n)
-        if vals:
-            arr = np.array(vals, dtype=float)
-            w = np.array(weights, dtype=float)
-            mean = float(np.average(arr, weights=w))
+                summary = _mode_summary(store, perturbation_mode)
+                for pi in range(n_pvel):
+                    cell = summary[ei][pi]
+                    zmp = cell["mean_min_zmp_after_push"]
+                    n = int(cell["n_total"])
+                    if n <= 0 or np.isnan(zmp):
+                        continue
+                    vals.append(float(zmp))
+            if vals:
+                group_vals.append(float(np.mean(np.array(vals, dtype=float))))
+        if group_vals:
+            arr = np.array(group_vals, dtype=float)
+            mean = float(np.mean(arr))
             means.append(mean)
-            stds.append(float(np.sqrt(np.average((arr - mean) ** 2, weights=w))))
+            stds.append(float(np.std(arr)) if len(arr) > 1 else 0.0)
         else:
             means.append(float("nan"))
             stds.append(float("nan"))
@@ -597,22 +602,19 @@ def plot_grouped_recovery_curve(
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for gi, group in enumerate(groups):
-        means, cis, totals = _pooled_rate_by_eps(stores, group, perturbation_mode)
+        means, _, _ = _pooled_rate_by_eps(stores, group, perturbation_mode)
         y = np.array(means) * 100.0
-        ci = np.array(cis) * 100.0
         color = colors[gi % len(colors)]
         lw = 2.6 if group == "Overall" else 1.8
         alpha = 1.0 if group == "Overall" else 0.85
-        ax.fill_between(eps_vals, y - ci, y + ci, color=color, alpha=0.12)
         ax.plot(eps_vals, y, marker="o", linewidth=lw, color=color, alpha=alpha, label=group)
 
-    ax.axhline(70.0, color="gray", linestyle="--", linewidth=1.0, label="70% threshold")
-    ax.set_xlabel("Reference frame error amplitude ε")
+    ax.set_xlabel("Reference frame noise ε")
     ax.set_ylabel("End-to-end success rate (%)")
-    ax.set_title("Fig1: Push-Recovery Rate vs Reference-Frame Error")
+    ax.set_title("Push-Recovery Rate")
     ax.set_ylim(0, 105)
     ax.set_xlim(left=0)
-    ax.legend(fontsize=8, framealpha=0.8)
+    ax.legend(fontsize=8, framealpha=0.8, loc="upper right")
     _save(fig, output_dir, "fig1_recovery_rate")
 
 
@@ -628,21 +630,19 @@ def plot_grouped_zmp_mechanism(
 
     fig, ax = plt.subplots(figsize=(7, 4.2))
     for gi, group in enumerate(groups):
-        means, stds = _pooled_zmp_by_eps(stores, group, perturbation_mode)
+        means, _ = _pooled_zmp_by_eps(stores, group, perturbation_mode)
         y = np.array(means)
-        std = np.array(stds)
         color = colors[gi % len(colors)]
         lw = 2.6 if group == "Overall" else 1.8
         alpha = 1.0 if group == "Overall" else 0.85
-        ax.fill_between(eps_vals, y - std, y + std, color=color, alpha=0.10)
         ax.plot(eps_vals, y, marker="s", linewidth=lw, color=color, alpha=alpha, label=group)
 
-    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0, label="Stability boundary")
-    ax.set_xlabel("Reference frame error amplitude ε")
+    ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0)
+    ax.set_xlabel("Reference frame noise ε")
     ax.set_ylabel("Minimum post-push margin (m)")
-    ax.set_title("Fig2: Post-Push Margin vs Reference-Frame Error")
+    ax.set_title("Stability Margin")
     ax.set_xlim(left=0)
-    ax.legend(fontsize=8, framealpha=0.8)
+    ax.legend(fontsize=8, framealpha=0.8, loc="upper right")
     _save(fig, output_dir, "fig2_zmp_margin")
 
 
@@ -718,6 +718,10 @@ if __name__ == "__main__":
                              "(default: directory basenames).")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Where to save figures.")
+    parser.add_argument("--grouped", action="store_true",
+                        help="For --results_dirs, plot paper-style curves grouped by motion_group.")
+    parser.add_argument("--perturbation_mode", type=str, default="composite",
+                        help="Perturbation mode to plot for grouped figures.")
 
     args = parser.parse_args()
 
@@ -730,6 +734,13 @@ if __name__ == "__main__":
         else:
             load_and_plot_run_root(args.results_dir, output_dir=args.output_dir)
     else:
-        load_and_plot_multi(args.results_dirs,
-                            motion_names=args.motion_names,
-                            output_dir=args.output_dir)
+        if args.grouped:
+            load_and_plot_grouped_dirs(
+                args.results_dirs,
+                output_dir=args.output_dir,
+                perturbation_mode=args.perturbation_mode,
+            )
+        else:
+            load_and_plot_multi(args.results_dirs,
+                                motion_names=args.motion_names,
+                                output_dir=args.output_dir)
