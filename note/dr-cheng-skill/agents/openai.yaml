@@ -1,0 +1,7 @@
+interface:
+  display_name: "Dr.Cheng"
+  short_description: "Research-first collaboration contract"
+  brand_color: "#2F6F73"
+  default_prompt: "Use $Dr.Cheng to preserve the research architecture while implementing or explaining this FrontRES/MOSAIC change."
+policy:
+  allow_implicit_invocation: true

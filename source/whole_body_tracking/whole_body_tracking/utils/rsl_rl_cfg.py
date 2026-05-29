@@ -255,6 +255,32 @@ class RslRlFrontRESUnifiedAlgorithmCfg(RslRlPpoAlgorithmCfg):
     """Penalty for closing coefficients on active target axes in basis_restore."""
     supervised_coeff_smooth_weight: float = 0.0
     """Temporal smoothness weight for per-axis repair coefficients in basis_restore."""
+    supervised_harm_loss_weight: float = 1.0
+    """Explicit no-op penalty weight on rollout samples where FEMR is worse than noisy."""
+    frontres_hsl_rollout_label_enabled: bool = False
+    """Use Clean/Noisy/FEMR rollout states to build continuous HSL supervised targets."""
+    frontres_hsl_rollout_eta: float = 1.0
+    """Step size for converting FEMR-vs-clean rollout residual into a correction target."""
+    frontres_hsl_rot_error_scale: float = 0.25
+    """Scale rotation error when computing continuous HSL sample difficulty."""
+    frontres_hsl_safe_threshold: float = 0.03
+    """Samples below this rollout error are treated as mostly safe/no-op."""
+    frontres_hsl_broken_threshold: float = 0.35
+    """Samples above this rollout error are treated as mostly broken/no-op."""
+    frontres_hsl_safe_temperature: float = 0.01
+    """Temperature for the safe side of the double-sigmoid HSL gate."""
+    frontres_hsl_broken_temperature: float = 0.05
+    """Temperature for the broken side of the double-sigmoid HSL gate."""
+    frontres_hsl_harm_temperature: float = 0.02
+    """Temperature for the harmful-repair sigmoid gate."""
+    frontres_hsl_safe_noop_weight: float = 1.0
+    """No-op supervision weight for safe samples."""
+    frontres_hsl_broken_noop_weight: float = 1.0
+    """No-op supervision weight for broken samples."""
+    frontres_hsl_harm_noop_weight: float = 2.0
+    """No-op supervision weight when FEMR rollout is worse than noisy rollout."""
+    frontres_hsl_max_sample_weight: float = 4.0
+    """Upper bound on the combined HSL supervised sample weight."""
     frontres_supervised_lr_schedule: str = "fixed"
     """Supervised-only LR schedule: fixed or cosine_anneal."""
     frontres_supervised_lr_start: float | None = None

@@ -854,6 +854,131 @@ class OnPolicyRunner:
         masked[:n, :6] = masked[:n, :6] * mode_mask
         return masked
 
+    def _maybe_update_frontres_hsl_rollout_target(
+        self,
+        command,
+        actions: torch.Tensor | None,
+        dones: torch.Tensor | None,
+        current_pos_correction: torch.Tensor | None,
+        current_quat_correction: torch.Tensor | None,
+        n_train: int,
+        n_base: int,
+        n_clean: int,
+    ) -> None:
+        """Build HSL supervised labels from Clean/Noisy/FEMR rollout states.
+
+        Geometry gives the initial in-cone correction, but the label here is
+        corrected by the one-step simulation residual between the Clean rollout
+        and the FEMR rollout.  The simulator is still treated as label data:
+        gradients flow through the FEMR prediction loss, not through physics.
+        """
+        if not bool(self.cfg.get("frontres_hsl_rollout_label_enabled", False)):
+            return
+        if (
+            command is None
+            or actions is None
+            or current_pos_correction is None
+            or current_quat_correction is None
+            or n_train <= 0
+            or n_base <= 0
+            or n_clean <= 0
+        ):
+            return
+        if not hasattr(command, "robot") or not hasattr(command.robot, "data"):
+            return
+        data = command.robot.data
+        if not (hasattr(data, "root_pos_w") and hasattr(data, "root_quat_w")):
+            return
+
+        n = min(int(n_train), int(n_base), int(n_clean), actions.shape[0])
+        if n <= 0:
+            return
+
+        base_start = int(n_train)
+        clean_start = int(n_train + n_base)
+        device = self.device
+        dtype = actions.dtype
+        valid_rollout = torch.ones(n, device=device, dtype=dtype)
+        if dones is not None:
+            done_flat = dones.to(device).view(-1)
+            if done_flat.numel() >= clean_start + n:
+                done_any = (
+                    done_flat[:n].bool()
+                    | done_flat[base_start:base_start + n].bool()
+                    | done_flat[clean_start:clean_start + n].bool()
+                )
+                valid_rollout = (~done_any).to(dtype)
+
+        root_pos = data.root_pos_w.to(device=device, dtype=dtype)
+        root_quat = data.root_quat_w.to(device=device, dtype=dtype)
+        env_raw = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        origins = getattr(getattr(env_raw, "scene", None), "env_origins", None)
+        if origins is None:
+            origins = torch.zeros_like(root_pos)
+        else:
+            origins = origins.to(device=device, dtype=dtype)
+
+        fr_pos = root_pos[:n] - origins[:n]
+        noisy_pos = root_pos[base_start:base_start + n] - origins[base_start:base_start + n]
+        clean_pos = root_pos[clean_start:clean_start + n] - origins[clean_start:clean_start + n]
+        fr_quat = root_quat[:n]
+        noisy_quat = root_quat[base_start:base_start + n]
+        clean_quat = root_quat[clean_start:clean_start + n]
+
+        front_to_clean_r = _quat_to_rotvec_wxyz(quat_mul(quat_inv(fr_quat), clean_quat))
+        noisy_to_clean_r = _quat_to_rotvec_wxyz(quat_mul(quat_inv(noisy_quat), clean_quat))
+        sim_residual = torch.cat([clean_pos - fr_pos, front_to_clean_r], dim=-1)
+
+        current = torch.zeros(n, 6, device=device, dtype=dtype)
+        current[:, :3] = current_pos_correction[:n].to(device=device, dtype=dtype)
+        current[:, 3:6] = _quat_to_rotvec_wxyz(
+            current_quat_correction[:n].to(device=device, dtype=dtype)
+        )
+
+        eta = float(self.cfg.get("frontres_hsl_rollout_eta", 1.0))
+        label = current + eta * sim_residual
+        label = self._frontres_project_task_target_to_action_cone(command, label)
+        if bool(self.cfg.get("frontres_per_mode_supervised_mask", True)):
+            mode_groups = list(getattr(
+                self,
+                "_frontres_curriculum_env_mode_groups",
+                [tuple(getattr(self, "_frontres_curriculum_active_modes", ()))] * n,
+            ))[:n]
+            label = self._frontres_apply_per_mode_supervised_mask(label, mode_groups, n)
+
+        rot_scale = float(self.cfg.get("frontres_hsl_rot_error_scale", 0.25))
+        noisy_err = (noisy_pos - clean_pos).norm(dim=-1) + rot_scale * noisy_to_clean_r.norm(dim=-1)
+        front_err = (fr_pos - clean_pos).norm(dim=-1) + rot_scale * front_to_clean_r.norm(dim=-1)
+        safe_th = float(self.cfg.get("frontres_hsl_safe_threshold", 0.03))
+        broken_th = float(self.cfg.get("frontres_hsl_broken_threshold", 0.35))
+        safe_tau = max(float(self.cfg.get("frontres_hsl_safe_temperature", 0.01)), 1e-6)
+        broken_tau = max(float(self.cfg.get("frontres_hsl_broken_temperature", 0.05)), 1e-6)
+        harm_tau = max(float(self.cfg.get("frontres_hsl_harm_temperature", 0.02)), 1e-6)
+        safe_w = torch.sigmoid((safe_th - noisy_err) / safe_tau)
+        broken_w = torch.sigmoid((noisy_err - broken_th) / broken_tau)
+        repair_w = torch.sigmoid((noisy_err - safe_th) / safe_tau) * torch.sigmoid((broken_th - noisy_err) / broken_tau)
+        harm_w = torch.sigmoid((front_err - noisy_err) / harm_tau)
+
+        safe_scale = float(self.cfg.get("frontres_hsl_safe_noop_weight", 1.0))
+        broken_scale = float(self.cfg.get("frontres_hsl_broken_noop_weight", 1.0))
+        harm_scale = float(self.cfg.get("frontres_hsl_harm_noop_weight", 2.0))
+        noop_w = safe_scale * safe_w + broken_scale * broken_w + harm_scale * harm_w
+        denom = (repair_w + noop_w).clamp(min=1e-6)
+        mixed_label = label * (repair_w / denom).unsqueeze(-1)
+
+        target_full = torch.zeros(self.env.num_envs, 6, device=device, dtype=dtype)
+        weight_full = torch.zeros(self.env.num_envs, 1, device=device, dtype=dtype)
+        harm_weight_full = torch.zeros(self.env.num_envs, 1, device=device, dtype=dtype)
+        target_full[:n] = mixed_label
+        weight_full[:n, 0] = (
+            denom.clamp(max=float(self.cfg.get("frontres_hsl_max_sample_weight", 4.0)))
+            * valid_rollout
+        )
+        harm_weight_full[:n, 0] = harm_w * valid_rollout
+        self.alg.transition.supervised_target = target_full
+        self.alg.transition.supervised_weight = weight_full
+        self.alg.transition.supervised_harm_weight = harm_weight_full
+
     def _frontres_family_gain_std(
         self,
         mode_groups: list[tuple[str, ...]] | tuple[tuple[str, ...], ...],
@@ -1140,6 +1265,10 @@ class OnPolicyRunner:
         _frontres_supervised_restore = (
             _is_frontres
             and _frontres_training_objective in ("supervised_restore", "basis_restore")
+        )
+        _frontres_hsl_restore = (
+            _is_frontres
+            and _frontres_training_objective in ("supervised_restore", "basis_restore", "hsl_hybrid")
         )
 
         # Critic warmup: freeze Actor for the first N iterations so the Critic
@@ -2276,7 +2405,7 @@ class OnPolicyRunner:
                 # curriculum gates, and PPO loss all see the same phase.
                 self.alg.ppo_actor_weight = _ppo_actor_weight_current
 
-            if _frontres_supervised_restore and _perturb_target is not None:
+            if _frontres_hsl_restore and _perturb_target is not None:
                 _sup_dr_start = float(self.cfg.get("frontres_supervised_dr_scale_start", _dr_scale_init))
                 _sup_dr_end = float(self.cfg.get("frontres_supervised_dr_scale_end", _sup_dr_start))
                 _sup_dr_ramp = max(1, int(self.cfg.get("frontres_supervised_dr_ramp_iters", 500)))
@@ -2667,6 +2796,24 @@ class OnPolicyRunner:
                                 )
                                 break
 
+                    _hsl_pos_snapshot = None
+                    _hsl_quat_snapshot = None
+                    if (
+                        _is_frontres
+                        and _is_task_space_mode
+                        and bool(self.cfg.get("frontres_hsl_rollout_label_enabled", False))
+                    ):
+                        _env_for_hsl_pre = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+                        if hasattr(_env_for_hsl_pre, "command_manager"):
+                            for _term_hsl_pre in _env_for_hsl_pre.command_manager._terms.values():
+                                if (
+                                    hasattr(_term_hsl_pre, "_frontres_pos_correction")
+                                    and hasattr(_term_hsl_pre, "_frontres_quat_correction")
+                                ):
+                                    _hsl_pos_snapshot = _term_hsl_pre._frontres_pos_correction[:N_train].clone()
+                                    _hsl_quat_snapshot = _term_hsl_pre._frontres_quat_correction[:N_train].clone()
+                                    break
+
                     # Step the environment 仿真环境更新观测量/动作评分/序列结束与否/监控数据
                     # NOTE: This is where the environment computes the *next* observation internally.
                     # The result is returned here and then used in the next loop iteration.
@@ -2674,6 +2821,33 @@ class OnPolicyRunner:
 
                     # Move to device
                     rewards, dones = rewards.to(self.device), dones.to(self.device)
+
+                    if (
+                        _is_frontres
+                        and _is_task_space_mode
+                        and bool(self.cfg.get("frontres_hsl_rollout_label_enabled", False))
+                    ):
+                        _env_for_hsl = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+                        _cmd_hsl = None
+                        if hasattr(_env_for_hsl, "command_manager"):
+                            for _term_hsl in _env_for_hsl.command_manager._terms.values():
+                                if (
+                                    hasattr(_term_hsl, "_frontres_pos_correction")
+                                    and hasattr(_term_hsl, "_frontres_quat_correction")
+                                ):
+                                    _cmd_hsl = _term_hsl
+                                    break
+                        if _cmd_hsl is not None:
+                            self._maybe_update_frontres_hsl_rollout_target(
+                                _cmd_hsl,
+                                actions,
+                                dones,
+                                _hsl_pos_snapshot,
+                                _hsl_quat_snapshot,
+                                N_train,
+                                N_base,
+                                N_clean,
+                            )
 
                     # ── GMT baselines ────────────────────────────────────────────────
                     # Noisy-GMT envs share the FrontRES perturbation and receive no
@@ -3818,6 +3992,7 @@ class OnPolicyRunner:
             "supervised_l_sparse",
             "supervised_l_miss",
             "supervised_l_coeff_smooth",
+            "supervised_l_harm",
             "frontres_alpha_mean",
             "frontres_alpha_active_frac",
             "frontres_write_ratio",
@@ -4045,7 +4220,7 @@ class OnPolicyRunner:
 
                 _frontres_supervised_log = (
                     f"{getattr(self.alg, 'frontres_training_objective', '')}".lower()
-                    in ("supervised_restore", "basis_restore")
+                    in ("supervised_restore", "basis_restore", "hsl_hybrid")
                 )
                 _loss_dict = locs.get("loss_dict", {})
 
@@ -4083,7 +4258,8 @@ class OnPolicyRunner:
                             f"{_loss_dict.get('supervised_l_over', 0.0):.6f} / "
                             f"{_loss_dict.get('supervised_l_smooth', 0.0):.6f}\n"
                         )
-                    if f"{getattr(self.alg, 'frontres_training_objective', '')}".lower() == "basis_restore":
+                        log_string += f"""{'L_harm:':>{pad}} {_loss_dict.get('supervised_l_harm', 0.0):.6f}\n"""
+                    if f"{getattr(self.alg, 'frontres_training_objective', '')}".lower() in ("basis_restore", "hsl_hybrid"):
                         log_string += f"""{'alpha mean/active:':>{pad}} """
                         log_string += (
                             f"{_loss_dict.get('frontres_alpha_mean', 0.0):.3f} / "
@@ -4771,14 +4947,24 @@ class OnPolicyRunner:
         return self.obs_normalizer(obs)
 
     def _mask_frontres_task_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        """Apply the configured task-space action cone to task corrections and coefficients."""
+        """Apply the configured task-space action cone to correction proposals.
+
+        In task-space mode actions are
+        [dx, dy, dz, droll, dpitch, dyaw, alpha...].  The action cone should
+        zero inactive correction proposals.  It should not force inactive
+        sigmoid coefficients to zero: that value is on the boundary of the
+        transformed action distribution and would corrupt PPO log-prob ratios.
+        Coefficients on inactive axes are harmless once their proposal is zero.
+        """
         active_dims = self.cfg.get("frontres_active_task_dims", None)
         if active_dims is None:
             return actions
-        mask = torch.zeros(actions.shape[-1], device=actions.device, dtype=actions.dtype)
+        mask = torch.ones(actions.shape[-1], device=actions.device, dtype=actions.dtype)
+        proposal_dim = min(6, actions.shape[-1])
+        mask[:proposal_dim] = 0.0
         for idx in active_dims:
             idx = int(idx)
-            if 0 <= idx < actions.shape[-1]:
+            if 0 <= idx < proposal_dim:
                 mask[idx] = 1.0
         return actions * mask.view(1, -1)
 
@@ -4895,7 +5081,7 @@ class OnPolicyRunner:
         if rollout_step != 0:
             return
         objective = str(getattr(self.alg, "frontres_training_objective", "")).lower()
-        if objective not in ("supervised_restore", "basis_restore"):
+        if objective not in ("supervised_restore", "basis_restore", "hsl_hybrid"):
             return
         interval = int(getattr(self.alg, "frontres_restore_debug_print_interval", self.cfg.get("frontres_restore_debug_print_interval", 100)))
         if interval <= 0 or int(it) % interval != 0:

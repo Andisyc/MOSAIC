@@ -243,11 +243,6 @@ def plot_recovery_curve(
 
     ax.set_xlabel("Reference frame noise ε")
     ax.set_ylabel("End-to-end success rate (%)")
-    title = "Push-Recovery Rate"
-    if multi_mode:
-        n = len(merged[0][0]["motion_names"])
-        title += f"\n(mean over {n} motion sequences)"
-    ax.set_title(title)
     ax.set_ylim(0, 105)
     ax.set_xlim(left=0)
 
@@ -309,15 +304,14 @@ def plot_zmp_mechanism(
                     linestyle="--", alpha=0.4, label=mname)
 
         ax.plot(eps_vals, mean_zmps, color=color, linewidth=2.2, linestyle="-",
-                marker="s", markersize=7, label="Min post-push margin")
+                marker="s", markersize=7, label="Min push margin")
     else:
         ax.plot(eps_vals, mean_zmps, color=color, linewidth=2, linestyle="-",
-                marker="s", markersize=7, label="Min post-push margin")
+                marker="s", markersize=7, label="Min push margin")
 
     ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0)
     ax.set_xlabel("Reference frame noise ε")
-    ax.set_ylabel("Minimum post-push margin (m)")
-    ax.set_title("Stability Margin")
+    ax.set_ylabel("Minimum push margin (m)")
     ax.legend(fontsize=8, loc="upper right")
     ax.set_xlim(left=0)
 
@@ -508,7 +502,7 @@ def _mode_summary(store: ResultsStore, perturbation_mode: str) -> dict:
 
 def _group_names(stores: list[tuple[str, ResultsStore]]) -> list[str]:
     groups = sorted({store.meta.get("motion_group", "Ungrouped") for _, store in stores})
-    return groups + ["Overall"]
+    return [group for group in groups if str(group).lower() != "overall"]
 
 
 def _pooled_rate_by_eps(
@@ -520,28 +514,24 @@ def _pooled_rate_by_eps(
     n_eps = len(ref_meta["epsilon_values"])
     n_pvel = len(ref_meta["push_velocities"])
     means, cis, totals = [], [], []
-    real_groups = sorted({store.meta.get("motion_group", "Ungrouped") for _, store in stores})
-
     for ei in range(n_eps):
-        groups_to_average = real_groups if group == "Overall" else [group]
         group_rates = []
         total = 0
-        for group_name in groups_to_average:
-            motion_rates = []
-            for _, store in stores:
-                if store.meta.get("motion_group", "Ungrouped") != group_name:
+        motion_rates = []
+        for _, store in stores:
+            if store.meta.get("motion_group", "Ungrouped") != group:
+                continue
+            summary = _mode_summary(store, perturbation_mode)
+            for pi in range(n_pvel):
+                cell = summary[ei][pi]
+                n = int(cell["n_total"])
+                rate = cell["end_to_end_success_rate"]
+                if n <= 0 or np.isnan(rate):
                     continue
-                summary = _mode_summary(store, perturbation_mode)
-                for pi in range(n_pvel):
-                    cell = summary[ei][pi]
-                    n = int(cell["n_total"])
-                    rate = cell["end_to_end_success_rate"]
-                    if n <= 0 or np.isnan(rate):
-                        continue
-                    motion_rates.append(float(rate))
-                    total += n
-            if motion_rates:
-                group_rates.append(float(np.mean(motion_rates)))
+                motion_rates.append(float(rate))
+                total += n
+        if motion_rates:
+            group_rates.append(float(np.mean(motion_rates)))
         p = float(np.mean(group_rates)) if group_rates else float("nan")
         ci = float(np.sqrt(p * (1.0 - p) / total)) if total > 0 and not np.isnan(p) else 0.0
         means.append(p)
@@ -559,26 +549,22 @@ def _pooled_zmp_by_eps(
     n_eps = len(ref_meta["epsilon_values"])
     n_pvel = len(ref_meta["push_velocities"])
     means, stds = [], []
-    real_groups = sorted({store.meta.get("motion_group", "Ungrouped") for _, store in stores})
-
     for ei in range(n_eps):
-        groups_to_average = real_groups if group == "Overall" else [group]
         group_vals = []
-        for group_name in groups_to_average:
-            vals = []
-            for _, store in stores:
-                if store.meta.get("motion_group", "Ungrouped") != group_name:
+        vals = []
+        for _, store in stores:
+            if store.meta.get("motion_group", "Ungrouped") != group:
+                continue
+            summary = _mode_summary(store, perturbation_mode)
+            for pi in range(n_pvel):
+                cell = summary[ei][pi]
+                zmp = cell["mean_min_zmp_after_push"]
+                n = int(cell["n_total"])
+                if n <= 0 or np.isnan(zmp):
                     continue
-                summary = _mode_summary(store, perturbation_mode)
-                for pi in range(n_pvel):
-                    cell = summary[ei][pi]
-                    zmp = cell["mean_min_zmp_after_push"]
-                    n = int(cell["n_total"])
-                    if n <= 0 or np.isnan(zmp):
-                        continue
-                    vals.append(float(zmp))
-            if vals:
-                group_vals.append(float(np.mean(np.array(vals, dtype=float))))
+                vals.append(float(zmp))
+        if vals:
+            group_vals.append(float(np.mean(np.array(vals, dtype=float))))
         if group_vals:
             arr = np.array(group_vals, dtype=float)
             mean = float(np.mean(arr))
@@ -595,23 +581,20 @@ def plot_grouped_recovery_curve(
     output_dir: str,
     perturbation_mode: str = "composite",
 ) -> None:
-    """Fig1: all motion categories and overall recovery rate on one axis."""
+    """Fig1: all motion categories on one axis."""
     eps_vals = stores[0][1].meta["epsilon_values"]
     groups = _group_names(stores)
-    colors = ["#1976D2", "#388E3C", "#F57C00", "#7B1FA2", "#212121"]
+    colors = ["#1976D2", "#388E3C", "#F57C00", "#7B1FA2"]
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for gi, group in enumerate(groups):
         means, _, _ = _pooled_rate_by_eps(stores, group, perturbation_mode)
         y = np.array(means) * 100.0
         color = colors[gi % len(colors)]
-        lw = 2.6 if group == "Overall" else 1.8
-        alpha = 1.0 if group == "Overall" else 0.85
-        ax.plot(eps_vals, y, marker="o", linewidth=lw, color=color, alpha=alpha, label=group)
+        ax.plot(eps_vals, y, marker="o", linewidth=1.8, color=color, alpha=0.9, label=group)
 
     ax.set_xlabel("Reference frame noise ε")
     ax.set_ylabel("End-to-end success rate (%)")
-    ax.set_title("Push-Recovery Rate")
     ax.set_ylim(0, 105)
     ax.set_xlim(left=0)
     ax.legend(fontsize=8, framealpha=0.8, loc="upper right")
@@ -623,25 +606,24 @@ def plot_grouped_zmp_mechanism(
     output_dir: str,
     perturbation_mode: str = "composite",
 ) -> None:
-    """Fig2: mechanism view, all motion categories and post-push minimum margin."""
+    """Fig2: mechanism view, all motion categories and push minimum margin."""
     eps_vals = stores[0][1].meta["epsilon_values"]
     groups = _group_names(stores)
-    colors = ["#1976D2", "#388E3C", "#F57C00", "#7B1FA2", "#212121"]
+    colors = ["#1976D2", "#388E3C", "#F57C00", "#7B1FA2"]
 
-    fig, ax = plt.subplots(figsize=(7, 4.2))
+    fig, ax = plt.subplots(figsize=(7, 4.5))
     for gi, group in enumerate(groups):
         means, _ = _pooled_zmp_by_eps(stores, group, perturbation_mode)
         y = np.array(means)
         color = colors[gi % len(colors)]
-        lw = 2.6 if group == "Overall" else 1.8
-        alpha = 1.0 if group == "Overall" else 0.85
-        ax.plot(eps_vals, y, marker="s", linewidth=lw, color=color, alpha=alpha, label=group)
+        ax.plot(eps_vals, y, marker="s", linewidth=1.8, color=color, alpha=0.9, label=group)
 
     ax.axhline(0.0, color="red", linestyle="--", linewidth=1.0)
     ax.set_xlabel("Reference frame noise ε")
-    ax.set_ylabel("Minimum post-push margin (m)")
-    ax.set_title("Stability Margin")
+    ax.set_ylabel("Minimum push margin (m)")
     ax.set_xlim(left=0)
+    ax.set_ylim(-0.10, 0.42)
+    ax.set_yticks(np.arange(-0.10, 0.41, 0.10))
     ax.legend(fontsize=8, framealpha=0.8, loc="upper right")
     _save(fig, output_dir, "fig2_zmp_margin")
 
@@ -694,8 +676,9 @@ def _write_summary_all_csv(stores: list[tuple[str, ResultsStore]], path: str) ->
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _save(fig, output_dir: str, name: str) -> None:
+    fig.tight_layout()
     for ext in ("pdf", "png"):
-        fig.savefig(os.path.join(output_dir, f"{name}.{ext}"), bbox_inches="tight")
+        fig.savefig(os.path.join(output_dir, f"{name}.{ext}"))
     plt.close(fig)
     print(f"[plot] Saved {name}")
 

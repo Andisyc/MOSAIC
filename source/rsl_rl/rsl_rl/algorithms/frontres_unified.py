@@ -61,6 +61,7 @@ class FrontRESUnified:
         supervised_coeff_sparse_weight: float = 0.0,
         supervised_coeff_miss_weight: float = 0.0,
         supervised_coeff_smooth_weight: float = 0.0,
+        supervised_harm_loss_weight: float = 1.0,
         frontres_supervised_lr_schedule: str = "fixed",
         frontres_supervised_lr_start: float | None = None,
         frontres_supervised_lr_peak: float | None = None,
@@ -153,6 +154,7 @@ class FrontRESUnified:
         self.supervised_coeff_sparse_weight = float(supervised_coeff_sparse_weight)
         self.supervised_coeff_miss_weight = float(supervised_coeff_miss_weight)
         self.supervised_coeff_smooth_weight = float(supervised_coeff_smooth_weight)
+        self.supervised_harm_loss_weight = float(supervised_harm_loss_weight)
         self.frontres_supervised_lr_schedule = str(frontres_supervised_lr_schedule).lower()
         self.frontres_supervised_lr_start = float(frontres_supervised_lr_start) if frontres_supervised_lr_start is not None else float(learning_rate)
         self.frontres_supervised_lr_peak = float(frontres_supervised_lr_peak) if frontres_supervised_lr_peak is not None else float(learning_rate)
@@ -246,6 +248,9 @@ class FrontRESUnified:
         elif self.frontres_training_objective == "basis_restore":
             print("  L = L_proposal + L_written + L_coeff  "
                   "(factorized per-axis repair coefficients; PPO/HRL branch kept but disabled)")
+        elif self.frontres_training_objective == "hsl_hybrid":
+            print("  L = L_PPO(exec advantage) + λ_sup·L_HSL  "
+                  "(rollout labels supervise direction; PPO explores repair strength)")
         else:
             print(f"  L = L_PPO + λ_sup({self.lambda_supervised:.2f})·L_supervised")
         print("=" * 80)
@@ -430,8 +435,10 @@ class FrontRESUnified:
                 frontres_mask_batch,
                 supervised_target_batch,
                 frontres_actor_gate_batch,
-            ) = batch[:20]
-            batch_indices = batch[20] if len(batch) > 20 else None
+                supervised_weight_batch,
+                supervised_harm_weight_batch,
+            ) = batch[:22]
+            batch_indices = batch[22] if len(batch) > 22 else None
             original_batch_size = obs_batch.shape[0]
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
@@ -462,7 +469,13 @@ class FrontRESUnified:
                 self._adapt_learning_rate(old_mu_batch, old_sigma_batch, mu_batch, sigma_batch)
 
             supervised_loss, sup_cos_sim, sup_metrics = self._compute_supervised_loss(
-                mu_batch, supervised_target_batch, original_batch_size, batch_indices=batch_indices)
+                mu_batch,
+                supervised_target_batch,
+                original_batch_size,
+                batch_indices=batch_indices,
+                supervised_weight_batch=supervised_weight_batch,
+                supervised_harm_weight_batch=supervised_harm_weight_batch,
+            )
 
             if self.frontres_training_objective in ("supervised_restore", "basis_restore"):
                 loss = supervised_loss
@@ -678,6 +691,8 @@ class FrontRESUnified:
         supervised_target_batch,
         original_batch_size,
         batch_indices=None,
+        supervised_weight_batch=None,
+        supervised_harm_weight_batch=None,
     ):
         supervised_loss = torch.tensor(0.0, device=self.device)
         sup_cos_sim = 0.0
@@ -696,10 +711,12 @@ class FrontRESUnified:
             "supervised_l_sparse": 0.0,
             "supervised_l_miss": 0.0,
             "supervised_l_coeff_smooth": 0.0,
+            "supervised_l_harm": 0.0,
             "frontres_alpha_mean": 0.0,
             "frontres_alpha_active_frac": 0.0,
             "frontres_write_ratio": 0.0,
             "frontres_axis_leakage": 0.0,
+            "frontres_supervised_weight": 0.0,
         }
         if supervised_target_batch is None or self.lambda_supervised <= 0:
             return supervised_loss, sup_cos_sim, sup_metrics
@@ -711,6 +728,24 @@ class FrontRESUnified:
 
         raw_pred = mu_batch[:original_batch_size]
         target = supervised_target_batch[:original_batch_size]
+        if supervised_weight_batch is not None:
+            sample_weight = supervised_weight_batch[:original_batch_size].view(-1).to(
+                device=self.device, dtype=raw_pred.dtype
+            )
+        else:
+            sample_weight = torch.ones(raw_pred.shape[0], device=self.device, dtype=raw_pred.dtype)
+        sample_weight = torch.nan_to_num(sample_weight, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+        if supervised_harm_weight_batch is not None:
+            harm_weight = supervised_harm_weight_batch[:original_batch_size].view(-1).to(
+                device=self.device, dtype=raw_pred.dtype
+            )
+            harm_weight = torch.nan_to_num(harm_weight, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+        else:
+            harm_weight = torch.zeros(raw_pred.shape[0], device=self.device, dtype=raw_pred.dtype)
+
+        def _wmean(values: torch.Tensor, weight: torch.Tensor | None = None) -> torch.Tensor:
+            w = sample_weight if weight is None else sample_weight * weight.to(sample_weight.dtype)
+            return (values * w).sum() / w.sum().clamp(min=1e-6)
 
         is_task_space = hasattr(self.policy, "num_task_corrections") and self.policy.num_task_corrections > 0
         if is_task_space:
@@ -728,7 +763,7 @@ class FrontRESUnified:
             ], dim=-1)
 
         coeff = None
-        if is_task_space and str(self.frontres_training_objective).lower() == "basis_restore":
+        if is_task_space and str(self.frontres_training_objective).lower() in ("basis_restore", "hsl_hybrid"):
             coeff_dim = int(getattr(self.policy, "task_conf_dim", 2))
             if coeff_dim == 6 and raw_pred.shape[-1] >= 12:
                 coeff = torch.sigmoid(raw_pred[:, 6:12])
@@ -778,13 +813,13 @@ class FrontRESUnified:
             dir_pred[:, :3], target_detached[:, :3], reduction="none").mean(dim=-1)
         rpy_err = nn.functional.huber_loss(
             dir_pred[:, 3:], target_detached[:, 3:], reduction="none").mean(dim=-1)
-        pos_sup = (pos_err * pos_weight).mean()
-        rpy_sup = (rpy_err * rpy_weight).mean()
+        pos_sup = _wmean(pos_err, pos_weight)
+        rpy_sup = _wmean(rpy_err, rpy_weight)
         supervised_loss = pos_sup + self.supervised_rpy_loss_weight * rpy_sup
 
         if coeff is not None:
             write_err = nn.functional.huber_loss(pred, target_detached, reduction="none").mean(dim=-1)
-            supervised_loss = supervised_loss + write_err.mean()
+            supervised_loss = supervised_loss + _wmean(write_err)
 
         mag_loss = torch.zeros((), device=self.device)
         over_loss = torch.zeros((), device=self.device)
@@ -792,15 +827,18 @@ class FrontRESUnified:
         sparse_loss = torch.zeros((), device=self.device)
         miss_loss = torch.zeros((), device=self.device)
         coeff_smooth_loss = torch.zeros((), device=self.device)
+        harm_loss = torch.zeros((), device=self.device)
         if self.supervised_magnitude_loss_weight > 0 and valid.any():
-            pred_norm = pred[valid].norm(dim=-1)
-            target_norm_valid = target_detached[valid].norm(dim=-1)
-            mag_loss = nn.functional.huber_loss(pred_norm, target_norm_valid, reduction="mean")
+            pred_norm = pred.norm(dim=-1)
+            target_norm_valid = target_detached.norm(dim=-1)
+            mag_terms = nn.functional.huber_loss(pred_norm, target_norm_valid, reduction="none")
+            mag_loss = _wmean(mag_terms, valid.to(sample_weight.dtype))
             supervised_loss = supervised_loss + self.supervised_magnitude_loss_weight * mag_loss
         if self.supervised_over_loss_weight > 0 and valid.any():
-            pred_norm = pred[valid].norm(dim=-1)
-            target_norm_valid = target_detached[valid].norm(dim=-1)
-            over_loss = torch.relu(pred_norm - target_norm_valid).square().mean()
+            pred_norm = pred.norm(dim=-1)
+            target_norm_valid = target_detached.norm(dim=-1)
+            over_terms = torch.relu(pred_norm - target_norm_valid).square()
+            over_loss = _wmean(over_terms, valid.to(sample_weight.dtype))
             supervised_loss = supervised_loss + self.supervised_over_loss_weight * over_loss
         if (
             self.supervised_smooth_loss_weight > 0
@@ -814,10 +852,12 @@ class FrontRESUnified:
         if coeff is not None:
             target_axis_mask = (target_detached.abs() > 1e-4).to(coeff.dtype)
             if self.supervised_coeff_sparse_weight > 0:
-                sparse_loss = (coeff * (1.0 - target_axis_mask)).mean()
+                sparse_terms = (coeff * (1.0 - target_axis_mask)).mean(dim=-1)
+                sparse_loss = _wmean(sparse_terms)
                 supervised_loss = supervised_loss + self.supervised_coeff_sparse_weight * sparse_loss
             if self.supervised_coeff_miss_weight > 0:
-                miss_loss = ((1.0 - coeff) * target_axis_mask).mean()
+                miss_terms = ((1.0 - coeff) * target_axis_mask).mean(dim=-1)
+                miss_loss = _wmean(miss_terms)
                 supervised_loss = supervised_loss + self.supervised_coeff_miss_weight * miss_loss
             if (
                 self.supervised_coeff_smooth_weight > 0
@@ -828,17 +868,30 @@ class FrontRESUnified:
                     coeff, batch_indices[:original_batch_size])
                 supervised_loss = supervised_loss + self.supervised_coeff_smooth_weight * coeff_smooth_loss
 
+        if self.supervised_harm_loss_weight > 0 and harm_weight.sum() > 0:
+            harm_terms = pred.square().mean(dim=-1)
+            harm_loss = (harm_terms * harm_weight).sum() / harm_weight.sum().clamp(min=1e-6)
+            supervised_loss = supervised_loss + self.supervised_harm_loss_weight * harm_loss
+
         if self.supervised_direction_loss_weight > 0:
             direction_loss = torch.zeros((), device=self.device)
             if pos_valid.any():
                 direction_loss = direction_loss + (
-                    1.0 - nn.functional.cosine_similarity(
-                        dir_pred[pos_valid, :3], target_detached[pos_valid, :3], dim=-1).mean()
+                    _wmean(
+                        1.0 - nn.functional.cosine_similarity(
+                            dir_pred[:, :3], target_detached[:, :3], dim=-1
+                        ),
+                        pos_valid.to(sample_weight.dtype),
+                    )
                 )
             if rpy_valid.any():
                 direction_loss = direction_loss + (
-                    1.0 - nn.functional.cosine_similarity(
-                        dir_pred[rpy_valid, 3:], target_detached[rpy_valid, 3:], dim=-1).mean()
+                    _wmean(
+                        1.0 - nn.functional.cosine_similarity(
+                            dir_pred[:, 3:], target_detached[:, 3:], dim=-1
+                        ),
+                        rpy_valid.to(sample_weight.dtype),
+                    )
                 )
             supervised_loss = supervised_loss + self.supervised_direction_loss_weight * direction_loss
 
@@ -866,6 +919,8 @@ class FrontRESUnified:
             sup_metrics["supervised_l_sparse"] = sparse_loss.item()
             sup_metrics["supervised_l_miss"] = miss_loss.item()
             sup_metrics["supervised_l_coeff_smooth"] = coeff_smooth_loss.item()
+            sup_metrics["supervised_l_harm"] = harm_loss.item()
+            sup_metrics["frontres_supervised_weight"] = sample_weight.mean().item()
             if coeff is not None:
                 sup_metrics["frontres_alpha_mean"] = coeff.mean().item()
                 sup_metrics["frontres_alpha_active_frac"] = (coeff > 0.5).float().mean().item()

@@ -818,10 +818,10 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         max_grad_norm        = 0.5,
 
         # ── Supervised auxiliary loss (λ_sup schedule) ────────────────────────
-        frontres_training_objective  = "basis_restore",
+        frontres_training_objective  = "hsl_hybrid",
         lambda_supervised             = 1.0,   # initial weight
-        lambda_supervised_min         = 1.0,   # supervised/basis branches keep the target as the main objective
-        lambda_supervised_decay       = 1.0,   # no decay in the supervised branch
+        lambda_supervised_min         = 0.20,  # HSL remains an anchor while PPO explores repair strength
+        lambda_supervised_decay       = 0.995, # HSL direction anchor can decay once rollout advantage is useful
         supervised_trigger_cosine_sim = 0.85,  # EMA threshold to start decay
         supervised_rpy_loss_weight    = 1.0,
         supervised_conf_loss_weight   = 0.0,   # BCE drives c→1 always (OU≠0); let PPO learn gating
@@ -833,6 +833,19 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         supervised_coeff_sparse_weight   = 0.02,
         supervised_coeff_miss_weight     = 0.10,
         supervised_coeff_smooth_weight   = 0.02,
+        supervised_harm_loss_weight      = 1.0,
+        frontres_hsl_rollout_label_enabled = True,
+        frontres_hsl_rollout_eta        = 1.0,
+        frontres_hsl_rot_error_scale    = 0.25,
+        frontres_hsl_safe_threshold     = 0.03,
+        frontres_hsl_broken_threshold   = 0.35,
+        frontres_hsl_safe_temperature   = 0.01,
+        frontres_hsl_broken_temperature = 0.05,
+        frontres_hsl_harm_temperature   = 0.02,
+        frontres_hsl_safe_noop_weight   = 1.0,
+        frontres_hsl_broken_noop_weight = 1.0,
+        frontres_hsl_harm_noop_weight   = 2.0,
+        frontres_hsl_max_sample_weight  = 4.0,
         frontres_supervised_lr_schedule  = "cosine_anneal",
         frontres_supervised_lr_start     = 3.0e-5,
         frontres_supervised_lr_peak      = 1.0e-4,

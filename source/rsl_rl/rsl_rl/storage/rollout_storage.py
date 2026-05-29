@@ -39,6 +39,12 @@ class RolloutStorage:
             self.frontres_actor_gate = None
             # Unified training: ΔSE3 supervised target [Δpos(3), Δrpy(3)] per env per step
             self.supervised_target = None
+            # Optional sample weight for supervised/HSL targets.  This lets rollout-derived
+            # safe/repairable/broken weights gate the supervised loss without touching PPO.
+            self.supervised_weight = None
+            # Optional harmful-repair weight for HSL.  This keeps the explicit harmful
+            # no-op penalty separate from the ordinary supervised sample weight.
+            self.supervised_harm_weight = None
 
         def clear(self):
             self.__init__()
@@ -136,6 +142,8 @@ class RolloutStorage:
             self.frontres_actor_gate = torch.ones(num_transitions_per_env, num_envs, 1, device=self.device)
             # Unified training: ΔSE3 supervised target [Δpos(3), Δrpy(3)] (default zeros = no supervision)
             self.supervised_target = torch.zeros(num_transitions_per_env, num_envs, 6, device=self.device)
+            self.supervised_weight = torch.ones(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.supervised_harm_weight = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         # For RNN networks
         self.saved_hidden_states_a = None
@@ -198,6 +206,10 @@ class RolloutStorage:
             # Store ΔSE3 supervised target (zeros when not in unified training mode)
             if hasattr(transition, 'supervised_target') and transition.supervised_target is not None:
                 self.supervised_target[self.step].copy_(transition.supervised_target)
+            if hasattr(transition, 'supervised_weight') and transition.supervised_weight is not None:
+                self.supervised_weight[self.step].copy_(transition.supervised_weight)
+            if hasattr(transition, 'supervised_harm_weight') and transition.supervised_harm_weight is not None:
+                self.supervised_harm_weight[self.step].copy_(transition.supervised_harm_weight)
 
         # For RND
         if self.rnd_state_shape is not None:
@@ -321,6 +333,8 @@ class RolloutStorage:
             frontres_actor_gate = self.frontres_actor_gate.flatten(0, 1)
             # ΔSE3 supervised target
             supervised_target = self.supervised_target.flatten(0, 1)
+            supervised_weight = self.supervised_weight.flatten(0, 1)
+            supervised_harm_weight = self.supervised_harm_weight.flatten(0, 1)
             # For velocity estimator
             if self.ref_vel_estimator_observations is not None:
                 ref_vel_estimator_observations = self.ref_vel_estimator_observations.flatten(0, 1)
@@ -368,6 +382,8 @@ class RolloutStorage:
                     frontres_mask_batch = frontres_mask[batch_idx]
                     frontres_actor_gate_batch = frontres_actor_gate[batch_idx]
                     supervised_target_batch = supervised_target[batch_idx]
+                    supervised_weight_batch = supervised_weight[batch_idx]
+                    supervised_harm_weight_batch = supervised_harm_weight[batch_idx]
                     # For velocity estimator
                     if ref_vel_estimator_observations is not None:
                         ref_vel_estimator_obs_batch = ref_vel_estimator_observations[batch_idx]
@@ -382,6 +398,8 @@ class RolloutStorage:
                     frontres_mask_batch = None
                     frontres_actor_gate_batch = None
                     supervised_target_batch = None
+                    supervised_weight_batch = None
+                    supervised_harm_weight_batch = None
 
                 # yield the mini-batch
                 if self.training_type == "frontres":
@@ -393,7 +411,8 @@ class RolloutStorage:
                         None,
                         ), None, rnd_state_batch, teacher_obs_batch, teacher_mu_batch, teacher_sigma_batch,
                         ref_vel_estimator_obs_batch, motion_groups_batch, frontres_mask_batch,
-                        supervised_target_batch, frontres_actor_gate_batch,
+                        supervised_target_batch, frontres_actor_gate_batch, supervised_weight_batch,
+                        supervised_harm_weight_batch,
                     )
                     if getattr(self, "yield_batch_indices", False):
                         frontres_batch = frontres_batch + (batch_idx,)
@@ -497,16 +516,20 @@ class RolloutStorage:
                         frontres_mask_batch = self.frontres_mask[:, start:stop]
                         frontres_actor_gate_batch = self.frontres_actor_gate[:, start:stop]
                         supervised_target_batch = self.supervised_target[:, start:stop]
+                        supervised_weight_batch = self.supervised_weight[:, start:stop]
+                        supervised_harm_weight_batch = self.supervised_harm_weight[:, start:stop]
                     else:
                         ref_vel_estimator_obs_batch = None
                         frontres_mask_batch = None
                         frontres_actor_gate_batch = None
                         supervised_target_batch = None
+                        supervised_weight_batch = None
+                        supervised_harm_weight_batch = None
                     if self.training_type == "frontres":
                         yield obs_batch, privileged_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                             hid_a_batch,
                             hid_c_batch,
-                        ), masks_batch, rnd_state_batch, teacher_obs_batch, teacher_mu_batch, teacher_sigma_batch, ref_vel_estimator_obs_batch, None, frontres_mask_batch, supervised_target_batch, frontres_actor_gate_batch
+                        ), masks_batch, rnd_state_batch, teacher_obs_batch, teacher_mu_batch, teacher_sigma_batch, ref_vel_estimator_obs_batch, None, frontres_mask_batch, supervised_target_batch, frontres_actor_gate_batch, supervised_weight_batch, supervised_harm_weight_batch
                     else:
                         yield obs_batch, privileged_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                             hid_a_batch,
