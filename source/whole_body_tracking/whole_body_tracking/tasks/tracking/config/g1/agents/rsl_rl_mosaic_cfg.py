@@ -483,10 +483,11 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
 
     # ── FrontRES rp demo specialist ───────────────────────────────────────────
     # Task-space action layout with task_conf_dim=1:
-    #   [dx, dy, dz, droll, dpitch, dyaw, tau]
+    #   [dx, dy, dz, droll, dpitch, dyaw, rho_pos]
     # Local-rp perturbations may require root-position compensation at high
-    # strength, so keep the full ΔSE(3) proposal active and let PPO choose the
-    # temporal mix between HSL repair and continuity-preserving repair.
+    # strength.  HSL owns the clean-oriented ΔSE(3) proposal; PPO owns only the
+    # scalar position rejoin rate between HSL position repair and the temporal
+    # continuity candidate.  Attitude repair is written from HSL directly.
     frontres_specialist_mode       = "rp"
     frontres_active_task_dims      = [0, 1, 2, 3, 4, 5, 6]
     frontres_perturbation_channels = "rp"
@@ -631,8 +632,8 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     frontres_debug_training        = False
     debug_supervised_warmup_iterations = 200
     debug_supervised_warmup_diag_interval = 40
-    debug_critic_warmup_iterations = 0
-    debug_ppo_actor_warmup_iterations = 0
+    debug_critic_warmup_iterations = 50
+    debug_ppo_actor_warmup_iterations = 50
     debug_ppo_actor_ramp_iterations = 100
     debug_dr_scale_init            = 1.0
     debug_dr_min_scale             = 0.3
@@ -689,6 +690,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # final plateau for fixed-difficulty refinement.
     frontres_supervised_dr_scale_start = 1.25
     frontres_supervised_dr_scale_end = 4.375
+    frontres_supervised_dr_delay_iters = 200
     frontres_supervised_dr_ramp_iters = 1400
 
     # ── Perturbation curriculum ────────────────────────────────────────────
@@ -743,9 +745,11 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     root_tilt_prob                 = 0.5
     root_tilt_max_rad              = 0.08
 
-    # ── Legacy Critic warmup ───────────────────────────────────────────────
-    # Disabled because Critic now learns executable damage during joint warmup.
-    critic_warmup_iterations       = 0
+    # ── Critic warmup after HSL warmup ─────────────────────────────────────
+    # HSL warmup gives a stable repair proposal.  The first PPO-loop stage lets
+    # the Critic learn the rollout value landscape while the actor and harder
+    # DR curriculum remain held.
+    critic_warmup_iterations       = 200
 
     # ── DR PI controller, velocity form (Phase 3) ────────────────────────────
     # Δu = Kp×(e−e_prev) + Ki×e  →  dr_scale += Δu
@@ -782,7 +786,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         noise_std_type         = "scalar",
         # ── Task-space SE(3) correction mode ─────────────────────────────────
         num_task_corrections   = 6,        # bounded correction proposal = [Δpos(3), Δrpy(3)]
-        task_conf_dim          = 1,        # scalar tau: PPO temporal mix, not amplitude/confidence
+        task_conf_dim          = 1,        # scalar rho_pos: PPO position rejoin rate
         max_delta_pos          = 0.3,      # tanh clip (metres)
         max_delta_rpy          = 0.4,      # tanh clip (rad); needed to repair RobotBridge rp eps up to 0.35
         # ── GMT (frozen) ─────────────────────────────────────────────────────
@@ -825,7 +829,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         lambda_supervised_decay       = 0.995, # HSL direction anchor can decay once rollout advantage is useful
         supervised_trigger_cosine_sim = 0.85,  # EMA threshold to start decay
         supervised_rpy_loss_weight    = 1.0,
-        supervised_conf_loss_weight   = 0.0,   # hsl_hybrid uses tau as PPO temporal mix, not supervised amplitude gate
+        supervised_conf_loss_weight   = 0.0,   # hsl_hybrid uses rho_pos as PPO position rejoin, not supervised amplitude gate
         supervised_direction_loss_weight = 0.03,
         supervised_valid_loss_weight     = 4.0,
         supervised_magnitude_loss_weight = 0.5,
@@ -854,12 +858,11 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         frontres_supervised_lr_warmup_iters = 50,
         frontres_supervised_lr_cosine_iters = 1550,
         frontres_restore_debug_print_interval = 10,
-        # Joint warmup already initializes the Critic's executable-energy
-        # estimate, but Actor takeover still changes the corrected-reference
-        # distribution.  Ramp slowly so PPO does not push the warmup solution
-        # out of its executable neighborhood in the first few hundred iters.
-        ppo_actor_warmup_iterations   = 0,
-        ppo_actor_ramp_iterations     = 400,
+        # HSL first, Critic second, Actor third, difficulty last.  PPO only
+        # controls rho_pos, but it still changes the corrected-reference
+        # distribution, so we keep a short frozen-actor phase and a slow ramp.
+        ppo_actor_warmup_iterations   = 200,
+        ppo_actor_ramp_iterations     = 500,
         ppo_advantage_focal_power     = 0.0,
         frontres_active_task_dims      = [0, 1, 2, 3, 4, 5, 6],
         diagnose_gradient_conflict    = True,

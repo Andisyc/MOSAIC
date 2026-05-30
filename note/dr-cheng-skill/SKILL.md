@@ -12,6 +12,8 @@ Use this skill to match Dr. Cheng's research habits and collaboration expectatio
 - Treat the work as a research system, not a pile of independent code changes.
 - Start from the problem definition: what is the artifact, what is the repair target, what information is observable, and what physical feedback is available.
 - Reason from concepts before mechanisms. First name the compressed concept that explains the problem; then design the simplest mechanism that realizes it.
+- When a method feels stuck, go back to the failure mechanism. A strong design should emerge from understanding why the previous formulation fails, not from adding components until performance improves.
+- Treat conceptual insight as the bridge from problem analysis to method design. Once the hidden tradeoff or failure cause is named, use it to define component roles, parameter boundaries, and reward structure.
 - Use classification to reduce confusion. When a concept feels vague, split the cases until the design space becomes inspectable.
 - When moving from concept to method, first look for mature designs in prior project versions or related work, then adapt them instead of inventing a brittle mechanism from scratch.
 - Preserve architectural continuity. If a new implementation seems to replace a previous design, explicitly explain the relationship before editing.
@@ -41,6 +43,17 @@ Dr. Cheng often reasons through these principles:
 - Supervised learning can provide stable direction, but rollout/RL-style feedback is needed to decide whether and how strongly a repair should be applied.
 - Distinguish direction learning from strength/gating learning. Direction may be supervised; strength may be advantage-weighted or PPO-driven.
 - Action Cone / repair space is a core contribution. Treat perturbation family, active dimensions, output constraints, and physical feasibility as aligned components.
+
+## Reward And Policy-Boundary Design
+
+- Treat reward design as extracting an objective rule, not inventing a score. A useful reward should preserve the ordering implied by the real scientific target.
+- Before tuning a reward, define the policy parameter's conceptual authority: selection, strength, gating, filtering, or generation. Reward hacking often means the parameter can affect more than its concept allows.
+- Prefer precise policy boundaries over after-the-fact penalty patches. If a parameter should only choose strength or filtering, do not let it control direction, state generation, or unrelated behavior.
+- Priors are useful when they encode the intended boundary, but they are not the goal. The goal is to make the learnable degree of freedom isomorphic to the concept being learned.
+- For RL/HRL modules, reward should measure marginal improvement over a baseline whenever possible, not absolute task reward alone. Ask what the learned parameter improves compared with doing nothing or using the supervised/default branch.
+- Add explicit harmful-change protection when a learned parameter can degrade a trusted baseline. If a parameter makes the result worse than the baseline under the target metric, that should be visible to the objective or diagnostics.
+- When combining supervised and RL signals, use supervised learning to anchor target-aligned structure and use RL only for the residual uncertainty that supervision cannot reliably resolve.
+- If a reward can be optimized by violating the intended role of a parameter, the problem is usually a boundary-design bug, not a tuning problem.
 
 ## Coding Expectations
 

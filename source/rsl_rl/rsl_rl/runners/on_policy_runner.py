@@ -971,17 +971,17 @@ class OnPolicyRunner:
 
         objective = str(getattr(self.alg, "frontres_training_objective", "")).lower()
         task_conf_dim = int(getattr(getattr(self.alg, "policy", None), "task_conf_dim", 2))
-        scalar_tau_hybrid = objective == "hsl_hybrid" and task_conf_dim == 1
+        scalar_rejoin_hybrid = objective == "hsl_hybrid" and task_conf_dim == 1
 
         target_full = torch.zeros(self.env.num_envs, 6, device=device, dtype=dtype)
         weight_full = torch.zeros(self.env.num_envs, 1, device=device, dtype=dtype)
         harm_weight_full = torch.zeros(self.env.num_envs, 1, device=device, dtype=dtype)
         max_weight = float(self.cfg.get("frontres_hsl_max_sample_weight", 4.0))
-        if scalar_tau_hybrid:
+        if scalar_rejoin_hybrid:
             # HSL owns the repair direction.  The continuous sample classifier
             # trains the proposal on repairable samples and the harmful loss
-            # suppresses unsafe proposals.  The scalar tau is left to PPO as a
-            # temporal mix coefficient, so the label is not pre-shrunk here.
+            # suppresses unsafe proposals.  The scalar rho_pos is left to PPO
+            # as a position rejoin rate, so the label is not pre-shrunk here.
             target_full[:n] = label
             weight_full[:n, 0] = repair_w.clamp(max=max_weight) * valid_rollout
             harm_weight_full[:n, 0] = noop_w.clamp(max=max_weight) * valid_rollout
@@ -1356,7 +1356,7 @@ class OnPolicyRunner:
             flush=True,
         )
         if _is_frontres and critic_warmup_iters > 0:
-            print(f"[Runner] Critic warmup (fixed DR scale, Actor active): {critic_warmup_iters} iters")
+            print(f"[Runner] Critic warmup (fixed DR scale, Actor may be held): {critic_warmup_iters} iters")
 
         def _frontres_ppo_actor_weight_for_iter(iteration: int) -> float:
             """Linear supervised-to-PPO takeover schedule for the current iteration."""
@@ -2424,9 +2424,13 @@ class OnPolicyRunner:
                 _sup_dr_start = float(self.cfg.get("frontres_supervised_dr_scale_start", _dr_scale_init))
                 _sup_dr_end = float(self.cfg.get("frontres_supervised_dr_scale_end", _sup_dr_start))
                 _sup_dr_ramp = max(1, int(self.cfg.get("frontres_supervised_dr_ramp_iters", 500)))
-                # Use absolute iteration so a full-resume keeps the supervised
-                # perturbation curriculum aligned with the LR schedule.
-                _sup_dr_frac = min(1.0, max(0.0, it / float(_sup_dr_ramp)))
+                _sup_dr_delay = max(0, int(self.cfg.get("frontres_supervised_dr_delay_iters", 0)))
+                # Use absolute iteration, with an optional post-warmup delay, so
+                # a full-resume keeps the supervised perturbation curriculum
+                # aligned while still letting Critic/Actor settle before harder
+                # disturbances arrive.
+                _sup_dr_phase = max(0, it - _sup_dr_delay)
+                _sup_dr_frac = min(1.0, max(0.0, _sup_dr_phase / float(_sup_dr_ramp)))
                 _dr_scale = _sup_dr_start + (_sup_dr_end - _sup_dr_start) * _sup_dr_frac
                 _dr_scale = max(_dr_min, min(_dr_max, _dr_scale))
                 self._dr_scale = _dr_scale
@@ -2699,18 +2703,22 @@ class OnPolicyRunner:
                             _zeros_gmt = torch.zeros(N_base + N_clean, self.alg.transition.actions.shape[-1],
                                                      device=self.device)
                             self.alg.transition.actions[N_train:] = _zeros_gmt
-                            _mean_gmt = self.alg.policy.action_mean[N_train:].clone()
-                            _std_gmt  = self.alg.policy.action_std[N_train:]
-                            _logp_zeros = torch.distributions.Normal(_mean_gmt, _std_gmt) \
-                                              .log_prob(_zeros_gmt).sum(dim=-1)
-                            # TanhNormal Jacobian correction for zero action:
-                            # bounded=0 → raw=atanh(0)=0, Jacobian = Σlog(max_d)
-                            # so TanhNormal.log_prob(0) = Normal.log_prob(0) - Σlog(max_d)
-                            # This ensures IS ratio = 1 for GMT envs (zero correction taken).
-                            if _is_task_space_mode:
-                                _logp_zeros = _logp_zeros - (
-                                    3 * math.log(self.alg.policy.max_delta_pos)
-                                    + 3 * math.log(self.alg.policy.max_delta_rpy))
+                            if hasattr(self.alg, "_get_actor_log_prob"):
+                                _logp_all = self.alg._get_actor_log_prob(self.alg.transition.actions)
+                                _logp_zeros = _logp_all[N_train:]
+                            else:
+                                _mean_gmt = self.alg.policy.action_mean[N_train:].clone()
+                                _std_gmt  = self.alg.policy.action_std[N_train:]
+                                _logp_zeros = torch.distributions.Normal(_mean_gmt, _std_gmt) \
+                                                  .log_prob(_zeros_gmt).sum(dim=-1)
+                                # TanhNormal Jacobian correction for zero action:
+                                # bounded=0 → raw=atanh(0)=0, Jacobian = Σlog(max_d)
+                                # so TanhNormal.log_prob(0) = Normal.log_prob(0) - Σlog(max_d)
+                                # This ensures IS ratio = 1 for GMT envs (zero correction taken).
+                                if _is_task_space_mode:
+                                    _logp_zeros = _logp_zeros - (
+                                        3 * math.log(self.alg.policy.max_delta_pos)
+                                        + 3 * math.log(self.alg.policy.max_delta_rpy))
                             self.alg.transition.actions_log_prob[N_train:] = _logp_zeros
                             _frontres_mask = torch.zeros(self.env.num_envs, 1, device=self.device)
                             _frontres_mask[:N_train] = 1.0
@@ -2765,14 +2773,18 @@ class OnPolicyRunner:
                             # the IS ratio used in PPO is correct (zero was the actual env action).
                             _zeros_gmt = torch.zeros_like(actions[N_train:])  # [N_base, A]
                             self.alg.transition.actions[N_train:] = _zeros_gmt
-                            _mean_gmt   = self.alg.policy.action_mean[N_train:].clone()
-                            _std_gmt    = self.alg.policy.action_std[N_train:]  # [N_base, A]
-                            _logp_zeros = torch.distributions.Normal(_mean_gmt, _std_gmt) \
-                                              .log_prob(_zeros_gmt).sum(dim=-1)
-                            if _is_task_space_mode:
-                                _logp_zeros = _logp_zeros - (
-                                    3 * math.log(self.alg.policy.max_delta_pos)
-                                    + 3 * math.log(self.alg.policy.max_delta_rpy))
+                            if hasattr(self.alg, "_get_actor_log_prob"):
+                                _logp_all = self.alg._get_actor_log_prob(self.alg.transition.actions)
+                                _logp_zeros = _logp_all[N_train:]
+                            else:
+                                _mean_gmt   = self.alg.policy.action_mean[N_train:].clone()
+                                _std_gmt    = self.alg.policy.action_std[N_train:]  # [N_base, A]
+                                _logp_zeros = torch.distributions.Normal(_mean_gmt, _std_gmt) \
+                                                  .log_prob(_zeros_gmt).sum(dim=-1)
+                                if _is_task_space_mode:
+                                    _logp_zeros = _logp_zeros - (
+                                        3 * math.log(self.alg.policy.max_delta_pos)
+                                        + 3 * math.log(self.alg.policy.max_delta_rpy))
                             self.alg.transition.actions_log_prob[N_train:] = _logp_zeros
                             # Mark which envs are FrontRES (1) vs GMT baseline (0) for critic masking.
                             _frontres_mask = torch.zeros(self.env.num_envs, 1, device=self.device)
@@ -4022,7 +4034,10 @@ class OnPolicyRunner:
             "frontres_alpha_active_frac",
             "frontres_tau_mean",
             "frontres_tau_active_frac",
+            "frontres_rho_pos_mean",
+            "frontres_rho_pos_active_frac",
             "frontres_write_ratio",
+            "frontres_proposal_ratio",
             "frontres_axis_leakage",
         }      # diagnostics, not losses
         _to_curriculum = {"lambda_supervised", "ppo_actor_weight"}  # scheduler state, not a loss
@@ -4292,10 +4307,10 @@ class OnPolicyRunner:
                         )
                     if f"{getattr(self.alg, 'frontres_training_objective', '')}".lower() in ("basis_restore", "hsl_hybrid"):
                         if int(getattr(getattr(self.alg, "policy", None), "task_conf_dim", 2)) == 1:
-                            log_string += f"""{'tau mix/active:':>{pad}} """
+                            log_string += f"""{'pos rejoin/active:':>{pad}} """
                             log_string += (
-                                f"{_loss_dict.get('frontres_tau_mean', 0.0):.3f} / "
-                                f"{_loss_dict.get('frontres_tau_active_frac', 0.0):.3f}\n"
+                                f"{_loss_dict.get('frontres_rho_pos_mean', _loss_dict.get('frontres_tau_mean', 0.0)):.3f} / "
+                                f"{_loss_dict.get('frontres_rho_pos_active_frac', _loss_dict.get('frontres_tau_active_frac', 0.0)):.3f}\n"
                             )
                         else:
                             log_string += f"""{'alpha mean/active:':>{pad}} """
@@ -4303,9 +4318,14 @@ class OnPolicyRunner:
                                 f"{_loss_dict.get('frontres_alpha_mean', 0.0):.3f} / "
                                 f"{_loss_dict.get('frontres_alpha_active_frac', 0.0):.3f}\n"
                             )
-                        log_string += f"""{'write ratio/leakage:':>{pad}} """
+                        ratio_label = "proposal ratio/leakage"
+                        ratio_value = _loss_dict.get(
+                            "frontres_proposal_ratio",
+                            _loss_dict.get("frontres_write_ratio", 0.0),
+                        )
+                        log_string += f"""{ratio_label + ':':>{pad}} """
                         log_string += (
-                            f"{_loss_dict.get('frontres_write_ratio', 0.0):.3f} / "
+                            f"{ratio_value:.3f} / "
                             f"{_loss_dict.get('frontres_axis_leakage', 0.0):.3f}\n"
                         )
                         log_string += f"""{'L_sparse/miss/csmooth:':>{pad}} """
@@ -4339,7 +4359,7 @@ class OnPolicyRunner:
                     log_string += f"""{'learning rate:':>{pad}} {getattr(self.alg, 'learning_rate', 0.0):.2e}\n"""
                     _objective_name = f"{getattr(self.alg, 'frontres_training_objective', '')}".lower()
                     if _objective_name == "hsl_hybrid":
-                        _objective_desc = "HSL direction + PPO temporal mix"
+                        _objective_desc = "HSL attitude + PPO position rejoin"
                     elif _objective_name == "basis_restore":
                         _objective_desc = "basis supervised only"
                     else:
@@ -5080,14 +5100,14 @@ class OnPolicyRunner:
             rpy_corr = task_corr[:n_train, 3:6].clone()
             objective = str(getattr(self.alg, "frontres_training_objective", "")).lower()
             task_conf_dim = int(getattr(policy, "task_conf_dim", 2))
-            tau_mix = None
+            rho_pos = None
             if task_corr.shape[-1] >= 12 and task_conf_dim == 6:
                 c_pos = task_corr[:n_train, 6:9].clone()
                 c_rpy = task_corr[:n_train, 9:12].clone()
             elif task_corr.shape[-1] >= 7 and task_conf_dim == 1:
-                tau_mix = task_corr[:n_train, 6:7].clone().clamp(0.0, 1.0)
-                c_pos = torch.ones_like(tau_mix)
-                c_rpy = torch.ones_like(tau_mix)
+                rho_pos = task_corr[:n_train, 6:7].clone().clamp(0.0, 1.0)
+                c_pos = torch.ones_like(rho_pos)
+                c_rpy = torch.ones_like(rho_pos)
             else:
                 c_pos = task_corr[:n_train, 6:7].clone()
                 c_rpy = task_corr[:n_train, 7:8].clone()
@@ -5110,14 +5130,19 @@ class OnPolicyRunner:
             pos_corr = pos_corr * c_pos
             rpy_corr = rpy_corr * c_rpy
 
-            if objective == "hsl_hybrid" and tau_mix is not None:
+            if objective == "hsl_hybrid" and rho_pos is not None:
                 cont = self._frontres_temporal_continuity_correction(
                     cmd_term, n_train, pos_corr, rpy_corr)
                 if cont is not None:
-                    cont_pos, cont_rpy, valid = cont
-                    mix = tau_mix * valid.view(-1, 1).to(tau_mix.dtype)
-                    pos_corr = (1.0 - mix) * pos_corr + mix * cont_pos
-                    rpy_corr = (1.0 - mix) * rpy_corr + mix * cont_rpy
+                    cont_pos, _cont_rpy, valid = cont
+                    valid_mask = valid.view(-1, 1)
+                    rho = rho_pos.to(pos_corr.dtype)
+                    # PPO owns only the position rejoin rate.  rho=1 writes the
+                    # HSL clean-oriented position repair; rho=0 follows the
+                    # previous refined reference for temporal continuity.  The
+                    # attitude correction remains the HSL proposal.
+                    mixed_pos = (1.0 - rho) * cont_pos + rho * pos_corr
+                    pos_corr = torch.where(valid_mask, mixed_pos, pos_corr)
 
             cmd_term._frontres_pos_correction[:n_train].copy_(pos_corr)
             cmd_term._frontres_quat_correction[:n_train].copy_(_rotvec_to_quat_wxyz(rpy_corr))
@@ -5159,12 +5184,11 @@ class OnPolicyRunner:
         hsl_pos_corr: torch.Tensor,
         hsl_rpy_corr: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """Build the correction that follows the previous refined frame.
+        """Build the continuity candidate from the previous refined frame.
 
-        HSL gives a geometric repair for the current raw frame.  The scalar
-        PPO output is a temporal mix coefficient between that HSL repair and a
-        continuity candidate obtained by advancing the previous refined frame
-        with the raw reference motion increment.
+        HSL gives the clean-oriented repair for the current raw frame.  In the
+        active hsl_hybrid design PPO only chooses a scalar position rejoin rate
+        between this candidate and the HSL position repair; HSL owns attitude.
         """
         if n <= 0:
             return None
@@ -5313,6 +5337,17 @@ class OnPolicyRunner:
         raw_q = cmd_term.anchor_quat_w_raw[:n].to(self.device)
         clean_q = cmd_term.anchor_quat_w_original[:n].to(self.device)
         written_q = cmd_term._frontres_quat_correction[:n].to(self.device)
+        have_pos_debug = (
+            hasattr(cmd_term, "anchor_pos_w_raw")
+            and hasattr(cmd_term, "anchor_pos_w_original")
+            and hasattr(cmd_term, "_frontres_pos_correction")
+        )
+        if have_pos_debug:
+            raw_p = cmd_term.anchor_pos_w_raw[:n].to(self.device)
+            clean_p = cmd_term.anchor_pos_w_original[:n].to(self.device)
+            written_p = cmd_term._frontres_pos_correction[:n].to(self.device)
+            target_pos = supervised_target[:n, :3].detach()
+            pred_pos = actions[:n, :3].detach()
         target = supervised_target[:n, 3:6].detach()
         pred = actions[:n, 3:6].detach()
         task_conf_dim = int(getattr(self.alg.policy, "task_conf_dim", 2))
@@ -5324,13 +5359,13 @@ class OnPolicyRunner:
             conf_raw = actions[:n, 7:8].detach()
         else:
             conf_raw = torch.ones(n, 1, device=self.device)
-        scalar_tau_hybrid = objective == "hsl_hybrid" and task_conf_dim == 1
-        if objective == "supervised_restore" or scalar_tau_hybrid:
+        scalar_rejoin_hybrid = objective == "hsl_hybrid" and task_conf_dim == 1
+        if objective == "supervised_restore" or scalar_rejoin_hybrid:
             conf_eff = torch.ones_like(conf_raw)
         else:
             conf_eff = conf_raw
         written = _quat_to_rotvec_wxyz(written_q)[:, :3]
-        applied = written if scalar_tau_hybrid else pred * conf_eff
+        applied = written if scalar_rejoin_hybrid else pred * conf_eff
 
         clean_from_raw = _quat_to_rotvec_wxyz(quat_mul(quat_inv(raw_q), clean_q))[:, :3]
         corrected_q = quat_mul(raw_q, written_q)
@@ -5355,6 +5390,16 @@ class OnPolicyRunner:
         corrected_err_norm = corrected_err[:, :2].norm(dim=-1)
         alt_err_norm = alt_corrected_err[:, :2].norm(dim=-1)
         restore_gain = noisy_err_norm - corrected_err_norm
+        if have_pos_debug:
+            raw_pos_err = (clean_p - raw_p).norm(dim=-1)
+            written_pos_err = (clean_p - (raw_p + written_p)).norm(dim=-1)
+            pos_valid = target_pos.norm(dim=-1) > 1e-4
+            if pos_valid.any():
+                pos_cos_pred = _safe_cos(pred_pos[pos_valid], target_pos[pos_valid]).mean()
+                pos_cos_written = _safe_cos(written_p[pos_valid], target_pos[pos_valid]).mean()
+            else:
+                pos_cos_pred = torch.tensor(0.0, device=self.device)
+                pos_cos_written = torch.tensor(0.0, device=self.device)
         max_delta_rpy = float(getattr(getattr(self.alg, "policy", None), "max_delta_rpy", 0.4))
         sat_frac = (pred[:, :2].abs() > 0.95 * max_delta_rpy).float().mean()
 
@@ -5371,8 +5416,8 @@ class OnPolicyRunner:
 
         sample_idx = int(torch.argmax(noisy_err_norm).item())
         gate_desc = (
-            f"tau_mix={float(conf_raw.mean()):.3f}"
-            if scalar_tau_hybrid
+            f"rho_pos={float(conf_raw.mean()):.3f}"
+            if scalar_rejoin_hybrid
             else f"conf_eff={float(conf_eff.mean()):.3f} conf_raw={float(conf_raw.mean()):.3f}"
         )
         print(
@@ -5393,6 +5438,15 @@ class OnPolicyRunner:
             f"gain={float(restore_gain.mean()):+.5f}",
             flush=True,
         )
+        if have_pos_debug:
+            print(
+                "[FrontRES restore debug] position "
+                f"|raw-clean|={float(raw_pos_err.mean()):.5f} "
+                f"|written-clean|={float(written_pos_err.mean()):.5f} "
+                f"cos(pred,target)={float(pos_cos_pred):+.4f} "
+                f"cos(written,target)={float(pos_cos_written):+.4f}",
+                flush=True,
+            )
         print(
             "[FrontRES restore debug] sample vectors "
             f"clean_from_raw={_vec(clean_from_raw, sample_idx)} "

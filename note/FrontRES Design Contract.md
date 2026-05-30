@@ -22,30 +22,56 @@ approach the clean rollout closely enough for demo-quality behavior.
   Noisy, and Repaired rollout information to construct continuous sample
   weights, harmful-repair penalties, and rollout-aware supervised labels.
 - **HRL / PPO** does not own the repair direction.  In the current hybrid
-  design, PPO owns only the scalar temporal mix variable \(\tau_t\).
-- **Temporal mix** chooses between the HSL repair and a continuity-preserving
-  repair candidate:
+  design, PPO owns only the scalar position rejoin rate \(\rho^p_t\).
+- **Position rejoin** chooses between the HSL position repair and a
+  continuity-preserving position candidate:
   \[
-  \Delta g^{\mathrm{write}}_t =
-  (1-\tau_t)\Delta g^{\mathrm{HSL}}_t
-  + \tau_t\Delta g^{\mathrm{cont}}_t.
+  \Delta p^{\mathrm{write}}_t =
+  (1-\rho^p_t)\Delta p^{\mathrm{cont}}_t
+  + \rho^p_t\Delta p^{\mathrm{HSL}}_t.
   \]
-- **Continuity candidate** advances the previous refined reference using the
-  raw reference frame-to-frame motion.  It injects the prior that repaired
-  references should remain dynamically continuous over time.
+- **Attitude repair** is written directly from HSL:
+  \[
+  \Delta rpy^{\mathrm{write}}_t=\Delta rpy^{\mathrm{HSL}}_t.
+  \]
+- **Continuity candidate** advances the previous refined reference position
+  using the raw reference frame-to-frame motion.  It injects the prior that
+  repaired root positions should remain dynamically continuous over time.
 - **Action Cone** owns output feasibility constraints, including active
   dimensions, per-axis bounds, upward-\(z\) constraints, and jump/contact
   restrictions.
 - **Diagnostics** must describe the value actually written into GMT.  They must
   not report old conceptual variables as if they were the deployed correction.
 
+## Current Output Interface
+
+The active `hsl_hybrid` branch uses a seven-dimensional task-space output:
+
+\[
+a^{\mathrm{FEMR}}_t =
+(\Delta x,\Delta y,\Delta z,\Delta r,\Delta p,\Delta yaw,\rho^p_t).
+\]
+
+The first six dimensions are the HSL repair proposal.  The last dimension is
+the PPO-owned position rejoin rate.  It is not a confidence score and it is not
+an attitude gate.
+
+The old `conf_pos` and `conf_rpy` interface is kept only for legacy objectives
+and ablations.  It is not part of the current hybrid design because a pair of
+confidence gates can shrink the clean-oriented repair but cannot express the
+specific uncertainty we identified: how much root position should rejoin the
+clean geometry versus preserve frame-to-frame dynamic continuity.
+
 ## Forbidden Freedoms
 
 - Do not let PPO update the \(\Delta SE(3)\) proposal direction in
-  `hsl_hybrid`.  PPO must be restricted to the scalar tau output.
-- Do not reinterpret \(\tau_t\) as a confidence score or amplitude gate in the
-  current `hsl_hybrid` design.
-- Do not pre-shrink the HSL label and then shrink it again through tau.
+  `hsl_hybrid`.  PPO must be restricted to the scalar \(\rho^p_t\) output.
+- Do not reinterpret \(\rho^p_t\) as a confidence score, amplitude gate, or
+  attitude gate in the current `hsl_hybrid` design.
+- Do not pre-shrink the HSL label and then shrink it again through
+  \(\rho^p_t\).
+- Do not let PPO mix or overwrite \(\Delta rpy^{\mathrm{HSL}}_t\) in the
+  current position-rejoin design.
 - Do not let Safe/Broken/Harmful samples dominate the proposal direction loss.
 - Do not let temporal continuity cache survive an episode reset.
 - Do not remove old HRL/HSL branches unless explicitly requested.  They are
@@ -65,11 +91,28 @@ The current `hsl_hybrid` contract is:
 
 - Supervised/HSL loss trains \(\Delta g^{\mathrm{HSL}}_t\).
 - Harmful loss suppresses unsafe proposals.
-- PPO uses rollout advantage but its actor gradient is restricted to tau.
-- Runtime writes \(\Delta g^{\mathrm{write}}_t\), not
-  \(\tau_t\Delta g^{\mathrm{HSL}}_t\).
+- PPO uses rollout advantage but its actor gradient is restricted to
+  \(\rho^p_t\).
+- Runtime writes \((\Delta p^{\mathrm{write}}_t,\Delta rpy^{\mathrm{HSL}}_t)\),
+  not \(\rho^p_t\Delta g^{\mathrm{HSL}}_t\).
 - The first frame after reset has no valid temporal cache, so it falls back to
   HSL repair.
+
+The core conceptual split is:
+
+\[
+\text{HSL}:\quad \text{where should the corrupted root frame move?}
+\]
+
+\[
+\text{HRL/PPO}:\quad \text{how aggressively should root position rejoin that
+target under dynamic continuity?}
+\]
+
+This split is deliberately asymmetric.  Roll/pitch repair is usually the
+clean-oriented part that improves visual/demo quality.  Root position repair is
+where strong geometric correction most often creates dynamic discontinuities,
+so it receives the learned rejoin filter.
 
 ## Code Mapping
 
@@ -77,7 +120,7 @@ The current `hsl_hybrid` contract is:
   `source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_mosaic_cfg.py`
 - Runner rollout, label construction, temporal cache, action-cone writing:
   `source/rsl_rl/rsl_rl/runners/on_policy_runner.py`
-- PPO/supervised loss and tau-only PPO restriction:
+- PPO/supervised loss and rho-only PPO restriction:
   `source/rsl_rl/rsl_rl/algorithms/frontres_unified.py`
 - FrontRES actor output bounding:
   `source/rsl_rl/rsl_rl/modules/front_residual_actor_critic.py`
@@ -101,4 +144,3 @@ The current `hsl_hybrid` contract is:
 - Inspect whether old concepts remain in comments, log labels, or variable
   names in a way that can mislead future debugging.
 - Explicitly report whether the training command changes.
-

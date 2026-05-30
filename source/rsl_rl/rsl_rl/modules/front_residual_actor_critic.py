@@ -357,7 +357,7 @@ class FrontRESActorCritic(nn.Module):
         # ========== Build Front-End Residual Network ==========
 
         # Joint-space mode outputs [Δq, Δz]; task-space mode outputs
-        # [Δpos, Δrpy, trust/confidence/repair coefficients].
+        # [Δpos, Δrpy, scalar/gate/coefficient head].
         _frontres_input_dim = num_frontres_obs if num_frontres_obs > 0 else num_actor_obs
         self.residual_actor = self._build_residual_actor(
             input_dim=_frontres_input_dim,
@@ -367,9 +367,9 @@ class FrontRESActorCritic(nn.Module):
             last_layer_gain=residual_last_layer_gain)
         if num_task_corrections > 0:
             if self.task_conf_dim == 1:
-                coeff_desc = "tau_trust(1)"
+                coeff_desc = "rho_pos(1)"
             elif self.task_conf_dim == 2:
-                coeff_desc = "c_pos(1)+c_rpy(1)"
+                coeff_desc = "legacy c_pos(1)+c_rpy(1)"
             else:
                 coeff_desc = "alpha_pos(3)+alpha_rpy(3)"
             print(f"[FrontEndResidualActorCritic] FrontRES output: "

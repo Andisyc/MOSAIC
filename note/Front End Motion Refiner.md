@@ -5,7 +5,7 @@
 本工作研究一个放置在冻结 GMT tracker 前端的轻量 motion refiner。FEMR 不替代 GMT，而是在参考动作进入 GMT 之前输出 task-space residual correction：
 
 $$
-\Delta_\theta
+a^{\mathrm{FEMR}}_t
 =
 [
 \Delta x,
@@ -13,9 +13,12 @@ $$
 \Delta z,
 \Delta r,
 \Delta p,
-\Delta yaw
+\Delta yaw,
+\rho^p_t
 ].
 $$
+
+其中前六维是 HSL 学到的 root-level \(\Delta SE(3)\) 修复提案，最后一维 \(\rho^p_t\) 是 HRL/PPO 学到的 position rejoin rate。当前版本不再把最后两维解释为 `conf_pos` 和 `conf_rpy`；旧的 confidence gate 只保留为 legacy objective / ablation。
 
 目标是修复视频/视觉动作提取产生的 reference-frame artifacts，使被污染的动作序列重新接近 clean motion，并保持 GMT 可执行。
 
@@ -39,7 +42,7 @@ $$
 
 而不是重新训练一个新的 tracker。
 
-### 2. Task-Space Correction：从通用残差到可解释动作锥
+### 2. Task-Space Correction：从通用残差到动力学连续修复
 
 FEMR 使用 task-space correction，而不是直接输出 joint-space residual：
 
@@ -49,7 +52,7 @@ $$
 
 主要原因是 reference-frame artifacts 通常表现为 root position、root orientation、yaw、roll/pitch 等可解释扰动。
 
-当前 rp demo 分支只激活：
+早期 rp demo 分支只激活：
 
 $$
 M_{\mathrm{rp}}
@@ -57,7 +60,25 @@ M_{\mathrm{rp}}
 [0,0,0,1,1,0],
 $$
 
-即只允许 FEMR 修复 roll/pitch 方向误差。这样可以先验证单一扰动分支的极限，避免 xy、z、yaw 与接触动力学混在一起。
+即只允许 FEMR 修复 roll/pitch 方向误差。该设计验证了姿态修复的有效性，但在高强度扰动下暴露出一个关键问题：将 reference 几何上强行拉回 Clean，特别是 root position，可能破坏与前一帧的动力学连续性。
+
+因此当前 HSL+HRL 版本采用非对称分工：
+
+$$
+\Delta rpy^{\mathrm{write}}_t
+=
+\Delta rpy^{\mathrm{HSL}}_t,
+$$
+
+$$
+\Delta p^{\mathrm{write}}_t
+=
+(1-\rho^p_t)\Delta p^{\mathrm{cont}}_t
++
+\rho^p_t\Delta p^{\mathrm{HSL}}_t.
+$$
+
+HSL 负责回答“被污染的 root frame 应当往哪里修”，HRL/PPO 只负责回答“root position 应当以多大比例重新贴近 Clean 几何目标”。这样 PPO 不再直接改变修复方向，只学习动力学连续性与 Clean rejoin 之间的折中。
 
 ### 3. 三分支 Rollout：Clean / Noisy / FEMR
 
@@ -275,13 +296,13 @@ $$
 
 该项通过 action gate 过滤 no-op 噪声。只有 FEMR 确实输出了修正，并且让 executability 变差时，才认为是 harmful repair。
 
-### 10. 训练策略：监督学习为主，PPO 作为物理约束微调
+### 10. 训练策略：HSL 提供修复方向，HRL 过滤位置连续性
 
 训练分为三阶段：
 
-1. Supervised warmup：学习 clean anti-perturbation target。
-2. Actor takeover：逐步提高 PPO actor weight。
-3. PPO fine-tuning：在 supervised anchor 下用 intrinsic reward 微调。
+1. HSL warmup：学习 clean-oriented \(\Delta SE(3)\) 修复提案。
+2. Actor takeover：逐步提高 PPO 对 \(\rho^p_t\) 的控制权。
+3. PPO fine-tuning：在 HSL anchor 下学习 root position rejoin rate。
 
 总优化目标为：
 
@@ -299,12 +320,14 @@ $$
 
 这里 supervised loss 提供 clean restoration 方向，PPO reward 提供可执行性和物理约束。
 
+当前混合版本中，PPO 的 actor gradient 只允许进入 \(\rho^p_t\) 输出维度，不能更新 \(\Delta SE(3)\) proposal direction。这样保留 HSL 的 clean-restoration 上限，同时限制 HRL 的作用域，降低 reward hacking 风险。
+
 ### 11. 当前代码中的核心模块
 
 当前代码实际包含以下机制：
 
 1. FrontRES task-space actor。
-2. rp-only specialist mode。
+2. HSL \(\Delta SE(3)\) proposal + PPO \(\rho^p_t\) position rejoin。
 3. Clean / Noisy / FEMR / Oracle 分支。
 4. Clean restoration reward。
 5. Clean damage based repairability window。
@@ -313,7 +336,7 @@ $$
 8. Under-repair penalty。
 9. Harmful repair penalty。
 10. PPO actor sample weighting。
-11. Supervised anchor。
+11. Supervised anchor and rho-only PPO restriction。
 12. Checkpoint probe。
 13. TensorBoard / console diagnostics。
 

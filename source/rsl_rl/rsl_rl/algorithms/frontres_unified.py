@@ -249,8 +249,8 @@ class FrontRESUnified:
             print("  L = L_proposal + L_written + L_coeff  "
                   "(factorized per-axis repair coefficients; PPO/HRL branch kept but disabled)")
         elif self.frontres_training_objective == "hsl_hybrid":
-            print("  L = L_PPO(tau temporal mix) + λ_sup·L_HSL(proposal)  "
-                  "(PPO log-prob is restricted to tau; ΔSE proposal is supervised)")
+            print("  L = L_PPO(rho_pos rejoin) + λ_sup·L_HSL(proposal)  "
+                  "(PPO log-prob is restricted to rho_pos; ΔSE proposal is supervised)")
         else:
             print(f"  L = L_PPO + λ_sup({self.lambda_supervised:.2f})·L_supervised")
         print("=" * 80)
@@ -515,7 +515,7 @@ class FrontRESUnified:
                 self._warn_skip("non-finite loss", loss)
                 continue
 
-            if self._ppo_tau_only_mode() and ppo_weight > 0.0:
+            if self._ppo_rho_pos_only_mode() and ppo_weight > 0.0:
                 non_ppo_loss = loss - ppo_weight * surrogate_loss
                 non_ppo_loss.backward(retain_graph=True)
                 base_grads = {
@@ -523,7 +523,7 @@ class FrontRESUnified:
                     for p in self.policy.parameters()
                 }
                 (ppo_weight * surrogate_loss).backward()
-                self._keep_ppo_grad_on_tau_head_only(base_grads)
+                self._keep_ppo_grad_on_rho_pos_head_only(base_grads)
             else:
                 loss.backward()
             if self.is_multi_gpu:
@@ -585,16 +585,21 @@ class FrontRESUnified:
 
     def _ppo_selected_action_dims(self):
         """Return the action dimensions that PPO is allowed to update."""
-        if self._ppo_tau_only_mode():
+        if self._ppo_rho_pos_only_mode():
             return [6]
         return None
 
-    def _ppo_tau_only_mode(self) -> bool:
+    def _ppo_rho_pos_only_mode(self) -> bool:
+        """Current hsl_hybrid contract: PPO owns only scalar rho_pos."""
         return (
             str(self.frontres_training_objective).lower() == "hsl_hybrid"
             and getattr(self.policy, "num_task_corrections", 0) > 0
             and int(getattr(self.policy, "task_conf_dim", 2)) == 1
         )
+
+    def _ppo_tau_only_mode(self) -> bool:
+        """Backward-compatible alias for older checkpoints/scripts."""
+        return self._ppo_rho_pos_only_mode()
 
     def _get_actor_log_prob(self, actions):
         dims = self._ppo_selected_action_dims()
@@ -602,13 +607,13 @@ class FrontRESUnified:
             return self.policy.get_actions_log_prob_selected(actions, dims)
         return self.policy.get_actions_log_prob(actions)
 
-    def _keep_ppo_grad_on_tau_head_only(self, base_grads):
+    def _keep_ppo_grad_on_rho_pos_head_only(self, base_grads):
         """Remove PPO leakage into proposal direction and shared trunk.
 
-        The residual actor is a shared MLP.  Even a tau-only log-prob would
+        The residual actor is a shared MLP.  Even a rho_pos-only log-prob would
         normally backpropagate through shared hidden layers and move ΔSE(3)
         proposal directions.  This keeps the non-PPO gradients everywhere, and
-        adds the PPO gradient only to the final-layer row that emits tau.
+        adds the PPO gradient only to the final-layer row that emits rho_pos.
         """
         final_linear = None
         residual_actor = getattr(self.policy, "residual_actor", None)
@@ -638,6 +643,10 @@ class FrontRESUnified:
             else:
                 mask[6:7] = 1.0
             p.grad = base_tensor + ppo_grad * mask
+
+    def _keep_ppo_grad_on_tau_head_only(self, base_grads):
+        """Backward-compatible alias for the previous scalar-head name."""
+        return self._keep_ppo_grad_on_rho_pos_head_only(base_grads)
 
     def _compute_actor_grad_conflict(self, surrogate_loss, supervised_loss):
         params = [
@@ -784,7 +793,10 @@ class FrontRESUnified:
             "frontres_alpha_active_frac": 0.0,
             "frontres_tau_mean": 0.0,
             "frontres_tau_active_frac": 0.0,
+            "frontres_rho_pos_mean": 0.0,
+            "frontres_rho_pos_active_frac": 0.0,
             "frontres_write_ratio": 0.0,
+            "frontres_proposal_ratio": 0.0,
             "frontres_axis_leakage": 0.0,
             "frontres_supervised_weight": 0.0,
         }
@@ -843,9 +855,9 @@ class FrontRESUnified:
                 tau_value = torch.sigmoid(tau_logits)
                 coeff = tau_value.expand(-1, proposal.shape[-1])
                 scalar_trust = True
-                # Runtime uses tau as a temporal mix coefficient between the
-                # HSL proposal and a continuity candidate.  The supervised
-                # direction loss therefore trains the proposal itself; tau is
+                # Runtime uses the scalar head as rho_pos, a position-only
+                # rejoin rate between the temporal continuity candidate and the
+                # HSL position proposal.  HSL owns attitude; rho_pos is
                 # optimized only by PPO in hsl_hybrid mode.
                 pred = proposal
             elif coeff_dim == 6 and raw_pred.shape[-1] >= 12:
@@ -1036,12 +1048,16 @@ class FrontRESUnified:
                 sup_metrics["frontres_alpha_mean"] = coeff.mean().item()
                 sup_metrics["frontres_alpha_active_frac"] = (coeff > 0.5).float().mean().item()
                 if scalar_trust:
-                    tau = coeff[:, :1]
-                    sup_metrics["frontres_tau_mean"] = tau.mean().item()
-                    sup_metrics["frontres_tau_active_frac"] = (tau > 0.5).float().mean().item()
+                    rho_pos = coeff[:, :1]
+                    sup_metrics["frontres_rho_pos_mean"] = rho_pos.mean().item()
+                    sup_metrics["frontres_rho_pos_active_frac"] = (rho_pos > 0.5).float().mean().item()
+                    # Legacy aliases kept for old TensorBoard dashboards.
+                    sup_metrics["frontres_tau_mean"] = sup_metrics["frontres_rho_pos_mean"]
+                    sup_metrics["frontres_tau_active_frac"] = sup_metrics["frontres_rho_pos_active_frac"]
                 pred_norm_all = written_pred.norm(dim=-1)
                 target_norm_all = target_detached.norm(dim=-1).clamp(min=1e-6)
                 sup_metrics["frontres_write_ratio"] = (pred_norm_all / target_norm_all).mean().item()
+                sup_metrics["frontres_proposal_ratio"] = sup_metrics["frontres_write_ratio"]
                 inactive = (target_detached.abs() <= 1e-4).to(pred.dtype)
                 leakage_num = (written_pred.abs() * inactive).sum(dim=-1)
                 leakage_den = written_pred.abs().sum(dim=-1).clamp(min=1e-6)
