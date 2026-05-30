@@ -968,17 +968,28 @@ class OnPolicyRunner:
         harm_scale = float(self.cfg.get("frontres_hsl_harm_noop_weight", 2.0))
         noop_w = safe_scale * safe_w + broken_scale * broken_w + harm_scale * harm_w
         denom = (repair_w + noop_w).clamp(min=1e-6)
-        mixed_label = label * (repair_w / denom).unsqueeze(-1)
+
+        objective = str(getattr(self.alg, "frontres_training_objective", "")).lower()
+        task_conf_dim = int(getattr(getattr(self.alg, "policy", None), "task_conf_dim", 2))
+        scalar_tau_hybrid = objective == "hsl_hybrid" and task_conf_dim == 1
 
         target_full = torch.zeros(self.env.num_envs, 6, device=device, dtype=dtype)
         weight_full = torch.zeros(self.env.num_envs, 1, device=device, dtype=dtype)
         harm_weight_full = torch.zeros(self.env.num_envs, 1, device=device, dtype=dtype)
-        target_full[:n] = mixed_label
-        weight_full[:n, 0] = (
-            denom.clamp(max=float(self.cfg.get("frontres_hsl_max_sample_weight", 4.0)))
-            * valid_rollout
-        )
-        harm_weight_full[:n, 0] = harm_w * valid_rollout
+        max_weight = float(self.cfg.get("frontres_hsl_max_sample_weight", 4.0))
+        if scalar_tau_hybrid:
+            # HSL owns the repair direction.  The continuous sample classifier
+            # trains the proposal on repairable samples and the harmful loss
+            # suppresses unsafe proposals.  The scalar tau is left to PPO as a
+            # temporal mix coefficient, so the label is not pre-shrunk here.
+            target_full[:n] = label
+            weight_full[:n, 0] = repair_w.clamp(max=max_weight) * valid_rollout
+            harm_weight_full[:n, 0] = noop_w.clamp(max=max_weight) * valid_rollout
+        else:
+            mixed_label = label * (repair_w / denom).unsqueeze(-1)
+            target_full[:n] = mixed_label
+            weight_full[:n, 0] = denom.clamp(max=max_weight) * valid_rollout
+            harm_weight_full[:n, 0] = harm_w * valid_rollout
         self.alg.transition.supervised_target = target_full
         self.alg.transition.supervised_weight = weight_full
         self.alg.transition.supervised_harm_weight = harm_weight_full
@@ -2833,6 +2844,8 @@ class OnPolicyRunner:
 
                     # Move to device
                     rewards, dones = rewards.to(self.device), dones.to(self.device)
+                    if _is_frontres and _is_task_space_mode:
+                        self._frontres_invalidate_temporal_reference_cache(dones)
 
                     if (
                         _is_frontres
@@ -4272,10 +4285,14 @@ class OnPolicyRunner:
                             f"{_loss_dict.get('supervised_l_over', 0.0):.6f} / "
                             f"{_loss_dict.get('supervised_l_smooth', 0.0):.6f}\n"
                         )
-                        log_string += f"""{'L_harm:':>{pad}} {_loss_dict.get('supervised_l_harm', 0.0):.6f}\n"""
+                        log_string += f"""{'L_harm/conf:':>{pad}} """
+                        log_string += (
+                            f"{_loss_dict.get('supervised_l_harm', 0.0):.6f} / "
+                            f"{_loss_dict.get('supervised_l_conf', 0.0):.6f}\n"
+                        )
                     if f"{getattr(self.alg, 'frontres_training_objective', '')}".lower() in ("basis_restore", "hsl_hybrid"):
                         if int(getattr(getattr(self.alg, "policy", None), "task_conf_dim", 2)) == 1:
-                            log_string += f"""{'tau mean/active:':>{pad}} """
+                            log_string += f"""{'tau mix/active:':>{pad}} """
                             log_string += (
                                 f"{_loss_dict.get('frontres_tau_mean', 0.0):.3f} / "
                                 f"{_loss_dict.get('frontres_tau_active_frac', 0.0):.3f}\n"
@@ -4320,7 +4337,14 @@ class OnPolicyRunner:
                     if _paw is not None:
                         log_string += f"""{'PPO actor weight:':>{pad}} {_paw:.3f}\n"""
                     log_string += f"""{'learning rate:':>{pad}} {getattr(self.alg, 'learning_rate', 0.0):.2e}\n"""
-                    log_string += f"""{'objective:':>{pad}} supervised only\n"""
+                    _objective_name = f"{getattr(self.alg, 'frontres_training_objective', '')}".lower()
+                    if _objective_name == "hsl_hybrid":
+                        _objective_desc = "HSL direction + PPO temporal mix"
+                    elif _objective_name == "basis_restore":
+                        _objective_desc = "basis supervised only"
+                    else:
+                        _objective_desc = "supervised only"
+                    log_string += f"""{'objective:':>{pad}} {_objective_desc}\n"""
 
                 else:
                     log_string += f"""\n{'-' * 12} Main Reward {'-' * 12}\n"""
@@ -5056,13 +5080,14 @@ class OnPolicyRunner:
             rpy_corr = task_corr[:n_train, 3:6].clone()
             objective = str(getattr(self.alg, "frontres_training_objective", "")).lower()
             task_conf_dim = int(getattr(policy, "task_conf_dim", 2))
+            tau_mix = None
             if task_corr.shape[-1] >= 12 and task_conf_dim == 6:
                 c_pos = task_corr[:n_train, 6:9].clone()
                 c_rpy = task_corr[:n_train, 9:12].clone()
             elif task_corr.shape[-1] >= 7 and task_conf_dim == 1:
-                tau = task_corr[:n_train, 6:7].clone()
-                c_pos = tau
-                c_rpy = tau
+                tau_mix = task_corr[:n_train, 6:7].clone().clamp(0.0, 1.0)
+                c_pos = torch.ones_like(tau_mix)
+                c_rpy = torch.ones_like(tau_mix)
             else:
                 c_pos = task_corr[:n_train, 6:7].clone()
                 c_rpy = task_corr[:n_train, 7:8].clone()
@@ -5085,13 +5110,162 @@ class OnPolicyRunner:
             pos_corr = pos_corr * c_pos
             rpy_corr = rpy_corr * c_rpy
 
+            if objective == "hsl_hybrid" and tau_mix is not None:
+                cont = self._frontres_temporal_continuity_correction(
+                    cmd_term, n_train, pos_corr, rpy_corr)
+                if cont is not None:
+                    cont_pos, cont_rpy, valid = cont
+                    mix = tau_mix * valid.view(-1, 1).to(tau_mix.dtype)
+                    pos_corr = (1.0 - mix) * pos_corr + mix * cont_pos
+                    rpy_corr = (1.0 - mix) * rpy_corr + mix * cont_rpy
+
             cmd_term._frontres_pos_correction[:n_train].copy_(pos_corr)
             cmd_term._frontres_quat_correction[:n_train].copy_(_rotvec_to_quat_wxyz(rpy_corr))
+            self._frontres_update_temporal_reference_cache(cmd_term, n_train)
             if n_train < self.env.num_envs:
                 cmd_term._frontres_pos_correction[n_train:].zero_()
                 cmd_term._frontres_quat_correction[n_train:].zero_()
                 cmd_term._frontres_quat_correction[n_train:, 0] = 1.0
         return task_corr
+
+    def _frontres_raw_anchor_pose(self, cmd_term, n: int, device: torch.device, dtype: torch.dtype):
+        """Return raw reference pose before FrontRES correction."""
+        if hasattr(cmd_term, "anchor_pos_w_raw"):
+            raw_pos = cmd_term.anchor_pos_w_raw[:n].to(device=device, dtype=dtype)
+        elif hasattr(cmd_term, "anchor_pos_w"):
+            raw_pos = (
+                cmd_term.anchor_pos_w[:n].to(device=device, dtype=dtype)
+                - cmd_term._frontres_pos_correction[:n].to(device=device, dtype=dtype)
+            )
+        else:
+            return None
+        if hasattr(cmd_term, "anchor_quat_w_raw"):
+            raw_quat = cmd_term.anchor_quat_w_raw[:n].to(device=device, dtype=dtype)
+        elif hasattr(cmd_term, "anchor_quat_w"):
+            written_q = cmd_term._frontres_quat_correction[:n].to(device=device, dtype=dtype)
+            raw_quat = quat_mul(
+                cmd_term.anchor_quat_w[:n].to(device=device, dtype=dtype),
+                quat_inv(written_q),
+            )
+        else:
+            return None
+        raw_quat = raw_quat / raw_quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        return raw_pos, raw_quat
+
+    def _frontres_temporal_continuity_correction(
+        self,
+        cmd_term,
+        n: int,
+        hsl_pos_corr: torch.Tensor,
+        hsl_rpy_corr: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Build the correction that follows the previous refined frame.
+
+        HSL gives a geometric repair for the current raw frame.  The scalar
+        PPO output is a temporal mix coefficient between that HSL repair and a
+        continuity candidate obtained by advancing the previous refined frame
+        with the raw reference motion increment.
+        """
+        if n <= 0:
+            return None
+        pose = self._frontres_raw_anchor_pose(cmd_term, n, hsl_pos_corr.device, hsl_pos_corr.dtype)
+        if pose is None:
+            return None
+        raw_pos, raw_quat = pose
+
+        cache = getattr(self, "_frontres_temporal_ref_cache", None)
+        if cache is None:
+            return None
+        prev_raw_pos = cache.get("raw_pos")
+        prev_raw_quat = cache.get("raw_quat")
+        prev_ref_pos = cache.get("refined_pos")
+        prev_ref_quat = cache.get("refined_quat")
+        prev_valid = cache.get("valid")
+        if (
+            prev_raw_pos is None
+            or prev_raw_quat is None
+            or prev_ref_pos is None
+            or prev_ref_quat is None
+            or prev_valid is None
+        ):
+            return None
+        if prev_raw_pos.shape[0] < n or prev_ref_pos.shape[0] < n:
+            return None
+
+        prev_raw_pos = prev_raw_pos[:n].to(device=raw_pos.device, dtype=raw_pos.dtype)
+        prev_ref_pos = prev_ref_pos[:n].to(device=raw_pos.device, dtype=raw_pos.dtype)
+        prev_raw_quat = prev_raw_quat[:n].to(device=raw_pos.device, dtype=raw_pos.dtype)
+        prev_ref_quat = prev_ref_quat[:n].to(device=raw_pos.device, dtype=raw_pos.dtype)
+        valid = prev_valid[:n].to(device=raw_pos.device).bool()
+
+        raw_delta_pos = raw_pos - prev_raw_pos
+        cont_ref_pos = prev_ref_pos + raw_delta_pos
+        cont_pos_corr = cont_ref_pos - raw_pos
+
+        raw_delta_quat = quat_mul(quat_inv(prev_raw_quat), raw_quat)
+        cont_ref_quat = quat_mul(prev_ref_quat, raw_delta_quat)
+        cont_corr_quat = quat_mul(quat_inv(raw_quat), cont_ref_quat)
+        cont_rpy_corr = _quat_to_rotvec_wxyz(cont_corr_quat)
+
+        max_delta_pos = float(getattr(getattr(self.alg, "policy", None), "max_delta_pos", 0.3))
+        max_delta_rpy = float(getattr(getattr(self.alg, "policy", None), "max_delta_rpy", 0.1))
+        cont_pos_corr = cont_pos_corr.clamp(-max_delta_pos, max_delta_pos)
+        cont_rpy_corr = cont_rpy_corr.clamp(-max_delta_rpy, max_delta_rpy)
+
+        z_upper = torch.zeros(n, device=raw_pos.device, dtype=raw_pos.dtype)
+        if hasattr(cmd_term, "jump_degree") and hasattr(cmd_term, "anchor_penetration_depth"):
+            jump_degree = cmd_term.jump_degree[:n].to(raw_pos.device).to(raw_pos.dtype).clamp(0.0, 1.0)
+            penetration = cmd_term.anchor_penetration_depth[:n].to(raw_pos.device).to(raw_pos.dtype)
+            z_upper = (jump_degree * penetration).clamp(max=max_delta_pos)
+        z_lower = torch.full_like(z_upper, -max_delta_pos)
+        cont_pos_corr[:, 2] = torch.minimum(torch.maximum(cont_pos_corr[:, 2], z_lower), z_upper)
+        return cont_pos_corr, cont_rpy_corr, valid
+
+    def _frontres_update_temporal_reference_cache(self, cmd_term, n: int) -> None:
+        """Cache raw/refined reference poses after writing FrontRES corrections."""
+        if n <= 0:
+            return
+        device = cmd_term._frontres_pos_correction.device
+        dtype = cmd_term._frontres_pos_correction.dtype
+        pose = self._frontres_raw_anchor_pose(cmd_term, n, device, dtype)
+        if pose is None:
+            return
+        raw_pos, raw_quat = pose
+        pos_corr = cmd_term._frontres_pos_correction[:n].detach().clone()
+        quat_corr = cmd_term._frontres_quat_correction[:n].detach().clone()
+        refined_pos = raw_pos.detach().clone() + pos_corr
+        refined_quat = quat_mul(raw_quat, quat_corr)
+        refined_quat = refined_quat / refined_quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        cache_size = int(self.env.num_envs)
+        cache = getattr(self, "_frontres_temporal_ref_cache", None)
+        if cache is None or cache.get("raw_pos", torch.empty(0, device=device)).shape[0] != cache_size:
+            cache = {
+                "raw_pos": torch.zeros(cache_size, 3, device=device, dtype=dtype),
+                "raw_quat": torch.zeros(cache_size, 4, device=device, dtype=dtype),
+                "refined_pos": torch.zeros(cache_size, 3, device=device, dtype=dtype),
+                "refined_quat": torch.zeros(cache_size, 4, device=device, dtype=dtype),
+                "valid": torch.zeros(cache_size, device=device, dtype=torch.bool),
+            }
+            cache["raw_quat"][:, 0] = 1.0
+            cache["refined_quat"][:, 0] = 1.0
+            self._frontres_temporal_ref_cache = cache
+        cache["raw_pos"][:n].copy_(raw_pos.detach())
+        cache["raw_quat"][:n].copy_(raw_quat.detach())
+        cache["refined_pos"][:n].copy_(refined_pos.detach())
+        cache["refined_quat"][:n].copy_(refined_quat.detach())
+        cache["valid"][:n] = True
+
+    def _frontres_invalidate_temporal_reference_cache(self, dones: torch.Tensor | None) -> None:
+        """Drop temporal continuity state for environments that just reset."""
+        cache = getattr(self, "_frontres_temporal_ref_cache", None)
+        if cache is None or dones is None or "valid" not in cache:
+            return
+        valid = cache["valid"]
+        done_mask = dones.to(device=valid.device).view(-1).bool()
+        n = min(done_mask.numel(), valid.numel())
+        if n <= 0:
+            return
+        valid[:n] &= ~done_mask[:n]
 
     def _maybe_print_frontres_restore_debug(
         self,
@@ -5150,12 +5324,13 @@ class OnPolicyRunner:
             conf_raw = actions[:n, 7:8].detach()
         else:
             conf_raw = torch.ones(n, 1, device=self.device)
-        if objective == "supervised_restore":
+        scalar_tau_hybrid = objective == "hsl_hybrid" and task_conf_dim == 1
+        if objective == "supervised_restore" or scalar_tau_hybrid:
             conf_eff = torch.ones_like(conf_raw)
         else:
             conf_eff = conf_raw
-        applied = pred * conf_eff
         written = _quat_to_rotvec_wxyz(written_q)[:, :3]
+        applied = written if scalar_tau_hybrid else pred * conf_eff
 
         clean_from_raw = _quat_to_rotvec_wxyz(quat_mul(quat_inv(raw_q), clean_q))[:, :3]
         corrected_q = quat_mul(raw_q, written_q)
@@ -5195,14 +5370,18 @@ class OnPolicyRunner:
             return [round(float(v), 5) for v in vals]
 
         sample_idx = int(torch.argmax(noisy_err_norm).item())
+        gate_desc = (
+            f"tau_mix={float(conf_raw.mean()):.3f}"
+            if scalar_tau_hybrid
+            else f"conf_eff={float(conf_eff.mean()):.3f} conf_raw={float(conf_raw.mean()):.3f}"
+        )
         print(
             "[FrontRES restore debug] "
             f"it={int(it)} dr={float(getattr(self, '_dr_scale', 0.0)):.4f} "
             f"n={n} sample={sample_idx} "
             f"cos(pred,target)={float(cos_pred_target):+.4f} "
             f"cos(written,target)={float(cos_written_target):+.4f} "
-            f"sign_xy={float(sign_match):.3f} conf_eff={float(conf_eff.mean()):.3f} "
-            f"conf_raw={float(conf_raw.mean()):.3f} "
+            f"sign_xy={float(sign_match):.3f} {gate_desc} "
             f"sat={float(sat_frac):.3f} jump={float(step_jump):.5f}",
             flush=True,
         )

@@ -249,8 +249,8 @@ class FrontRESUnified:
             print("  L = L_proposal + L_written + L_coeff  "
                   "(factorized per-axis repair coefficients; PPO/HRL branch kept but disabled)")
         elif self.frontres_training_objective == "hsl_hybrid":
-            print("  L = L_PPO(tau trust filter) + λ_sup·L_HSL(direction)  "
-                  "(PPO log-prob is restricted to tau; direction is supervised)")
+            print("  L = L_PPO(tau temporal mix) + λ_sup·L_HSL(proposal)  "
+                  "(PPO log-prob is restricted to tau; ΔSE proposal is supervised)")
         else:
             print(f"  L = L_PPO + λ_sup({self.lambda_supervised:.2f})·L_supervised")
         print("=" * 80)
@@ -779,6 +779,7 @@ class FrontRESUnified:
             "supervised_l_miss": 0.0,
             "supervised_l_coeff_smooth": 0.0,
             "supervised_l_harm": 0.0,
+            "supervised_l_conf": 0.0,
             "frontres_alpha_mean": 0.0,
             "frontres_alpha_active_frac": 0.0,
             "frontres_tau_mean": 0.0,
@@ -833,13 +834,20 @@ class FrontRESUnified:
 
         coeff = None
         scalar_trust = False
+        tau_logits = None
+        tau_value = None
         if is_task_space and str(self.frontres_training_objective).lower() in ("basis_restore", "hsl_hybrid"):
             coeff_dim = int(getattr(self.policy, "task_conf_dim", 2))
             if coeff_dim == 1 and raw_pred.shape[-1] >= 7:
-                tau = torch.sigmoid(raw_pred[:, 6:7])
-                coeff = tau.expand(-1, proposal.shape[-1])
+                tau_logits = raw_pred[:, 6:7]
+                tau_value = torch.sigmoid(tau_logits)
+                coeff = tau_value.expand(-1, proposal.shape[-1])
                 scalar_trust = True
-                pred = proposal * coeff
+                # Runtime uses tau as a temporal mix coefficient between the
+                # HSL proposal and a continuity candidate.  The supervised
+                # direction loss therefore trains the proposal itself; tau is
+                # optimized only by PPO in hsl_hybrid mode.
+                pred = proposal
             elif coeff_dim == 6 and raw_pred.shape[-1] >= 12:
                 coeff = torch.sigmoid(raw_pred[:, 6:12])
                 pred = proposal * coeff
@@ -905,6 +913,7 @@ class FrontRESUnified:
         miss_loss = torch.zeros((), device=self.device)
         coeff_smooth_loss = torch.zeros((), device=self.device)
         harm_loss = torch.zeros((), device=self.device)
+        conf_sup = torch.zeros((), device=self.device)
         if self.supervised_magnitude_loss_weight > 0 and valid.any():
             pred_norm = supervised_pred.norm(dim=-1)
             target_norm_valid = target_detached.norm(dim=-1)
@@ -974,6 +983,28 @@ class FrontRESUnified:
             supervised_loss = supervised_loss + self.supervised_direction_loss_weight * direction_loss
 
         if (
+            scalar_trust
+            and tau_logits is not None
+            and str(self.frontres_training_objective).lower() != "hsl_hybrid"
+            and self.supervised_conf_loss_weight > 0
+        ):
+            pass_weight = sample_weight.view(-1, 1)
+            reject_weight = harm_weight.view(-1, 1)
+            pass_loss = torch.zeros((), device=self.device)
+            reject_loss = torch.zeros((), device=self.device)
+            if pass_weight.sum() > 0:
+                pass_target = torch.ones_like(tau_logits)
+                pass_terms = nn.functional.binary_cross_entropy_with_logits(
+                    tau_logits, pass_target, reduction="none")
+                pass_loss = (pass_terms * pass_weight).sum() / pass_weight.sum().clamp(min=1e-6)
+            if reject_weight.sum() > 0:
+                reject_target = torch.zeros_like(tau_logits)
+                reject_terms = nn.functional.binary_cross_entropy_with_logits(
+                    tau_logits, reject_target, reduction="none")
+                reject_loss = (reject_terms * reject_weight).sum() / reject_weight.sum().clamp(min=1e-6)
+            conf_sup = pass_loss + reject_loss
+            supervised_loss = supervised_loss + self.supervised_conf_loss_weight * conf_sup
+        elif (
             hasattr(self.policy, "num_task_corrections")
             and self.policy.num_task_corrections > 0
             and raw_pred.shape[-1] >= 8
@@ -999,6 +1030,7 @@ class FrontRESUnified:
             sup_metrics["supervised_l_miss"] = miss_loss.item()
             sup_metrics["supervised_l_coeff_smooth"] = coeff_smooth_loss.item()
             sup_metrics["supervised_l_harm"] = harm_loss.item()
+            sup_metrics["supervised_l_conf"] = conf_sup.item()
             sup_metrics["frontres_supervised_weight"] = sample_weight.mean().item()
             if coeff is not None:
                 sup_metrics["frontres_alpha_mean"] = coeff.mean().item()

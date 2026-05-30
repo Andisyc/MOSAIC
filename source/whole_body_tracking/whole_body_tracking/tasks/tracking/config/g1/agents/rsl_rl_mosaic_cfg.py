@@ -485,7 +485,8 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
     # Task-space action layout with task_conf_dim=1:
     #   [dx, dy, dz, droll, dpitch, dyaw, tau]
     # Local-rp perturbations may require root-position compensation at high
-    # strength, so keep the full ΔSE(3) proposal active and let PPO filter tau.
+    # strength, so keep the full ΔSE(3) proposal active and let PPO choose the
+    # temporal mix between HSL repair and continuity-preserving repair.
     frontres_specialist_mode       = "rp"
     frontres_active_task_dims      = [0, 1, 2, 3, 4, 5, 6]
     frontres_perturbation_channels = "rp"
@@ -781,7 +782,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         noise_std_type         = "scalar",
         # ── Task-space SE(3) correction mode ─────────────────────────────────
         num_task_corrections   = 6,        # bounded correction proposal = [Δpos(3), Δrpy(3)]
-        task_conf_dim          = 1,        # scalar trust τ: HSL proposes ΔSE(3), PPO filters its strength
+        task_conf_dim          = 1,        # scalar tau: PPO temporal mix, not amplitude/confidence
         max_delta_pos          = 0.3,      # tanh clip (metres)
         max_delta_rpy          = 0.4,      # tanh clip (rad); needed to repair RobotBridge rp eps up to 0.35
         # ── GMT (frozen) ─────────────────────────────────────────────────────
@@ -824,7 +825,7 @@ class G1FlatFrontRESUnifiedRunnerCfg(RslRlOnPolicyRunnerCfg):
         lambda_supervised_decay       = 0.995, # HSL direction anchor can decay once rollout advantage is useful
         supervised_trigger_cosine_sim = 0.85,  # EMA threshold to start decay
         supervised_rpy_loss_weight    = 1.0,
-        supervised_conf_loss_weight   = 0.0,   # BCE drives c→1 always (OU≠0); let PPO learn gating
+        supervised_conf_loss_weight   = 0.0,   # hsl_hybrid uses tau as PPO temporal mix, not supervised amplitude gate
         supervised_direction_loss_weight = 0.03,
         supervised_valid_loss_weight     = 4.0,
         supervised_magnitude_loss_weight = 0.5,
